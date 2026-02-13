@@ -1,0 +1,36 @@
+analysis:
+  word_thresholds:
+    ok: 60
+    weak: 50
+concurrency:
+  default_jobs: 2
+  max_jobs: 16
+engines:
+  azure:
+    api_key: ''
+    region: eastasia
+  gemini:
+    alignment_source: none
+    api_key: ''
+    connect_timeout_sec: 6.0
+    max_attempts: 5
+    max_inflight_per_key: 1
+    max_parallel_requests: 2
+    max_total_wait_sec: 120.0
+    model: gemini-3-flash-preview
+    queue_wait_timeout_sec: 22.0
+    read_timeout_sec: 65.0
+    reference_wait_sec: 1.2
+  pro:
+    enabled: true
+    local_fallback_engine: fast
+    prefer_pro_mode: true
+    require_cloud_success: true
+llm:
+  api_key: ''
+  base_url: ''
+  fallback_api_key: ''
+  fallback_model: glm-4-flash
+  model: gemini-3-flash-preview
+  provider: openai
+  zhipu_model: glm-4-flash

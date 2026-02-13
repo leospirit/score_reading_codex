@@ -1,0 +1,2978 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+{% macro get_level(score) -%}
+    {% if score >= 90 %}Advanced{% elif score >= 80 %}High-Intermediate{% elif score >= 70 %}Intermediate{% elif score >= 60 %}Basic{% else %}Beginner{% endif %}
+{%- endmacro %}
+{% macro score_int(value) -%}
+    {{ (value | float) | round(0) | int }}
+{%- endmacro %}
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speaking Score Report - {{ meta.student_name or meta.student_id }}</title>
+    <!-- cleaned comment -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- cleaned comment -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Work+Sans:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --color-ok: #00C853;     /* Green */
+            --color-weak: #FF9100;   /* Orange */
+            --color-missing: #FF1744; /* Red */
+            --color-poor: #AA00FF;    /* Purple */
+            
+            /* Light Theme */
+            --bg-page: #F8FAFC;      /* cleaned comment */
+            --bg-card: #ffffff;
+            --text-primary: #1E293B; /* Slate-800 */
+            --text-secondary: #64748B; /* Slate-500 */
+            --accent: #2979FF;       /* Blue */
+            
+            /* Gradients */
+            --grad-overall: linear-gradient(135deg, #00E5FF 0%, #2979FF 100%);
+            --grad-pronunciation: linear-gradient(to right, #2979FF, #448AFF);
+            --grad-fluency: linear-gradient(to right, #FF9100, #FFB74D);
+            --grad-intonation: linear-gradient(to right, #00C853, #69F0AE);
+            --grad-completeness: linear-gradient(to right, #AA00FF, #EA80FC);
+            
+            /* Shadows (Soft UI) */
+            --shadow-card: 0 10px 15px -3px rgba(0, 0, 0, 0.05), 0 4px 6px -2px rgba(0, 0, 0, 0.025);
+            --shadow-hover: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            
+            --font-heading: 'Outfit', sans-serif;
+            --font-body: 'Work Sans', sans-serif;
+            --font-text: 'Inter', sans-serif;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: var(--font-body);
+            background: var(--bg-page);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        h1, h2, h3, .number, .value, .skill-score {
+            font-family: var(--font-heading);
+        }
+        
+        .container {
+            max-width: 800px; /* cleaned comment */
+            margin: 0 auto;
+        }
+        
+        /* cleaned comment */
+        .header {
+            background: var(--bg-card);
+            border-radius: 12px;
+            padding: 16px 24px;
+            margin-bottom: 20px;
+            box-shadow: var(--shadow-card);
+            border: 1px solid rgba(0,0,0,0.02);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 1.2rem; /* cleaned comment */
+            margin-bottom: 0;
+            color: var(--accent);
+        }
+        
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+        
+        .meta-item {
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .meta-item .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+            opacity: 0.7;
+        }
+        
+        .meta-item .value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        /* cleaned comment */
+        .scores-section {
+            display: grid;
+            grid-template-columns: 200px 1fr; /* cleaned comment */
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        /* cleaned comment */
+        .overall-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: var(--shadow-card);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid rgba(0,0,0,0.02);
+            height: 100%;
+        }
+        
+        .ring-container {
+            width: 140px; /* cleaned comment */
+            height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .progress-ring__circle {
+            transition: stroke-dashoffset 0.5s ease-in-out;
+            transform: rotate(-90deg);
+            transform-origin: 50% 50%;
+        }
+        
+        .ring-center .value {
+            font-size: 2rem;
+            margin-bottom: 2px;
+        }
+
+        .overall-feedback {
+            text-align: center;
+        }
+        
+        .overall-feedback h2 {
+            display: none; /* cleaned comment */
+        }
+        
+        .overall-feedback .level-badge {
+            margin-bottom: 0;
+            padding: 4px 10px;
+            font-size: 0.8rem;
+        }
+        
+        .overall-feedback p {
+            display: none; /* cleaned comment */
+        }
+
+        /* cleaned comment */
+        .breakdown-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 16px;
+        }
+        
+        .skill-card {
+            padding: 16px;
+            border-radius: 12px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        .skill-score {
+            font-size: 1.8rem; /* cleaned comment */
+            margin: 4px 0;
+        }
+        
+        .skill-label {
+            font-size: 0.9rem;
+        }
+        
+        .skill-level {
+            font-size: 0.75rem;
+        }
+        
+        @media (max-width: 768px) {
+            .overall-card {
+                flex-direction: column;
+                text-align: center;
+                padding: 24px;
+            }
+        }
+        
+        .ring-container {
+            position: relative;
+            width: 140px;
+            height: 140px;
+            flex-shrink: 0;
+        }
+        
+        .ring-center {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+        
+        .ring-center .value {
+            font-size: 2.6rem; /* cleaned comment */
+            font-weight: 800;
+            background: var(--grad-overall);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            line-height: 1.1;
+            margin-bottom: 4px;
+            letter-spacing: -1px; /* cleaned comment */
+        }
+        
+        .ring-center .unit {
+            font-size: 0.65rem; /* cleaned comment */
+            color: var(--text-secondary);
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px; /* cleaned comment */
+            opacity: 0.8;
+            line-height: 1.2;
+            max-width: 120px; /* cleaned comment */
+            margin: 0 auto;
+        }
+        
+        .overall-feedback {
+            flex: 1;
+        }
+        
+        .overall-feedback h2 {
+            font-size: 1.8rem;
+            margin-bottom: 10px;
+            color: var(--text-primary);
+        }
+        
+        .overall-feedback .level-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            background: rgba(41, 121, 255, 0.1);
+            color: var(--accent);
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+        }
+        
+        .overall-feedback p {
+            color: var(--text-secondary);
+            line-height: 1.6;
+            max-width: 600px;
+        }
+        
+        /* cleaned comment */
+        .breakdown-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+        }
+        
+        .skill-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: var(--shadow-card);
+            text-align: center;
+            transition: transform 0.2s, box-shadow 0.2s;
+            position: relative;
+            overflow: hidden;
+            border-top: 4px solid transparent;
+            border-bottom: 1px solid rgba(0,0,0,0.02);
+            border-left: 1px solid rgba(0,0,0,0.02);
+            border-right: 1px solid rgba(0,0,0,0.02);
+        }
+        
+        .skill-card:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-hover);
+        }
+        
+        .skill-card.pronunciation { border-top-color: #2979FF; }
+        .skill-card.intonation { border-top-color: #00C853; }
+        .skill-card.fluency { border-top-color: #FF9100; }
+        .skill-card.completeness { border-top-color: #AA00FF; }
+        
+        .skill-score {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin: 10px 0;
+            line-height: 1;
+        }
+        
+        .skill-card.pronunciation .skill-score { color: #2979FF; }
+        .skill-card.intonation .skill-score { color: #00C853; }
+        .skill-card.fluency .skill-score { color: #FF9100; }
+        .skill-card.completeness .skill-score { color: #AA00FF; }
+        
+        .skill-label {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }
+        
+        .skill-level {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        
+
+        
+        /* cleaned comment */
+        .text-section {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        .text-section h2 {
+            font-size: 1.2rem;
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+        
+        .highlighted-text {
+            font-family: var(--font-text);
+            font-size: 1.05rem; /* cleaned comment */
+            line-height: 1.8;   /* cleaned comment */
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.4);
+            border: 1px solid rgba(0, 0, 0, 0.04);
+            border-radius: 12px;
+            text-align: justify;
+        }
+        
+        .highlighted-text .word {
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin: 0 2px;
+            display: inline-block;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            position: relative;
+        }
+        
+        .highlighted-text .word:hover {
+            transform: scale(1.15);
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+        
+        .highlighted-text .word.playing {
+            animation: wordPulse 0.3s ease-in-out infinite alternate;
+        }
+        
+        @keyframes wordPulse {
+            from { transform: scale(1); box-shadow: 0 0 5px currentColor; }
+            to { transform: scale(1.1); box-shadow: 0 0 15px currentColor; }
+        }
+        
+        .highlighted-text .word.ok {
+            /* cleaned comment */
+            background: transparent;
+            color: var(--text-primary);
+        }
+        
+        .highlighted-text .word.weak {
+            /* cleaned comment */
+            background: transparent;
+            color: var(--color-weak);
+            font-weight: 600;
+        }
+        
+        .highlighted-text .word.poor {
+            /* cleaned comment */
+            background: transparent;
+            color: var(--color-missing);
+            font-weight: 600;
+        }
+        
+        .highlighted-text .word.missing {
+            /* cleaned comment */
+            background: transparent;
+            color: var(--color-missing);
+            font-weight: 600;
+            opacity: 0.7;
+        }
+
+        .highlighted-text .word.missing .missing-box {
+            display: inline-block;
+            min-width: 24px;
+            text-align: center;
+            margin-right: 4px;
+            padding: 0 4px;
+            border-radius: 4px;
+            background: #FCE7F3;
+            color: #9D174D;
+            border: 1px solid #F9A8D4;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+
+        .highlighted-text .word.missing .missing-text {
+            text-decoration: line-through;
+            text-decoration-thickness: 2px;
+        }
+
+        .word-factor-pop {
+            position: absolute;
+            left: 50%;
+            bottom: calc(100% + 10px);
+            transform: translateX(-50%) translateY(4px);
+            min-width: 180px;
+            max-width: 280px;
+            padding: 8px 10px;
+            border-radius: 8px;
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            box-shadow: 0 8px 18px rgba(15, 23, 42, 0.18);
+            z-index: 30;
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity 0.14s ease, transform 0.14s ease;
+        }
+
+        .highlighted-text .word:hover .word-factor-pop {
+            opacity: 1;
+            visibility: visible;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .word-factor-pop::after {
+            content: '';
+            position: absolute;
+            left: 50%;
+            bottom: -6px;
+            width: 10px;
+            height: 10px;
+            background: #FFFFFF;
+            border-right: 1px solid #E2E8F0;
+            border-bottom: 1px solid #E2E8F0;
+            transform: translateX(-50%) rotate(45deg);
+        }
+
+        .word-factor-head {
+            display: block;
+            font-size: 0.9rem;
+            color: #0F172A;
+            margin-bottom: 4px;
+            white-space: nowrap;
+        }
+
+        .word-factor-grid {
+            display: grid;
+            grid-auto-flow: column;
+            grid-auto-columns: minmax(18px, auto);
+            gap: 6px;
+            align-items: center;
+            justify-content: start;
+            margin: 2px 0;
+        }
+
+        .word-factor-cell {
+            text-align: center;
+            font-size: 0.84rem;
+            color: #111827;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
+
+        .word-factor-grid.scores .word-factor-cell {
+            color: #0F766E;
+            font-weight: 700;
+        }
+
+        .break-chip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 4px 0 1px;
+            width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            font-size: 0.62rem;
+            line-height: 1;
+            font-weight: 700;
+            vertical-align: middle;
+            border: 1px solid transparent;
+        }
+
+        .break-chip.unexpected {
+            background: #FEF3C7;
+            color: #92400E;
+            border-color: #FCD34D;
+        }
+
+        .break-chip.missing {
+            background: #F1F5F9;
+            color: #475569;
+            border-color: #CBD5E1;
+        }
+        
+        /* cleaned comment */
+        .bottom-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .analysis-section, .feedback-section {
+            margin-bottom: 0; /* cleaned comment */
+            padding: 20px;
+            border-radius: 12px;
+        }
+
+        .analysis-section h2, .text-section h2, .feedback-section h2 {
+            font-size: 1.1rem;
+            margin-bottom: 12px;
+        }
+        
+        /* cleaned comment */
+        @media print {
+            body {
+                background: white;
+                padding: 0;
+            }
+            .container {
+                width: 100%;
+                max-width: none;
+                box-shadow: none;
+            }
+                box-shadow: none;
+                border: 1px solid #eee;
+                break-inside: avoid;
+            }
+            .print-btn { display: none; }
+        }
+        
+        .print-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: var(--font-body);
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: background 0.2s;
+        }
+        .print-btn:hover {
+            background: #2962FF;
+        }
+        
+        .legend-item.ok { color: var(--text-primary); font-weight: 500; }
+        .legend-item.weak { color: var(--color-weak); font-weight: 600; }
+        .legend-item.poor { color: var(--color-missing); font-weight: 600; }
+        .legend-item.missing { color: var(--color-missing); text-decoration: line-through; font-weight: 600; opacity: 0.7; }
+        .legend-item.linking { color: var(--accent); font-weight: 600; border-bottom: 2px solid var(--accent); border-radius: 0 0 8px 8px; padding-bottom: 1px; }
+        .legend-item.break-unexpected { color: #92400E; font-weight: 600; }
+        .legend-item.break-missing { color: #475569; font-weight: 600; }
+
+        /* cleaned comment */
+        .link-arc {
+            display: inline-block;
+            vertical-align: bottom;
+            margin: 0 -8px; /* cleaned comment */
+            color: var(--accent);
+            opacity: 0.8;
+            pointer-events: none;
+            width: 20px;
+            height: 10px;
+        }
+        
+        .word.weak[data-diagnosis]:after, .word.poor[data-diagnosis]:after {
+            content: " *";
+            font-size: 0.7em;
+            vertical-align: super;
+            opacity: 0.8;
+        }
+
+        /* cleaned comment */
+        .transcription-section {
+            background: #F8FAFC;
+            border-left: 4px solid #3B82F6;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 24px;
+        }
+        
+        .transcription-section h3 {
+            font-size: 0.95rem;
+            color: #1E293B;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .detected-content {
+            font-family: var(--font-mono);
+            font-size: 1rem;
+            line-height: 1.6;
+            color: #475569;
+            background: #FFFFFF;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #E2E8F0;
+            white-space: pre-wrap;
+        }
+        
+        .detected-content mark {
+            background: #FEE2E2;
+            color: #B91C1C;
+            padding: 0 2px;
+            border-radius: 2px;
+            font-weight: 600;
+        }
+
+        /* cleaned comment */
+        .analysis-section {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        .analysis-section h2 {
+            font-size: 1.2rem;
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+        
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+        }
+        
+        .analysis-card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 16px;
+        }
+        
+        .analysis-card h3 {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        
+        .analysis-card .items {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .analysis-card .item {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 4px 12px;
+            border-radius: 16px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .analysis-card .item:hover {
+            transform: scale(1.1);
+        }
+        
+        .analysis-card .item.weak {
+            background: rgba(255, 193, 7, 0.2);
+            color: var(--color-weak);
+        }
+        
+        .analysis-card .item.missing {
+            background: rgba(244, 67, 54, 0.2);
+            color: var(--color-missing);
+        }
+        
+        /* cleaned comment */
+        .pronunciation-section {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        .pronunciation-section h2 {
+            font-size: 1.2rem;
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+        
+        /* ELSA Style Pronunciation Cards */
+        .phoneme-analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .elsa-card {
+            background: #FFFFFF;
+            border-radius: 12px;
+            border: 1px solid #E2E8F0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        }
+
+        .elsa-card-header {
+            background: #F8FAFC;
+            padding: 12px 16px;
+            border-bottom: 1px solid #E2E8F0;
+            font-weight: 700;
+            color: #1E293B;
+            font-size: 1rem;
+        }
+
+        .elsa-card-body {
+            padding: 16px;
+            flex-grow: 1;
+        }
+
+        .elsa-section-title {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #64748B;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+
+        .elsa-mistake-item {
+            margin-bottom: 16px;
+        }
+
+        .elsa-mistake-text {
+            font-size: 0.95rem;
+            color: #334155;
+            margin-bottom: 8px;
+        }
+
+        .elsa-word-list {
+            list-style: disc;
+            padding-left: 20px;
+            color: #475569;
+            font-size: 0.9rem;
+        }
+
+        .elsa-word-item {
+            margin-bottom: 4px;
+        }
+
+        .elsa-word-highlight {
+            color: #EF4444;
+            font-weight: 600;
+            text-decoration: line-through;
+        }
+        
+        /* Modal Animation */
+        .modal-overlay.active {
+            display: flex;
+            animation: fadeIn 0.3s ease-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .elsa-card-footer {
+            padding: 16px;
+            background: #F8FAFC;
+            border-top: 1px solid #E2E8F0;
+        }
+
+        .elsa-improvement-tip {
+            font-size: 0.85rem;
+            color: #475569;
+            line-height: 1.5;
+        }
+        
+        /* cleaned comment */
+        /* cleaned comment */
+        .feedback-section {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: var(--shadow-card);
+            border: 1px solid rgba(0,0,0,0.02);
+        }
+        
+        .feedback-section h2 {
+            font-size: 1.2rem;
+            margin-bottom: 16px;
+            color: var(--accent);
+        }
+        
+        .feedback-summary {
+            font-size: 1.1rem;
+            margin-bottom: 16px;
+            padding: 16px;
+            background: rgba(41, 121, 255, 0.05);
+            border-radius: 12px;
+            border-left: 4px solid var(--accent);
+            color: var(--text-primary);
+        }
+        
+        .feedback-actions {
+            margin-bottom: 16px;
+        }
+        
+        .feedback-actions h3 {
+            font-size: 0.95rem;
+            color: var(--text-primary);
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+        
+        .feedback-actions ol {
+            padding-left: 20px;
+            color: var(--text-secondary);
+        }
+        
+        .feedback-actions li {
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+        
+        .practice-words {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 16px;
+        }
+        
+        .practice-word {
+            background: rgba(0, 0, 0, 0.05);
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        /* cleaned comment */
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+        }
+        
+        /* cleaned comment */
+        .no-audio-hint {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+        
+        .no-audio-hint svg {
+            width: 48px;
+            height: 48px;
+            opacity: 0.5;
+            margin-bottom: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- cleaned comment -->
+        <div class="header">
+            <h1>Speaking Report - {{ meta.student_id }}</h1>
+            <button class="print-btn" onclick="window.print()">Generate Report</button>
+        </div>
+        
+        <!-- cleaned comment -->
+        <div class="scores-section">
+            <!-- cleaned comment -->
+            <div class="overall-card">
+                <div class="ring-container" style="transform: scale(0.9); margin-bottom: -10px;">
+                    <svg class="progress-ring" width="120" height="120">
+                        <circle
+                            class="progress-ring__circle-bg"
+                            stroke="#e6e6e6"
+                            stroke-width="10"
+                            fill="transparent"
+                            r="54"
+                            cx="60"
+                            cy="60"/>
+                        <circle
+                            class="progress-ring__circle"
+                            stroke="url(#gradient)"
+                            stroke-width="10"
+                            fill="transparent"
+                            r="54"
+                            cx="60"
+                            cy="60"
+                            style="stroke-dasharray: 339; stroke-dashoffset: {{ 339 - (339 * scores.overall_100 / 100) }}"/>
+                        <defs>
+                            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                <stop offset="0%" stop-color="#00E5FF" />
+                                <stop offset="100%" stop-color="#2979FF" />
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                    <div class="ring-center">
+                        <div class="value" style="font-size: 2rem;">{{ score_int(scores.overall_100) }}%</div>
+                        <div class="unit">{{ get_level(scores.overall_100) }}</div>
+                    </div>
+                </div>
+                <div class="overall-feedback">
+                    <h2>Overall Speaking Score</h2>
+                    <span class="level-badge">Current Level: {{ get_level(scores.overall_100) }}</span>
+                    <p>Your speaking performance is solid. Keep practicing and focus on smoother rhythm and more natural pauses.</p>
+                </div>
+            </div>
+            
+            <!-- cleaned comment -->
+            <div class="breakdown-grid">
+                <div class="skill-card pronunciation" onclick="openPronunciationModal()" style="cursor: pointer;">
+                    <div class="skill-score">{{ score_int(scores.pronunciation_100) }}%</div>
+                    <div class="skill-label">Pronunciation</div>
+                    <div class="skill-level">{{ get_level(scores.pronunciation_100) }}</div>
+                </div>
+                
+                <div class="skill-card intonation" onclick="openIntonationModal()" style="cursor: pointer;">
+                    <div class="skill-score">{{ score_int(scores.intonation_100) }}%</div>
+                    <div class="skill-label">Prosody</div>
+                    <div class="skill-level">{{ get_level(scores.intonation_100) }}</div>
+                </div>
+                
+                <div class="skill-card fluency" onclick="openFluencyModal()" style="cursor: pointer;">
+                    <div class="skill-score">{{ score_int(scores.fluency_100) }}%</div>
+                    <div class="skill-label">Fluency</div>
+                    <div class="skill-level">{{ get_level(scores.fluency_100) }}</div>
+                </div>
+                
+                <div class="skill-card completeness" onclick="openCompletenessModal()" style="cursor: pointer;">
+                    <div class="skill-score">{{ score_int(scores.completeness_100) }}%</div>
+                    <div class="skill-label">Completeness</div>
+                    <div class="skill-level">{{ get_level(scores.completeness_100) }}</div>
+                </div>
+            </div>
+        </div>
+        
+
+        
+        <!-- cleaned comment -->
+        {% if engine_raw.detected_transcript %}
+        <div class="transcription-section">
+            <h3>Transcript Comparison</h3>
+            <div class="detected-content">{{ engine_raw.detected_transcript }}</div>
+            <p style="font-size: 0.8rem; color: #64748B; margin-top: 8px;">
+                <b>提示：</b>这是实际听到的内容。若与参考文本不一致，请优先关注高亮差异。
+        </div>
+        {% endif %}
+
+        {% set _pause_profile = engine_raw.pause_profile if engine_raw and engine_raw.pause_profile else {} %}
+        {% set show_missing_break = not ((_pause_profile.synthetic_timeline | default(0) | float >= 0.5) or (_pause_profile.low_confidence_timing | default(0) | float >= 0.5) or ((_pause_profile.timing_confidence | default('') | lower) == 'low')) %}
+        <!-- cleaned comment -->
+        <div class="text-section">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h2 style="margin-bottom: 0;">Reading Analysis</h2>
+                {% if audio_base64 %}
+                <audio controls style="height: 36px; border-radius: 18px;">
+                    <source src="data:audio/mp3;base64,{{ audio_base64 }}" type="audio/mpeg">
+                    Your browser does not support the audio element.
+                </audio>
+                {% endif %}
+            </div>
+            <div class="highlighted-text" id="highlightedText">
+                {% for word in alignment.words %}
+                {% if not loop.first and loop.previtem.pause %}
+                    {% if loop.previtem.pause.type == 'bad' %}
+                    <span class="break-chip unexpected" title="Unexpected break before this word">UB</span>
+                    {% elif show_missing_break and loop.previtem.pause.type == 'missed' %}
+                    <span class="break-chip missing" title="Missing break before this word">MB</span>
+                    {% endif %}
+                {% endif %}
+                <span class="word {{ word.tag }}" 
+                      title="{% if word.diagnosis %}Diagnosis: {{ word.diagnosis }}{% else %}Score: {{ ('%.1f' % (word.score | float)).rstrip('0').rstrip('.') }}{% endif %}"
+                      data-start="{{ word.start }}"
+                      data-end="{{ word.end }}"
+                      data-index="{{ loop.index0 }}"
+                      {% if word.diagnosis %}data-diagnosis="{{ word.diagnosis }}"{% endif %}>
+                    {% if word.tag == 'missing' %}
+                    <span class="missing-box">[ ]</span><span class="missing-text">{{ word.word }}</span>
+                    {% else %}
+                    {{ word.word }}
+                    {% endif %}
+                    {% if word.phoneme_breakdown %}
+                    <span class="word-factor-pop">
+                        <span class="word-factor-head">{{ word.word }} : {{ score_int(word.score) }}</span>
+                        <span class="word-factor-grid symbols">
+                            {% for ph in word.phoneme_breakdown %}
+                            <span class="word-factor-cell">{{ ph.symbol }}</span>
+                            {% endfor %}
+                        </span>
+                        <span class="word-factor-grid scores">
+                            {% for ph in word.phoneme_breakdown %}
+                            <span class="word-factor-cell">{{ score_int(ph.score) }}</span>
+                            {% endfor %}
+                        </span>
+                    </span>
+                    {% endif %}
+                </span>
+                {% endfor %}
+            </div>
+            <div class="legend">
+                <span class="legend-item ok">Correct</span>
+                <span class="legend-item weak">Weak</span>
+                <span class="legend-item poor">Needs Improvement</span>
+                <span class="legend-item missing">Missing</span>
+                <span class="legend-item break-unexpected" title="Unexpected break">UB</span>
+                {% if show_missing_break %}
+                <span class="legend-item break-missing" title="Missing break">MB</span>
+                {% else %}
+                <span class="legend-item break-missing" title="Missing break hidden on low-confidence timing">MB off</span>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- cleaned comment -->
+        <div class="bottom-row">
+            <!-- cleaned comment -->
+            <div class="analysis-section">
+                <h2>Key Focus</h2>
+                <div class="analysis-grid" style="grid-template-columns: 1fr;">
+                    {% if analysis.weak_words %}
+                    <div class="analysis-card" style="padding: 10px;">
+                        <h3 style="margin-bottom: 4px;">Words to improve</h3>
+                        <div class="items">
+                            {% for word in analysis.weak_words[:5] %}
+                            <span class="item weak" data-word="{{ word }}">{{ word }}</span>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+                    
+                    {% if analysis.missing_words %}
+                    <div class="analysis-card" style="padding: 10px;">
+                        <h3 style="margin-bottom: 4px;">Missing words</h3>
+                        <div class="items">
+                            {% for word in analysis.missing_words[:5] %}
+                            <span class="item missing" data-word="{{ word }}">{{ word }}</span>
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            <!-- cleaned comment -->
+            <div class="feedback-section">
+                <h2>Integrated Feedback</h2>
+                <div class="feedback-content" style="font-size: 0.9rem;">
+                    <p style="margin-bottom: 8px;">{{ feedback.cn_summary }}</p>
+                    <ul class="action-list">
+                        {% for action in feedback.cn_actions[:2] %}
+                        <li>{{ action }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- cleaned comment -->
+        {% if phoneme_tips %}
+        <div class="pronunciation-section">
+            <h2>Pronunciation Guidance</h2>
+            <div class="phoneme-cards">
+                {% for tip in phoneme_tips %}
+                <div class="phoneme-card">
+                    <div class="phoneme-title">
+                        <span class="phoneme-symbol">/{{ tip.phoneme }}/</span>
+                        <span class="phoneme-name">{{ tip.name }}</span>
+                    </div>
+                    <div class="examples">
+                        {% for example in tip.examples %}
+                        <span class="example-word">{{ example }}</span>
+                        {% endfor %}
+                    </div>
+                    <div class="tip">{{ tip.advice }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        
+        <!-- cleaned comment -->
+
+
+        <!-- cleaned comment -->
+        {% if (feedback.cn_summary or feedback.cn_actions) and not advisor_feedback %}
+        <div class="feedback-section">
+            <h2>Improvement Suggestions</h2>
+            {% if feedback.cn_summary %}
+            <div class="feedback-summary">
+                {{ feedback.cn_summary }}
+            </div>
+            {% endif %}
+            
+            {% if feedback.cn_actions %}
+            <div class="feedback-actions">
+                <h3>Action Plan</h3>
+                <ol>
+                    {% for action in feedback.cn_actions %}
+                    <li>{{ action }}</li>
+                    {% endfor %}
+                </ol>
+            </div>
+            {% endif %}
+            
+            {% if feedback.practice %}
+            <div class="practice-words">
+                {% for pair in feedback.practice %}
+                <span class="practice-word">{{ pair }}</span>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+        
+    </div>
+
+    <!-- cleaned comment -->
+    <div id="pronunciationModal" class="modal-overlay">
+        <div class="modal-container" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2>Pronunciation Details (Pronunciation)</h2>
+                <button class="close-btn" onclick="closePronunciationModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- cleaned comment -->
+                <div class="pro-header">
+                    <div class="ring-container small">
+                         <!-- cleaned comment -->
+                         <div class="ring-center">
+                            <div class="value" style="font-size: 1.8rem; color: #2979FF;">{{ score_int(scores.pronunciation_100) }}%</div>
+                            <div class="unit">{{ get_level(scores.pronunciation_100) }}</div>
+                        </div>
+                    </div>
+                    <div class="pro-status">
+                        <h3>Pronunciation Performance: {{ get_level(scores.pronunciation_100) }}</h3>
+                        <p>Please focus on the phoneme issues listed below. They are key to raising your score.</p>
+                    </div>
+                </div>
+
+                <h3 style="margin: 20px 0 16px; color: #1E293B;">Core Pronunciation Diagnostics (Top Errors)</h3>
+
+                <!-- cleaned comment -->
+                <div class="phoneme-analysis-grid">
+                    {% if advisor_feedback and advisor_feedback.top_errors %}
+                        {% for error in advisor_feedback.top_errors %}
+                        <div class="elsa-card">
+                            <div class="elsa-card-header">
+                                Sound {{ error.phoneme if error.phoneme else 'Key Sound' }}
+                            </div>
+                            <div class="elsa-card-body">
+                                <div class="elsa-section-title">Words with Mistakes</div>
+                                <div class="elsa-mistake-item">
+                                    <div class="elsa-mistake-text">{{ error.description if error.description else 'Detected pronunciation instability on key words.' }}</div>
+                                    <ul class="elsa-word-list">
+                                        {% if error.words and error.words|length > 0 %}
+                                            {% for w_name in error.words %}
+                                            <li class="elsa-word-item" 
+                                                onclick="jumpToWord('{{ w_name }}')"
+                                                style="cursor: pointer;">
+                                                {{ w_name }}
+                                                {% for w in alignment.words if w.word.lower() == w_name.lower() and w.diagnosis %}
+                                                <span style="display:block; font-size: 0.8rem; font-weight: normal; color: #DC2626; margin-top:2px;">
+                                                    Diagnosis: {{ w.diagnosis }}
+                                                </span>
+                                                {% endfor %}
+                                            </li>
+                                            {% endfor %}
+                                        {% else %}
+                                            <li class="elsa-word-item" style="cursor: default; opacity: 0.75;">
+                                                No specific words identified in this pass.
+                                            </li>
+                                        {% endif %}
+                                    </ul>
+                                </div>
+                            </div>
+                            <div class="elsa-card-footer">
+                                <div class="elsa-section-title">How to Improve</div>
+                                <div class="elsa-improvement-tip">{{ error.improvement if error.improvement else 'Slow down slightly and keep stressed vowels full; finish word endings clearly.' }}</div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    {% elif pronunciation_analysis and pronunciation_analysis|length > 0 %}
+                        {% for pa in pronunciation_analysis[:3] %}
+                        {% set first_mistake = pa.mistakes[0] if pa.mistakes else None %}
+                        <div class="elsa-card">
+                            <div class="elsa-card-header">
+                                Sound {{ pa.target if pa.target else 'Key Word' }}
+                            </div>
+                            <div class="elsa-card-body">
+                                <div class="elsa-section-title">Words with Mistakes</div>
+                                <div class="elsa-mistake-item">
+                                    <div class="elsa-mistake-text">
+                                        {{ first_mistake.actual if first_mistake and first_mistake.actual else 'Detected pronunciation instability on key words.' }}
+                                    </div>
+                                    <ul class="elsa-word-list">
+                                        {% if first_mistake and first_mistake.words %}
+                                            {% for w_obj in first_mistake.words[:5] %}
+                                            {% set w_name = w_obj.text if w_obj.text is defined else (w_obj if w_obj is string else '') %}
+                                            {% if w_name %}
+                                            <li class="elsa-word-item" onclick="jumpToWord('{{ w_name }}')" style="cursor: pointer;">
+                                                {{ w_name }}
+                                            </li>
+                                            {% endif %}
+                                            {% endfor %}
+                                        {% else %}
+                                            {% for w_name in analysis.weak_words[:5] %}
+                                            <li class="elsa-word-item" onclick="jumpToWord('{{ w_name }}')" style="cursor: pointer;">
+                                                {{ w_name }}
+                                            </li>
+                                            {% endfor %}
+                                        {% endif %}
+                                    </ul>
+                                </div>
+                            </div>
+                            <div class="elsa-card-footer">
+                                <div class="elsa-section-title">How to Improve</div>
+                                <div class="elsa-improvement-tip">
+                                    {{ first_mistake.desc if first_mistake and first_mistake.desc else 'Slow down slightly and keep stressed vowels full; finish word endings clearly.' }}
+                                </div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    {% else %}
+                        <div style="grid-column: 1/-1; padding: 40px; text-align: center; color: #64748B;">
+                            Pronunciation details are being prepared. Please refresh this report in a few seconds.
+                        </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- cleaned comment -->
+        <div id="intonationModal" class="modal-overlay">
+        <div class="modal-container" style="max-width: 980px;">
+            <div class="modal-header">
+                <h2>Prosody Analysis (Stress & Rhythm)</h2>
+                <button class="close-btn" onclick="closeIntonationModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="intonation-legend-row">
+                    <span class="legend-pill"><span class="legend-dot ok"></span>Stress Correct</span>
+                    <span class="legend-pill"><span class="legend-dot bad"></span>Stress Incorrect</span>
+                    <span class="legend-pill"><span class="legend-dot light"></span>Unstressed</span>
+                </div>
+                <div id="intonationRhythmRoot" class="intonation-rhythm-root">
+                    <div class="intonation-empty">Generating intonation stress analysis...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        .intonation-legend-row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }
+
+        .legend-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.9rem;
+            color: #475569;
+            font-weight: 600;
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .legend-dot.ok { background: #19C37D; }
+        .legend-dot.bad { background: #E55353; }
+        .legend-dot.light { background: #CBD5E1; }
+
+        .intonation-rhythm-root {
+            display: grid;
+            gap: 16px;
+        }
+
+        .intonation-empty {
+            background: #F8FAFC;
+            border: 1px dashed #CBD5E1;
+            border-radius: 12px;
+            padding: 18px;
+            color: #64748B;
+            font-size: 0.95rem;
+            text-align: center;
+        }
+
+        .intonation-card {
+            border-radius: 16px;
+            border: 1px solid #E2E8F0;
+            padding: 18px 20px 16px;
+        }
+
+        .intonation-card.best {
+            background: linear-gradient(135deg, #E6F8EE 0%, #D8F3E3 100%);
+            border-color: #A7E8C3;
+        }
+
+        .intonation-card.warning {
+            background: linear-gradient(135deg, #FCEEEE 0%, #FBE7E7 100%);
+            border-color: #F5B8B8;
+        }
+
+        .intonation-card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .intonation-title {
+            font-size: 1.65rem;
+            font-weight: 800;
+            letter-spacing: -0.3px;
+            margin: 0;
+        }
+
+        .intonation-title.best { color: #0F7A49; }
+        .intonation-title.warning { color: #C0392B; }
+
+        .intonation-acc {
+            font-size: 0.95rem;
+            font-weight: 800;
+            border-radius: 999px;
+            padding: 5px 12px;
+        }
+
+        .intonation-acc.best {
+            color: #087444;
+            background: rgba(16, 185, 129, 0.16);
+        }
+
+        .intonation-acc.warning {
+            color: #B42318;
+            background: rgba(229, 83, 83, 0.14);
+        }
+
+        .intonation-token-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px 16px;
+            margin-bottom: 10px;
+        }
+
+        .intonation-token {
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stress-bubble {
+            border-radius: 50%;
+            display: inline-block;
+            box-shadow: 0 3px 10px rgba(15, 23, 42, 0.12);
+        }
+
+        .stress-bubble.stressed {
+            width: 26px;
+            height: 26px;
+        }
+
+        .stress-bubble.light {
+            width: 14px;
+            height: 14px;
+            box-shadow: none;
+        }
+
+        .stress-bubble.ok { background: #19C37D; }
+        .stress-bubble.bad { background: #E55353; }
+        .stress-bubble.silver { background: #CBD5E1; }
+
+        .intonation-word {
+            font-size: 1.02rem;
+            color: #334155;
+            font-weight: 600;
+            line-height: 1;
+        }
+
+        .intonation-word.bad {
+            color: #D42F2F;
+            font-weight: 800;
+        }
+
+        .intonation-note {
+            font-size: 0.96rem;
+            font-weight: 650;
+            margin: 0;
+            color: #1E293B;
+        }
+
+        .intonation-method {
+            border-radius: 14px;
+            border: 1px solid #F5B8B8;
+            background: #FFF8F8;
+            padding: 14px 16px;
+        }
+
+        .intonation-method h4 {
+            margin: 0 0 6px;
+            color: #B42318;
+            font-size: 1.02rem;
+            font-weight: 800;
+        }
+
+        .intonation-method p {
+            margin: 0 0 6px;
+            color: #7A2E2E;
+            line-height: 1.55;
+            font-size: 0.95rem;
+        }
+
+        .intonation-method p:last-child { margin-bottom: 0; }
+
+        @media (max-width: 768px) {
+            .intonation-card { padding: 14px 14px 12px; }
+            .intonation-title { font-size: 1.3rem; }
+            .intonation-token-row { gap: 8px 11px; }
+            .intonation-word { font-size: 0.96rem; }
+            .stress-bubble.stressed { width: 22px; height: 22px; }
+            .stress-bubble.light { width: 12px; height: 12px; }
+        }
+    </style>
+<!-- cleaned comment -->
+        <div class="footer">
+            <p>Generated by AI Speech Scoring System | Submission ID: {{ meta.submission_id }}</p>
+        </div>
+    </div>
+    
+    <style>
+        /* Modal Styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 100000;
+            backdrop-filter: blur(4px);
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal-container {
+            background: white;
+            width: 90%;
+            max-width: 800px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            animation: slideUp 0.3s ease-out;
+            display: flex;
+            flex-direction: column;
+            max-height: 90vh;
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .modal-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h2 {
+            font-size: 1.4rem;
+            margin: 0;
+            color: var(--accent);
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            font-size: 2rem;
+            line-height: 1;
+            cursor: pointer;
+            color: #999;
+        }
+
+        .modal-body {
+            padding: 24px;
+            overflow-y: auto;
+        }
+
+    </style>
+
+                <style>
+/* cleaned comment */
+        .pro-header {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            padding-bottom: 24px;
+            border-bottom: 1px solid #eee;
+            margin-bottom: 24px;
+        }
+        
+        .phoneme-analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 24px;
+        }
+        
+        .pattern-card {
+            background: white;
+            border: 1px solid #eee;
+            border-radius: 12px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+            transition: transform 0.2s;
+        }
+        .pattern-card:hover { transition: transform 0.2s; transform: translateY(-2px); box-shadow: 0 8px 16px rgba(0,0,0,0.06); }
+        
+        .pattern-header {
+            background: #F8FAFC;
+            padding: 14px 20px;
+            border-bottom: 1px solid #EEF2F6;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .phoneme-badge {
+            font-family: var(--font-heading);
+            font-weight: 700;
+            background: white;
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid #E2E8F0;
+            color: var(--text-primary);
+        }
+        
+        .phoneme-name {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+        
+        .pattern-section {
+            padding: 20px;
+        }
+        
+        .mistake-item {
+            margin-bottom: 24px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #F1F5F9;
+        }
+        .mistake-item:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+        
+        /* cleaned comment */
+        .comparison-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        
+        .comp-box {
+            flex: 1;
+            background: #F8FAFC;
+            border-radius: 8px;
+            padding: 10px;
+            text-align: center;
+            border: 1px solid transparent;
+        }
+        
+        .comp-box.error {
+            background: #FEF2F2;
+            border-color: #FEE2E2;
+        }
+        
+        .comp-box.target {
+            background: #F0FDF4;
+            border-color: #DCFCE7;
+        }
+        
+        .comp-box .label {
+            font-size: 0.75rem;
+            color: #64748B;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+        
+        .comp-box.error .label { color: #EF4444; }
+        .comp-box.target .label { color: #10B981; }
+        
+        .comp-box .value {
+            font-family: var(--font-heading);
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        
+        .comp-arrow {
+            color: #CBD5E1;
+            font-size: 1.2rem;
+            font-weight: bold;
+        }
+        
+        .mistake-desc {
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+            color: var(--text-secondary);
+            text-align: center;
+            background: #F8FAFC;
+            padding: 6px;
+            border-radius: 6px;
+        }
+        
+        .example-area {
+            background: #FFFFF;
+            border: 1px dashed #E2E8F0;
+            border-radius: 8px;
+            padding: 12px;
+        }
+        
+        .example-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .example-words {
+            list-style: none;
+            padding: 0;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        
+        .example-words li {
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .ex-text {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        
+        .ex-ipa {
+            color: #94A3B8;
+            font-family: inherit;
+        }
+        
+        .ex-ipa .err {
+            color: var(--color-missing);
+            font-weight: 700;
+            background: #FEF2F2; /* cleaned comment */
+            padding: 0 2px;
+            border-radius: 2px;
+        }
+        
+        .pattern-section.footer {
+            margin-top: auto;
+            border-top: 1px solid #EEF2F6;
+            background: #F8FAFC;
+            padding: 16px 20px;
+        }
+        
+        .pattern-section.footer p {
+            font-size: 0.9rem;
+            line-height: 1.6;
+            color: #475569;
+        }
+
+        /* Fluency insight card */
+        .gemini-insight-card {
+            background: linear-gradient(135deg, #F0F9FF 0%, #E6F3FF 100%);
+            border: 1px solid #BAE6FD;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 4px 15px rgba(2, 132, 199, 0.05);
+        }
+        
+        .gemini-insight-card::before {
+            content: "";
+            position: absolute;
+            top: -20px;
+            right: -20px;
+            width: 120px;
+            height: 120px;
+            background: radial-gradient(circle, rgba(56, 189, 248, 0.15) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .gemini-header {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #0284C7;
+            font-weight: 800;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .gemini-header span {
+            font-size: 1.2rem;
+        }
+
+        .gemini-motto {
+            font-family: var(--font-heading);
+            font-size: 1.3rem; /* cleaned comment */
+            font-weight: 700;
+            color: #0C4A6E;
+            margin-bottom: 12px;
+            font-style: italic;
+            line-height: 1.4;
+            position: relative;
+            z-index: 1;
+        }
+
+        .gemini-advice {
+            color: #334155;
+            font-size: 0.95rem;
+            line-height: 1.7;
+            position: relative;
+            z-index: 1;
+        }
+    </style>
+
+    <script>
+        // Modal Control
+                window.openIntonationModal = function() {
+            document.getElementById('intonationModal').classList.add('active');
+            document.body.style.overflow = 'hidden';
+            renderIntonationRhythm();
+        }
+
+        window.closeIntonationModal = function() {
+            document.getElementById('intonationModal').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+        function splitIntoIntonationSentences(words) {
+            const chunks = [];
+            let current = [];
+
+            for (let i = 0; i < words.length; i++) {
+                const w = words[i] || {};
+                current.push(w);
+
+                const pause = w.pause || null;
+                const pauseDuration = pause ? Number(pause.duration || 0) : 0;
+                const byPause = pauseDuration >= 0.38;
+                const byLength = current.length >= 16;
+                const isLast = i === words.length - 1;
+
+                if (byPause || byLength || isLast) {
+                    if (current.length >= 4) chunks.push(current);
+                    current = [];
+                }
+            }
+
+            if (!chunks.length && words.length) chunks.push(words);
+            return chunks;
+        }
+
+        function inferExpectedStressByWord(wordText) {
+            const token = String(wordText || '').toLowerCase().replace(/[^a-z']/g, '');
+            if (!token) return false;
+            const functionWords = new Set([
+                'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by',
+                'is', 'are', 'am', 'was', 'were', 'be', 'been', 'being',
+                'and', 'or', 'but', 'so', 'if', 'as', 'than', 'that', 'this', 'these', 'those',
+                'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+                'my', 'your', 'his', 'its', 'our', 'their',
+                'do', 'does', 'did', 'can', 'could', 'will', 'would', 'shall', 'should',
+                'have', 'has', 'had', 'not', 'no', 'yes', 'oh', 'too'
+            ]);
+            return !functionWords.has(token);
+        }
+
+        function quantile(values, q) {
+            if (!Array.isArray(values) || !values.length) return 0;
+            const sorted = [...values].sort((a, b) => a - b);
+            const pos = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * q)));
+            return sorted[pos];
+        }
+
+        function classifyStressToken(word, cutoff) {
+            const rawExpected = Number(word.expected_stress);
+            const expected = Number.isFinite(rawExpected)
+                ? rawExpected >= 0.62
+                : inferExpectedStressByWord(word.word);
+
+            const stressVal = Number(word.stress ?? 0);
+            const scoreVal = Number(word.score ?? 0);
+            const inferredStress = stressVal > 0.01
+                ? Math.max(0, Math.min(1, stressVal))
+                : Math.max(0, Math.min(1, scoreVal / 100));
+            const actual = inferredStress >= cutoff;
+            const tag = String(word.tag || '').toLowerCase();
+            const isMissing = tag === 'missing';
+            const isPoor = tag === 'poor';
+
+            if (expected) {
+                if (actual && !isMissing && !isPoor) {
+                    return { bubbleClass: 'ok stressed', wordClass: '', accurate: true, stressed: true, inferredStress };
+                }
+                return { bubbleClass: 'bad stressed', wordClass: 'bad', accurate: false, stressed: true, inferredStress };
+            }
+
+            if (actual && !isMissing && !isPoor) {
+                // Over-stress on a likely function/light word.
+                return { bubbleClass: 'bad light', wordClass: 'bad', accurate: false, stressed: false, inferredStress, overStress: true };
+            }
+            return { bubbleClass: 'silver light', wordClass: '', accurate: true, stressed: false, inferredStress, overStress: false };
+        }
+
+        function evaluateSentence(words) {
+            const tokens = [];
+            let stressTargets = 0;
+            let stressCorrect = 0;
+            const rawStress = words.map((w) => {
+                const s = Number(w.stress ?? 0);
+                const sc = Number(w.score ?? 0);
+                return s > 0.01 ? Math.max(0, Math.min(1, s)) : Math.max(0, Math.min(1, sc / 100));
+            });
+            const minStress = rawStress.length ? Math.min(...rawStress) : 0;
+            const maxStress = rawStress.length ? Math.max(...rawStress) : 1;
+            const spread = maxStress - minStress;
+            const q68 = quantile(rawStress, 0.68);
+            const cutoff = Math.max(0.56, Math.min(0.82, q68 + (spread < 0.06 ? 0.03 : 0)));
+
+            words.forEach((w) => {
+                const cls = classifyStressToken(w, cutoff);
+                if (cls.stressed) {
+                    stressTargets += 1;
+                    if (cls.accurate) stressCorrect += 1;
+                }
+                tokens.push({ word: w.word, cls });
+            });
+
+            const baseAccuracy = stressTargets > 0 ? Math.round((stressCorrect / stressTargets) * 100) : 0;
+            const stressedVals = tokens.filter((t) => t.cls.stressed).map((t) => Number(t.cls.inferredStress || 0));
+            const lightVals = tokens.filter((t) => !t.cls.stressed).map((t) => Number(t.cls.inferredStress || 0));
+            const missedStressCount = tokens.filter((t) => t.cls.stressed && !t.cls.accurate).length;
+            const overStressCount = tokens.filter((t) => t.cls.overStress).length;
+            const mean = (arr) => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
+            const contrast = stressedVals.length && lightVals.length ? (mean(stressedVals) - mean(lightVals)) : 0;
+            let penalty = 0;
+            if (stressTargets >= 2) {
+                if (contrast < 0.06) penalty += 25;
+                else if (contrast < 0.10) penalty += 14;
+                else if (contrast < 0.14) penalty += 7;
+            }
+            if (spread < 0.05) penalty += 8;
+            penalty += Math.min(18, overStressCount * 5);
+            const accuracy = Math.max(0, Math.min(100, baseAccuracy - penalty));
+            let issueScore = 0;
+            issueScore += missedStressCount * 3;
+            issueScore += overStressCount * 2;
+            if (contrast < 0.06) issueScore += 3;
+            else if (contrast < 0.10) issueScore += 2;
+            else if (contrast < 0.14) issueScore += 1;
+            if (spread < 0.05) issueScore += 1;
+            if (accuracy < 70) issueScore += 2;
+            else if (accuracy < 85) issueScore += 1;
+            return {
+                words,
+                tokens,
+                text: words.map((w) => w.word).join(' '),
+                stressTargets,
+                stressCorrect,
+                missedStressCount,
+                accuracy,
+                contrast,
+                spread,
+                overStressCount,
+                issueScore,
+            };
+        }
+
+        function pickBestAndWorst(sentenceStats) {
+            const analyzable = sentenceStats.filter((s) => Number(s.stressTargets || 0) >= 2);
+            const pool = analyzable.length ? analyzable : sentenceStats;
+            const sorted = [...pool].sort((a, b) => {
+                if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
+                return b.stressCorrect - a.stressCorrect;
+            });
+
+            const best = sorted[0] || null;
+            const bestText = best ? best.text : null;
+            let candidates = pool.filter((s) => !bestText || s.text !== bestText);
+            if (!candidates.length) candidates = pool;
+            const issueCandidates = candidates.filter((s) => Number(s.issueScore || 0) > 0);
+            const worstPool = issueCandidates.length ? issueCandidates : candidates;
+            const worst = [...worstPool].sort((a, b) => {
+                if ((b.issueScore || 0) !== (a.issueScore || 0)) return (b.issueScore || 0) - (a.issueScore || 0);
+                if (a.accuracy !== b.accuracy) return a.accuracy - b.accuracy;
+                if ((b.missedStressCount || 0) !== (a.missedStressCount || 0)) return (b.missedStressCount || 0) - (a.missedStressCount || 0);
+                return b.stressTargets - a.stressTargets;
+            })[0] || best;
+            return { best, worst };
+        }
+
+        function deriveIntonationIssue(stat) {
+            const under = stat.tokens
+                .filter((t) => t.cls.stressed && !t.cls.accurate)
+                .map((t) => String(t.word || '').toLowerCase());
+            const over = stat.tokens
+                .filter((t) => t.cls.overStress)
+                .map((t) => String(t.word || '').toLowerCase());
+            const miss = [...new Set(under)].filter(Boolean).slice(0, 3);
+            const overUniq = [...new Set(over)].filter(Boolean).slice(0, 3);
+
+            if (miss.length) {
+                return {
+                    title: `Key issue: missed stress on ${miss.join(' / ')}`,
+                    action: 'Fix: lengthen each focus word by about 0.1-0.2s and raise pitch slightly on its vowel.',
+                };
+            }
+            if (overUniq.length) {
+                return {
+                    title: `Key issue: over-stressed light words ${overUniq.join(' / ')}`,
+                    action: 'Fix: keep these words shorter and lighter; move emphasis back to content words.',
+                };
+            }
+            if (Number(stat.contrast || 0) < 0.10) {
+                return {
+                    title: 'Key issue: stress contrast is too flat in this sentence',
+                    action: 'Fix: keep 2-4 key stresses and reduce energy on connecting words.',
+                };
+            }
+            return {
+                title: 'Key issue: rhythm control is unstable in this sentence',
+                action: 'Fix: read once slowly with marked stress words, then repeat at normal pace.',
+            };
+        }
+
+        function buildCard(stat, variant) {
+            const title = variant === 'best' ? 'Best Performance' : 'Needs Improvement';
+            const issue = deriveIntonationIssue(stat);
+            const note = variant === 'best'
+                ? 'Stress rhythm is accurate and natural. Keep it up.'
+                : `${issue.title}. ${issue.action}`;
+
+            const cardClass = variant === 'best' ? 'intonation-card best' : 'intonation-card warning';
+            const titleClass = variant === 'best' ? 'intonation-title best' : 'intonation-title warning';
+            const accClass = variant === 'best' ? 'intonation-acc best' : 'intonation-acc warning';
+            const tokenHtml = stat.tokens.map((t) => `
+                <span class="intonation-token">
+                    <span class="stress-bubble ${t.cls.bubbleClass}"></span>
+                    <span class="intonation-word ${t.cls.wordClass}">${t.word}</span>
+                </span>
+            `).join('');
+
+            return `
+                <section class="${cardClass}">
+                    <div class="intonation-card-head">
+                        <h3 class="${titleClass}">${title}</h3>
+                        <span class="${accClass}">Accuracy ${stat.accuracy}%</span>
+                    </div>
+                    <div class="intonation-token-row">${tokenHtml}</div>
+                    <p class="intonation-note">${note}</p>
+                </section>
+            `;
+        }
+
+        function buildMethodPanel(stat) {
+            if (!stat) return '';
+            const weakWords = stat.tokens
+                .filter((t) => t.cls.stressed && !t.cls.accurate)
+                .map((t) => String(t.word || '').toLowerCase());
+            const overWords = stat.tokens
+                .filter((t) => t.cls.overStress)
+                .map((t) => String(t.word || '').toLowerCase());
+            const uniqueWeak = [...new Set(weakWords)].filter(Boolean).slice(0, 3);
+            const uniqueOver = [...new Set(overWords)].filter(Boolean).slice(0, 3);
+            const focusText = uniqueWeak.length
+                ? `Missed stress words: ${uniqueWeak.join(' / ')}`
+                : uniqueOver.length
+                    ? `Over-stressed light words: ${uniqueOver.join(' / ')}`
+                    : 'Focus words: keep stress on key content words in each sentence.';
+            const methodText = uniqueWeak.length
+                ? 'Method: for each focus word, slow down slightly, lengthen the vowel by about 0.1-0.2 seconds, and add a small pitch rise.'
+                : uniqueOver.length
+                    ? 'Method: compress these light words, reduce loudness, and keep your strongest energy on nouns/verbs/adjectives.'
+                    : 'Method: slightly lengthen stressed words by about 0.1-0.2 seconds and keep function words short. Keep 2-4 main stresses per sentence.';
+
+            return `
+                <section class="intonation-method">
+                    <h4>How to Improve Stress</h4>
+                    <p>${focusText}</p>
+                    <p>${methodText}</p>
+                </section>
+            `;
+        }
+
+        function renderIntonationRhythm() {
+            const root = document.getElementById('intonationRhythmRoot');
+            if (!root) return;
+
+            const words = {{ alignment.words | tojson | default('[]') }};
+            if (!Array.isArray(words) || words.length === 0) {
+                root.innerHTML = '<div class="intonation-empty">No intonation data available.</div>';
+                return;
+            }
+
+            const sentences = splitIntoIntonationSentences(words).map(evaluateSentence);
+            if (!sentences.length) {
+                root.innerHTML = '<div class="intonation-empty">No analyzable sentences were found.</div>';
+                return;
+            }
+
+            const { best, worst } = pickBestAndWorst(sentences);
+            const html = [
+                best ? buildCard(best, 'best') : '',
+                worst ? buildCard(worst, 'warning') : '',
+                worst ? buildMethodPanel(worst) : ''
+            ].join('');
+
+            root.innerHTML = html || '<div class="intonation-empty">No analyzable sentences were found.</div>';
+        }
+        
+        window.openPronunciationModal = function() {
+            document.getElementById('pronunciationModal').classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        window.closePronunciationModal = function() {
+            document.getElementById('pronunciationModal').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+
+    </script>
+    <!-- cleaned comment -->
+    <div id="fluencyModal" class="modal-overlay">
+        <div class="modal-container" style="max-width: 900px; max-height: 90vh; overflow-y: auto;">
+            <div class="modal-header">
+                <h2>Fluency Analysis (Fluency Analysis)</h2>
+                <button class="close-btn" onclick="closeFluencyModal()">&times;</button>
+            </div>
+            
+            <!-- Tab Navigation -->
+            <div class="modal-tabs">
+                <button class="tab-btn active" data-tab="pausing" onclick="switchFluencyTab('pausing', this)">Pausing</button>
+                <button class="tab-btn" data-tab="pace" onclick="switchFluencyTab('pace', this)">Pace</button>
+                <button class="tab-btn" data-tab="hesitations" data-tab="hesitations" onclick="switchFluencyTab('hesitations', this)">Hesitations</button>
+            </div>
+
+            <div class="modal-body">
+                 {% set fluency_components = (engine_raw.fluency_components if engine_raw and engine_raw.fluency_components is defined else None) %}
+                 {% set pausing_display_score = (fluency_components.pausing_score if fluency_components and fluency_components.pausing_score is defined else scores.fluency_100) %}
+                 {% set pace_display_score = (fluency_components.pace_score if fluency_components and fluency_components.pace_score is defined else None) %}
+                 {% set hesitation_display_score = (fluency_components.hesitation_score if fluency_components and fluency_components.hesitation_score is defined else None) %}
+
+                 <div style="display:flex; gap:12px; flex-wrap:wrap; margin: 4px 0 8px 0;">
+                    <div style="flex:1; min-width:180px; background:#FFF8F1; border:1px solid #FDE6C5; border-radius:10px; padding:10px 12px;">
+                        <div style="font-size:0.78rem; color:#9A6700; font-weight:800; text-transform:uppercase; letter-spacing:.4px;">Pausing subscore</div>
+                        <div style="font-size:1.15rem; color:#0F172A; font-weight:800; margin-top:3px;">{{ ('%.1f' % (pausing_display_score | float)).rstrip('0').rstrip('.') }}</div>
+                        <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">Weight in fluency: 72%</div>
+                    </div>
+                    <div style="flex:1; min-width:180px; background:#F0F9FF; border:1px solid #CFE8FF; border-radius:10px; padding:10px 12px;">
+                        <div style="font-size:0.78rem; color:#0369A1; font-weight:800; text-transform:uppercase; letter-spacing:.4px;">Pace subscore</div>
+                        <div style="font-size:1.15rem; color:#0F172A; font-weight:800; margin-top:3px;">{{ ('%.1f' % (pace_display_score | float)).rstrip('0').rstrip('.') if pace_display_score is not none else '--' }}</div>
+                        <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">Weight in fluency: 18%</div>
+                    </div>
+                    <div style="flex:1; min-width:180px; background:#F8F6FF; border:1px solid #E2D8FF; border-radius:10px; padding:10px 12px;">
+                        <div style="font-size:0.78rem; color:#6D28D9; font-weight:800; text-transform:uppercase; letter-spacing:.4px;">Hesitation subscore</div>
+                        <div style="font-size:1.15rem; color:#0F172A; font-weight:800; margin-top:3px;">{{ ('%.1f' % (hesitation_display_score | float)).rstrip('0').rstrip('.') if hesitation_display_score is not none else '--' }}</div>
+                        <div style="font-size:0.8rem; color:#64748B; margin-top:2px;">Weight in fluency: 10%</div>
+                    </div>
+                 </div>
+                 <div style="font-size:0.82rem; color:#64748B; margin: 0 0 14px 2px;">
+                    These are internal subscores used to compose Overall Fluency (not standalone module grades).
+                 </div>
+                  
+                 <!-- Tab 1: Pausing -->
+                 <div id="tab-pausing" class="tab-content active">
+                    <!-- cleaned comment -->
+                    <div class="pro-header">
+                        <div class="ring-container small">
+                             <div class="ring-center">
+                                <div class="value" style="font-size: 1.8rem; color: #FFA000;">{{ score_int(pausing_display_score) }}%</div>
+                                <div class="unit">{{ get_level(pausing_display_score) }}</div>
+                                <div style="font-size: 0.72rem; color: #64748B; font-weight: 700; margin-top: 4px;">Pausing Score</div>
+                            </div>
+                        </div>
+                        <div style="margin-left: 12px; align-self: center; font-size: 0.9rem; color: #475569;">
+                            Overall Fluency: <strong style="color:#0F172A;">{{ score_int(scores.fluency_100) }}%</strong>
+                        </div>
+                    <!-- Fluency Discovery -->
+                    {% if advisor_feedback and advisor_feedback.fluency_diagnosis %}
+                    <div class="gemini-insight-card">
+                        <div class="gemini-header">
+                            <span>*</span> Fluency Insight
+                        </div>
+                        <div class="gemini-motto">
+                            "{{ advisor_feedback.fluency_diagnosis.motto }}"
+                        </div>
+                        <div class="gemini-advice">
+                            {{ advisor_feedback.fluency_diagnosis.advice }}
+                        </div>
+                        <div style="margin-top: 12px; font-size: 0.85rem; color: #0284C7;">
+                            <strong>Diagnosis:</strong> {{ advisor_feedback.fluency_diagnosis.status }}
+                        </div>
+                    </div>
+                    {% endif %}
+                    </div> <!-- Close pro-header -->
+
+                    <!-- cleaned comment -->
+                    <div class="legend-bar">
+                        <div class="legend-item"><span class="mark-icon good">H</span> Good Pauses</div>
+                        <div class="legend-item"><span class="mark-icon optional">H</span> Optional Pauses</div>
+                        <div class="legend-item"><span class="mark-icon bad">H</span> Bad Pauses</div>
+                        {% if show_missing_break %}
+                        <div class="legend-item"><span class="mark-icon missed">I</span> Missed Pauses</div>
+                        {% endif %}
+                    </div>
+                    {% if not show_missing_break %}
+                    <div style="margin: 8px 0 10px; color:#64748B; font-size:12px;">
+                        Missing break is hidden because timestamp confidence is low.
+                    </div>
+                    {% endif %}
+
+                    <!-- Transcript Area -->
+                    <div class="transcript-box">
+                        <h3>Transcript</h3>
+                        <div class="transcript-content">
+                            {% for word in alignment.words %}
+                                <span class="t-word">{{ word.word }}</span>
+                                
+                                {% if word.pause %}
+                                    {% if word.pause.type == 'missed' %}
+                                        {% if show_missing_break %}
+                                        <span class="pause-mark missed" title="Missed Pause"></span>
+                                        {% endif %}
+                                    {% else %}
+                                        <!-- Dynamic width based on duration (mock logic: 0.1s = 5px) -->
+                                        <span class="pause-mark h-bar {{ word.pause.type }}" 
+                                              style="width: 40px;" 
+                                              title="{{ word.pause.type|capitalize }}: {{ word.pause.duration }}">
+                                        </span>
+                                    {% endif %}
+                                {% endif %}
+                            {% endfor %}
+                        </div>
+                    </div>
+                 </div>
+
+                 <div id="tab-pace" class="tab-content">
+                    {% set avg_wpm = 0 %}
+                    {# Unified data path to avoid nested scoping issues #}
+                    {% set current_pace_data = pace_chart_data | default(analysis.pace_chart_data) | default([]) %}
+                    
+                    {% if current_pace_data and current_pace_data|length > 0 %}
+                         {% set avg_wpm = (current_pace_data | map(attribute='y') | sum / current_pace_data|length) | int %}
+                    {% endif %}
+                    {% if avg_wpm < 20 %}{% set avg_wpm = 20 %}{% endif %}
+                    {% if avg_wpm > 240 %}{% set avg_wpm = 240 %}{% endif %}
+                    
+                    {% set pace_status = "Natural" %}
+                    {% set pace_msg = "Your pace is natural and easy to follow. Great job!" %}
+                    {% set pace_color = "#22c55e" %} {# Green #}
+                    
+                    {# Logic for Status and Gauge Needle #}
+                    {# Map 0-250 WPM to -90 to 90 deg #}
+                    {% set needle_deg = ((avg_wpm / 250) * 180 - 90) %}
+                    {% if needle_deg > 90 %} {% set needle_deg = 90 %} {% endif %}
+                    {% if needle_deg < -90 %} {% set needle_deg = -90 %} {% endif %}
+
+                    {% if avg_wpm < 95 %}
+                        {% set pace_status = "Too Slow" %}
+                        {% set pace_msg = "Your pace was a little Too slow during this recording!" %}
+                        {% set pace_color = "#f59e0b" %} {# Amber #}
+                    {% elif avg_wpm > 155 %}
+                        {% set pace_status = "Too Fast" %}
+                        {% set pace_msg = "Whoa! You're speaking a bit too fast. Try to slow down for better clarity." %}
+                        {% set pace_color = "#ef4444" %} {# Red #}
+                    {% endif %}
+
+                    <div class="pace-inner-box" style="padding: 24px; min-height: 400px; display: block !important;">
+                        <h2 style="font-size: 1.6rem; color: #1E293B; margin-bottom: 24px; border-bottom: 2px solid #F1F5F9; padding-bottom: 12px;">Pace Analysis Overview</h2>
+                        <div class="pace-overview" style="display: flex; gap: 40px; align-items: flex-start; margin-bottom: 40px;">
+                        <div class="gauge-section" style="flex: 0 0 250px; position: relative;">
+                             <svg width="250" height="150" viewBox="0 0 250 150" class="gauge-svg">
+                                <!-- Background Track -->
+                                <path d="M 30 130 A 90 90 0 0 1 220 130" fill="none" stroke="#F1F5F9" stroke-width="24" stroke-linecap="round" />
+                                
+                                <!-- Color Zones -->
+                                <!-- Slow Zone (50-120) -->
+                                <path d="M 30 130 A 90 90 0 0 1 100 50" fill="none" stroke="#F59E0B" stroke-width="24" stroke-opacity="0.2" />
+                                <!-- Natural Zone (120-180) -->
+                                <path d="M 100 50 A 90 90 0 0 1 150 50" fill="none" stroke="#22C55E" stroke-width="24" stroke-opacity="0.8" />
+                                <!-- Fast Zone (180-250) -->
+                                <path d="M 150 50 A 90 90 0 0 1 220 130" fill="none" stroke="#EF4444" stroke-width="24" stroke-opacity="0.2" />
+
+                                <!-- Needle (More Premium Design) -->
+                                <g class="gauge-needle" style="transform: rotate({{ needle_deg }}deg); transform-origin: 125px 130px; transition: transform 2s cubic-bezier(0.34, 1.56, 0.64, 1);">
+                                    <path d="M 122 130 L 125 45 L 128 130 Z" fill="#334155" />
+                                    <circle cx="125" cy="130" r="10" fill="#334155" />
+                                    <circle cx="125" cy="130" r="4" fill="#94A3B8" />
+                                </g>
+
+                                <!-- Labels -->
+                                <text x="25" y="145" font-size="12" fill="#94A3B8" font-weight="600">Slow</text>
+                                <text x="125" y="145" font-size="12" fill="#22C55E" text-anchor="middle" font-weight="700">Natural</text>
+                                <text x="225" y="145" font-size="12" fill="#EF4444" text-anchor="end" font-weight="600">Fast</text>
+                                
+                                <!-- Scale Ticks (Deeper Gray) -->
+                                <text x="42" y="112" font-size="9" fill="#94A3B8" font-weight="600">50</text>
+                                <text x="72" y="72" font-size="9" fill="#94A3B8" font-weight="600">90</text>
+                                <text x="125" y="42" font-size="9" fill="#94A3B8" text-anchor="middle" font-weight="600">150</text>
+                                <text x="178" y="72" font-size="9" fill="#94A3B8" font-weight="600">210</text>
+                                <text x="210" y="112" font-size="9" fill="#94A3B8" font-weight="600">250</text>
+                            </svg>
+                            <div style="text-align: center; margin-top: -25px; position: relative; z-index: 10;">
+                                <div style="font-size: 2.8rem; font-weight: 900; color: #0F172A; line-height: 1; letter-spacing: -1px;">{{ avg_wpm }}</div>
+                                <div style="font-size: 0.8rem; color: #64748B; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; margin-top: 2px;">wpm</div>
+                                <div style="margin-top: 10px; display: inline-block; padding: 4px 12px; background: {{ pace_color }}15; color: {{ pace_color }}; border-radius: 20px; font-size: 0.9rem; font-weight: 800; border: 1px solid {{ pace_color }}30;">
+                                    {{ pace_status }}
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="pace-text" style="flex: 1; padding-top: 5px;">
+                            <div style="display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px;">
+                                <h3 style="font-size: 1.8rem; font-weight: 800; color: #1E293B; margin: 0;">Pace</h3>
+                                <div style="font-size: 0.9rem; color: #94A3B8; cursor: help;" title="Words Per Minute: A measure of talking speed.">i</div>
+                            </div>
+                            <p style="font-size: 1.15rem; color: #475569; margin-bottom: 24px; line-height: 1.6;">{{ pace_msg }}</p>
+                            
+                            <div style="background: #F0F9FF; border-radius: 16px; padding: 20px; border: 1px dashed #BAE6FD; position: relative; overflow: hidden;">
+                                <div style="position: absolute; top: -10px; right: -10px; font-size: 4rem; opacity: 0.05; transform: rotate(15deg);">*</div>
+                                <div style="font-weight: 800; color: #0369A1; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; font-size: 0.75rem; display: flex; align-items: center; gap: 6px;">
+                                    <span>*</span> Top Performance Tip
+                                </div>
+                                <div style="font-size: 1rem; color: #0C4A6E; line-height: 1.6; font-weight: 500;">
+                                    To sound more natural, aim for clusters of **5-8 words** between pauses. This creates a rhythmic flow that engages your audience.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="pace-trend-card" style="background: white; border-radius: 16px; border: 1px solid #E2E8F0; padding: 24px;">
+                        <div style="margin-bottom: 24px;">
+                            <h3 style="font-size: 1.25rem; font-weight: 700; color: #1E293B; margin-bottom: 8px;">An overview of your Pace during this recording</h3>
+                            <p style="font-size: 0.95rem; color: #64748B;">Make sure you maintain a natural pace (between <strong>95 and 155 words per minute</strong>) when you speak. This will help your audience stay connected.</p>
+                        </div>
+                        
+                        <div class="chart-container" style="height: 300px; width: 100%; position: relative;">
+                            <canvas id="paceChart"></canvas>
+                            <!-- Axis Labels Overlay -->
+                            <div style="position: absolute; left: 0; top: 0; font-size: 0.8rem; color: #94A3B8;">Wpm 250</div>
+                            <div style="position: absolute; right: 0; bottom: -20px; font-size: 0.8rem; color: #94A3B8;">Timestamp</div>
+                            
+                            <div style="position: absolute; right: 12px; top: 120px; font-size: 0.75rem; color: #10B981; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8;">Normal</div>
+                            <div style="position: absolute; right: 12px; top: 20px; font-size: 0.75rem; color: #EF4444; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8;">Too Fast</div>
+                            <div style="position: absolute; right: 12px; bottom: 50px; font-size: 0.75rem; color: #F59E0B; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8;">Too Slow</div>
+                        </div>
+                    </div>
+                    </div> <!-- Close pace-inner-box -->
+                 </div>
+
+
+                 <!-- Tab 3: Hesitations -->
+                 {% if hesitations %}
+                 <div id="tab-hesitations" class="tab-content">
+                    <div class="hesi-dashboard">
+                        <div class="hesi-ring">
+                            <div class="ring-circle">
+                                <span>*</span>
+                                <div class="label">{{ hesitations.score_label }}</div>
+                            </div>
+                        </div>
+                        <div class="hesi-info">
+                            <h3>Hesitations (Disfluency)</h3>
+                            <p>{{ hesitations.desc }}</p>
+                        </div>
+                    </div>
+                    
+                    <div class="hesi-cols">
+                        <div class="hesi-col">
+                            <h4>Key disfluency signals</h4>
+                            <div class="filler-chart">
+                                {% for item in hesitations.fillers %}
+                                <div class="filler-row">
+                                    <span class="f-word">{{ item.word }}</span>
+                                    <div class="f-bar-container">
+                                        <div class="f-bar" style="width: {{ item.count * 20 }}px;"></div>
+                                    </div>
+                                    <span class="f-count">{{ item.count }} times</span>
+                                </div>
+                                {% endfor %}
+                            </div>
+                        </div>
+                        <div class="hesi-col">
+                            <h4>Say these sentences confidently</h4>
+                            {% for ex in hesitations.examples %}
+                            <div class="hesi-example">
+                                <div class="ex-row you">
+                                    <span class="label">You:</span>
+                                    <!-- Highlight filler if simple string match -->
+                                    <span class="text">{{ ex.original_text.replace(ex.filler, '<span class="filler">' + ex.filler + '</span>') | safe }}</span>
+                                </div>
+                                <div class="ex-row try">
+                                    <span class="label">Try:</span>
+                                    <span class="text">{{ ex.clean_text }}</span>
+                                </div>
+                            </div>
+                            {% endfor %}
+                            <div class="hesi-tips">
+                                <h4>Suggestion</h4>
+                                <ul>
+                                    {% for tip in hesitations.tips %}
+                                    <li>{{ tip }}</li>
+                                    {% endfor %}
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                 </div>
+                 {% endif %}
+
+            </div>
+        </div>
+    </div>
+
+    <style>
+        /* Modal Tabs */
+        .modal-tabs {
+            display: flex;
+            border-bottom: 1px solid #eee;
+            margin-bottom: 20px;
+            padding: 0 24px;
+        }
+        .tab-btn {
+            padding: 12px 20px;
+            background: none;
+            border: none;
+            font-size: 1rem;
+            color: #64748B;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-weight: 500;
+        }
+        .tab-btn.active {
+            color: #2563EB;
+            border-bottom-color: #2563EB;
+        }
+        
+        .tab-content {
+            display: none;
+            animation: fadeIn 0.3s ease;
+        }
+        /* Active tab must be visible - using high specificity */
+        .modal-body .tab-content.active {
+            display: block !important;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Fluency Specific Styles */
+        .legend-bar {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            padding: 12px;
+            background: #FAFAFA;
+            border-radius: 8px;
+            border: 1px solid #eee;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            color: #555;
+        }
+        
+        .mark-icon {
+            display: inline-block;
+            font-weight: bold;
+            font-size: 0.8rem;
+        }
+        .mark-icon.good { color: #4CAF50; }
+        .mark-icon.bad { color: #FF5252; }
+        .mark-icon.optional { color: #9E9E9E; }
+        .mark-icon.missed { color: #FF5252; border-left: 3px solid #FF5252; height: 12px; width: 0; content: ' '; }
+        
+        .transcript-box {
+            background: white;
+            border: 1px solid #eee;
+            border-radius: 12px;
+            padding: 24px;
+        }
+        
+        .transcript-content {
+            font-size: 1.1rem;
+            line-height: 2.2; /* High line-height for pause bars */
+            color: #333;
+        }
+        
+        .t-word {
+            display: inline-block;
+        }
+        
+        /* Pause Visualization */
+        .pause-mark {
+            display: inline-block;
+            vertical-align: middle;
+            margin: 0 6px;
+            position: relative;
+        }
+        
+        /* Missed Pause (I-Bar) */
+        .pause-mark.missed {
+            height: 24px;
+            width: 4px;
+            background-color: #FF5252;
+            border-radius: 2px;
+            transform: translateY(-2px);
+        }
+        
+        /* H-Bar Style */
+        .pause-mark.h-bar {
+            height: 14px;
+            border-left: 2px solid;
+            border-right: 2px solid;
+            min-width: 20px;
+        }
+        
+        .pause-mark.h-bar::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background-color: currentColor;
+            transform: translateY(-50%);
+        }
+        
+        .pause-mark.good { color: #4CAF50; border-color: #4CAF50; }
+        .pause-mark.bad { color: #FF5252; border-color: #FF5252; }
+        .pause-mark.optional { color: #BDBDBD; border-color: #BDBDBD; }
+        
+        /* Pace Chart Styles */
+        .pace-box {
+            background: white;
+            border: 1px solid #eee;
+            border-radius: 12px;
+            padding: 24px;
+        }
+        .pace-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .pace-legend {
+            font-size: 0.85rem;
+            color: #666;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .dot-legend.natural {
+            width: 12px;
+            height: 12px;
+            background-color: rgba(76, 175, 80, 0.2);
+            border: 1px solid rgba(76, 175, 80, 0.5); 
+            display: inline-block;
+        }
+        .pace-desc {
+            font-size: 0.9rem;
+            color: #888;
+            margin-bottom: 20px;
+        }
+        
+        /* Hesitations Styles */
+        .hesi-dashboard {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #F8FAFC;
+            border-radius: 12px;
+        }
+        .hesi-ring .ring-circle {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 6px solid #4CAF50;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: #4CAF50;
+        }
+        .hesi-ring span { font-size: 2rem; line-height: 1; }
+        .hesi-ring .label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase;}
+        
+        .hesi-cols { display: flex; gap: 40px; }
+        .hesi-col { flex: 1; }
+        .hesi-col h4 { margin-top: 0; margin-bottom: 16px; font-size: 1rem; color: #334155;}
+        
+        .filler-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px;
+            font-size: 0.9rem;
+        }
+        .f-word { width: 60px; font-weight: 500; }
+        .f-bar-container { flex: 1; margin: 0 12px; }
+        .f-bar { height: 8px; background: #FCD34D; border-radius: 4px; }
+        .f-count { width: 60px; text-align: right; color: #94A3B8; font-size: 0.8rem;}
+        
+        .hesi-example {
+            background: #fff;
+            border: 1px solid #E2E8F0;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 20px;
+        }
+        .ex-row { display: flex; gap: 12px; margin-bottom: 8px; font-size: 0.95rem; }
+        .ex-row:last-child { margin-bottom: 0; }
+        .ex-row .label { font-weight: 600; width: 80px; flex-shrink: 0; }
+        .ex-row.you .label { color: #64748B; }
+        .ex-row.try .label { color: #10B981; }
+        .ex-row .text .filler { color: #F59E0B; font-weight: bold; }
+        
+        .hesi-tips ul { padding-left: 20px; margin: 0; }
+        .hesi-tips li { margin-bottom: 8px; color: #475569; font-size: 0.9rem; }
+
+    </style>
+
+    <script>
+        // Fluency Modal Tab Logic
+        function switchFluencyTab(tabName, btnElement) {
+            console.log("Switching to tab:", tabName);
+            
+            // 1. Update Tab Buttons
+            document.querySelectorAll('.modal-tabs .tab-btn').forEach(btn => btn.classList.remove('active'));
+            if (btnElement) {
+                btnElement.classList.add('active');
+            } else {
+                // Try to find it by text or data-tab if needed, but usually btnElement is passed
+                console.warn("btnElement not passed to switchFluencyTab");
+            }
+            
+            // 2. Hide all tab content - relying on CSS class is safer
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+                // Don't force style.display if we use !important in CSS, but let's be safe
+                content.style.setProperty('display', 'none', 'important'); 
+            });
+            
+            // 3. Show target tab content
+            const targetContent = document.getElementById(`tab-${tabName}`);
+            if (targetContent) {
+                targetContent.classList.add('active');
+                targetContent.style.setProperty('display', 'block', 'important');
+                console.log("Tab content shown:", `tab-${tabName}`);
+            } else {
+                console.error("Tab content NOT found in DOM:", `tab-${tabName}`);
+            }
+            
+            // 4. Handle Pace Chart Specifics
+            if (tabName === 'pace') {
+                if (typeof initPaceChart === 'function') {
+                    initPaceChart();
+                } else {
+                    console.error("initPaceChart is not defined!");
+                }
+            }
+        }
+        
+        // Fluency Modal
+        let paceChartInstance = null;
+        
+        function openFluencyModal() {
+            document.getElementById('fluencyModal').classList.add('active');
+            document.body.style.overflow = 'hidden';
+            
+            // Re-init chart if we are on the pace tab
+            const activeBtn = document.querySelector('.modal-tabs .tab-btn.active');
+            if (activeBtn && activeBtn.getAttribute('data-tab') === 'pace') {
+                initPaceChart();
+            }
+        }
+
+        function closeFluencyModal() {
+            document.getElementById('fluencyModal').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+        
+        function initPaceChart() {
+            console.log("Initializing Pace Chart...");
+            const chartCanvas = document.getElementById('paceChart');
+            if (!chartCanvas) {
+                console.error("paceChart canvas not found in DOM");
+                return;
+            }
+            const ctx = chartCanvas.getContext('2d');
+            
+            // Safer data extraction - Use global context directly
+            let rawData = [];
+            try {
+                // Try top-level first, then nested
+                rawData = {{ pace_chart_data | default(analysis.pace_chart_data) | default([]) | tojson }};
+                rawData = (Array.isArray(rawData) ? rawData : []).map((p) => ({
+                    x: Number(p?.x ?? 0),
+                    y: Math.max(20, Math.min(240, Number(p?.y ?? 0)))
+                }));
+                console.log("Pace Data loaded successfully:", rawData);
+            } catch (e) {
+                console.error("Failed to parse pace data from Jinja:", e);
+            }
+            
+            if (!rawData || rawData.length === 0) {
+                console.warn("Pace Data is empty - rendering placeholder");
+                ctx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
+                ctx.font = "14px Inter";
+                ctx.fillStyle = "#94A3B8";
+                ctx.textAlign = "center";
+                ctx.fillText("Not enough speech data for pace analysis", chartCanvas.width / 2, chartCanvas.height / 2);
+                return;
+            } 
+            
+            // Custom Plugin to draw the "Natural Zone" background
+            const naturalZonePlugin = {
+                id: 'naturalZone',
+                beforeDraw: (chart) => {
+                    const { ctx, chartArea: { top, bottom, left, right }, scales: { y } } = chart;
+                    const yHigh = y.getPixelForValue(180);
+                    const yLow = y.getPixelForValue(120);
+                    
+                    ctx.save();
+                    ctx.fillStyle = 'rgba(34, 197, 94, 0.1)'; 
+                    ctx.fillRect(left, yHigh, right - left, yLow - yHigh);
+                    ctx.restore();
+                }
+            };
+
+            if (window.paceChartInstance) {
+                window.paceChartInstance.destroy();
+                window.paceChartInstance = null;
+            }
+            
+            window.paceChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: [{
+                        label: 'WPM',
+                        data: rawData,
+                        borderColor: '#3B82F6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        borderWidth: 3,
+                        fill: true,
+                        tension: 0.45,
+                        pointRadius: 4,
+                        pointHoverRadius: 8,
+                        pointBackgroundColor: '#3B82F6',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    layout: {
+                        padding: {
+                            top: 20,
+                            right: 60,
+                            bottom: 10
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            suggestedMax: 250,
+                            grid: { 
+                                color: '#F1F5F9',
+                                drawBorder: false
+                            },
+                            ticks: {
+                                color: '#94A3B8',
+                                font: { size: 10, weight: 600 },
+                                stepSize: 50
+                            }
+                        },
+                        x: {
+                            type: 'linear',
+                            position: 'bottom',
+                            grid: { display: false },
+                            ticks: {
+                                color: '#94A3B8',
+                                font: { size: 10, weight: 600 },
+                                callback: (val) => val + 's'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            backgroundColor: '#0F172A',
+                            titleFont: { size: 13, weight: 700 },
+                            bodyFont: { size: 13 },
+                            padding: 12,
+                            cornerRadius: 10,
+                            displayColors: false,
+                            callbacks: {
+                                label: (ctx) => ` Speed: ${ctx.parsed.y} WPM`
+                            }
+                        }
+                    }
+                },
+                plugins: [naturalZonePlugin]
+            });
+        }
+    </script>
+    <!-- cleaned comment -->
+    <div id="completenessModal" class="modal-overlay">
+        <div class="modal-container" style="max-width: 900px;">
+            <div class="modal-header">
+                <h2>Completeness Analysis (Completeness Analysis)</h2>
+                <button class="close-btn" onclick="closeCompletenessModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                {% if completeness_analysis %}
+                <!-- Metrics Dashboard -->
+                <div class="comp-dashboard">
+                    <div class="comp-metric main">
+                        <div class="c-value">{{ completeness_analysis.coverage }}%</div>
+                        <div class="c-label">Coverage</div>
+                    </div>
+                    <div class="comp-divider"></div>
+                    <div class="comp-metric">
+                        <div class="c-value red">{{ completeness_analysis.missing_stats.total }}</div>
+                        <div class="c-label">Missed</div>
+                    </div>
+                    <div class="comp-metric">
+                        <div class="c-value">{{ completeness_analysis.missing_stats.keywords }}</div>
+                        <div class="c-label">Keywords</div>
+                    </div>
+                    <div class="comp-metric">
+                        <div class="c-value">{{ completeness_analysis.missing_stats.function_words }}</div>
+                        <div class="c-label">Function Words</div>
+                    </div>
+                </div>
+
+                <!-- Insight Alert -->
+                <div class="comp-insight">
+                    <span class="icon">*</span>
+                    <span class="text">{{ completeness_analysis.insight }}</span>
+                </div>
+
+                <!-- Ghost Text View -->
+                <div class="ghost-box">
+                    <h3>Ghost Words View</h3>
+                    <p class="ghost-desc">
+                        Words shown as <span class="ghost-word demo">faded words</span> are the parts that were missed.
+                    </p>
+                    <div class="ghost-content">
+                        {% for word in alignment.words %}
+                            {% if word.tag == 'missing' %}
+                                <span class="ghost-word" title="You missed this word">{{ word.word }}</span>
+                            {% else %}
+                                <span class="normal-word">{{ word.word }}</span>
+                            {% endif %}
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <!-- Tips -->
+                <div class="comp-tips">
+                    <h4>Suggestions</h4>
+                    <ul>
+                        {% for tip in completeness_analysis.tips %}
+                        <li>{{ tip }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <style>
+        /* Completeness Styles */
+        .comp-dashboard {
+            display: flex;
+            align-items: center;
+            background: #F8FAFC;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            justify-content: space-around;
+        }
+        .comp-metric { text-align: center; }
+        .comp-metric .c-value { font-size: 1.8rem; font-weight: 700; color: #1E293B; line-height: 1.2; }
+        .comp-metric .c-value.red { color: #EF4444; }
+        .comp-metric.main .c-value { font-size: 2.5rem; color: #3B82F6; }
+        .comp-metric .c-label { font-size: 0.8rem; color: #64748B; text-transform: uppercase; margin-top: 4px; font-weight: 600; }
+        .comp-divider { width: 1px; height: 50px; background: #E2E8F0; }
+
+        .comp-insight {
+            background: #EFF6FF;
+            border: 1px solid #DBEAFE;
+            padding: 16px;
+            border-radius: 8px;
+            color: #1E40AF;
+            margin-bottom: 24px;
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+
+        .ghost-box {
+            background: white;
+            border: 2px dashed #E2E8F0;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        .ghost-box h3 { margin-top: 0; color: #334155; }
+        .ghost-desc { color: #64748B; font-size: 0.9rem; margin-bottom: 16px; }
+        
+        .ghost-content {
+            font-size: 1.2rem;
+            line-height: 1.8;
+            color: #1E293B;
+        }
+        .normal-word { margin-right: 4px; }
+        .ghost-word {
+            display: inline-block;
+            color: #EF4444;
+            opacity: 0.4;
+            text-decoration: line-through;
+            margin-right: 4px;
+            font-weight: bold;
+        }
+        .ghost-word.demo { margin: 0 4px; }
+
+        .comp-tips h4 { color: #334155; margin-bottom: 12px; }
+        .comp-tips ul { padding-left: 20px; color: #475569; }
+        .comp-tips li { margin-bottom: 8px; }
+    </style>
+
+    <script>
+        function openCompletenessModal() {
+            document.getElementById('completenessModal').classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+        function closeCompletenessModal() {
+            document.getElementById('completenessModal').classList.remove('active');
+            document.body.style.overflow = '';
+        }
+        // Fallback: Add event listeners manually to ensure clicks work
+        document.addEventListener('DOMContentLoaded', function() {
+            const fluencyCard = document.querySelector('.skill-card.fluency');
+            if (fluencyCard) {
+                fluencyCard.addEventListener('click', function(e) {
+                    console.log("Fluency card clicked via listener");
+                    e.preventDefault();
+                    if (window.openFluencyModal) {
+                        window.openFluencyModal();
+                    } else {
+                        console.error("openFluencyModal not found on window");
+                    }
+                });
+            }
+
+            const intonationCard = document.querySelector('.skill-card.intonation');
+            if (intonationCard) {
+                intonationCard.addEventListener('click', function(e) {
+                    console.log("Intonation card clicked via listener");
+                    e.preventDefault();
+                    if (window.openIntonationModal) {
+                        window.openIntonationModal();
+                    }
+                });
+            }
+            
+            const pronunciationCard = document.querySelector('.skill-card.pronunciation');
+            if (pronunciationCard) {
+                pronunciationCard.addEventListener('click', function(e) {
+                     e.preventDefault();
+                     if (window.openPronunciationModal) window.openPronunciationModal();
+                });
+            }
+            
+             const completenessCard = document.querySelector('.skill-card.completeness');
+            if (completenessCard) {
+                completenessCard.addEventListener('click', function(e) {
+                     e.preventDefault();
+                     if (window.openCompletenessModal) window.openCompletenessModal();
+                });
+            }
+
+            // All tab clicks are handled by switchFluencyTab(tabName, this) via onclick attribute.
+        });
+    </script>
+</body>
+</html>
+

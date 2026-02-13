@@ -1,0 +1,1308 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Printer, GripVertical, Check, X, Plus, Eye, Camera, Download } from 'lucide-react';
+import JSZip from 'jszip';
+
+// 闂佸憡鐟崹鎶藉极閵堝憘鐔煎灳閾忣偄浠撮柣搴ゎ潐閻喚绮?
+interface ModuleConfig {
+    id: string;
+    name: string;
+    icon: string;
+    description: string;
+    isDefault: boolean;
+}
+
+const AVAILABLE_MODULES: ModuleConfig[] = [
+    { id: 'score_overview', name: 'Score Overview', icon: 'OV', description: 'Overall + four dimensions', isDefault: true },
+    { id: 'text_highlight', name: 'Reading Analysis', icon: 'RA', description: 'Evidence view only (no extra scoring)', isDefault: true },
+    { id: 'pronunciation_diagnosis', name: 'Pronunciation', icon: 'PR', description: 'Word/phoneme diagnostics', isDefault: true },
+    { id: 'ai_feedback', name: 'Integrated Feedback', icon: 'FB', description: '2-3 encouraging sentences + 1 core issue', isDefault: true },
+    { id: 'fluency_analysis', name: 'Fluency', icon: 'FL', description: 'Pausing + Pace + Hesitation (one score)', isDefault: false },
+    { id: 'intonation_analysis', name: 'Prosody', icon: 'PS', description: 'Stress and rhythm (bouncing balls)', isDefault: false },
+    { id: 'completeness', name: 'Completeness', icon: 'CP', description: 'Missing/extra words coverage', isDefault: false },
+    { id: 'hesitation', name: 'Hesitation Detail', icon: 'HS', description: 'Fluency sub-metric only', isDefault: false },
+];
+
+// 闂佺硶鏅炲銊ц姳椤掑倵鍋撻崷顓炰槐婵?JSON 缂傚倷鐒﹂幐濠氭倵椤栫偞鍎嶉柛鏇ㄥ墮婢跺秹鏌涘▎娆戝埌闁伙絿鍋撶粙?
+interface ReportData {
+    meta: {
+        student_id: string;
+        student_name: string;
+        timestamp: string;
+    };
+    scores: {
+        overall_100: number;
+        pronunciation_100: number;
+        fluency_100: number;
+        intonation_100: number;
+        completeness_100: number;
+    };
+    alignment: {
+        words: Array<{
+            word: string;
+            tag: string;
+            score: number;
+            start?: number;
+            end?: number;
+            stress?: number;
+            expected_stress?: number;
+            diagnosis?: string;
+            pause?: {
+                type: 'good' | 'optional' | 'bad' | 'missed';
+                duration: number;
+            };
+        }>;
+        phonemes?: Array<{
+            phoneme: string;
+            start?: number;
+            end?: number;
+            score?: number;
+            in_word?: string;
+        }>;
+    };
+    analysis: {
+        weak_words: string[];
+        weak_phonemes: string[];
+        missing_words: string[];
+        mistakes: Array<{
+            type: string;
+            target: string;
+            word: string;
+            desc: string;
+            severity: string;
+            score: number;
+        }>;
+        hesitations?: {
+            total_count: number;
+            filler_count: number;
+            long_pause_count: number;
+            filler_words: string[];
+        };
+        completeness?: {
+            expected_words: number;
+            spoken_words: number;
+            missing_count: number;
+        };
+        intonation_analysis?: {
+            best_sentence?: {
+                sentence: string;
+                words: Array<{ word: string; is_stressed: boolean; stress_correct: boolean }>;
+                stress_accuracy: number;
+                tip: string;
+            };
+            problem_sentences: Array<{
+                sentence: string;
+                words: Array<{ word: string; is_stressed: boolean; stress_correct: boolean }>;
+                stress_accuracy: number;
+                tip: string;
+            }>;
+        };
+    };
+    engine_raw: {
+        pause_count?: number;
+        total_pause_duration?: number;
+        wpm?: number;
+        pause_profile?: {
+            synthetic_timeline?: number;
+            low_confidence_timing?: number;
+            timing_confidence?: string;
+            median_gap?: number;
+            gap_std?: number;
+            fixed_gap_ratio?: number;
+        };
+        integrated_feedback: {
+            overall_comment: string;
+            specific_suggestions: string[];
+            practice_tips: string[];
+            fun_challenge: string;
+        };
+    };
+}
+
+type WordPhonemeCell = {
+    symbol: string;
+    score: number;
+    start: number;
+};
+
+type WordDetailData = {
+    header: string;
+    symbols?: string;
+    scores?: string;
+    fallbackRows?: string[];
+};
+
+const normalizeToken = (text: string) => String(text || '').toLowerCase().replace(/[^a-z']/g, '');
+
+const ARPABET_TO_IPA: Record<string, string> = {
+    AA: '闁?,
+    AE: '闊?,
+    AH: '闁?,
+    AO: '闁?,
+    AW: 'a闁?,
+    AY: 'a闁?,
+    B: 'b',
+    CH: 't闁?,
+    D: 'd',
+    DH: '闁?,
+    EH: 'e',
+    ER: '闁?,
+    EY: 'e闁?,
+    F: 'f',
+    G: '濞?,
+    HH: 'h',
+    IH: '闁?,
+    IY: 'i',
+    JH: 'd闁?,
+    K: 'k',
+    L: 'l',
+    M: 'm',
+    N: 'n',
+    NG: '闁?,
+    OW: 'o闁?,
+    OY: '闁藉啫顕幉?,
+    P: 'p',
+    R: '闁?,
+    S: 's',
+    SH: '闁?,
+    T: 't',
+    TH: '闁?,
+    UH: '闁?,
+    UW: 'u',
+    V: 'v',
+    W: 'w',
+    Y: 'j',
+    Z: 'z',
+    ZH: '闁?,
+};
+
+const PSEUDO_TO_IPA: Record<string, string> = {
+    th: '闁?,
+    sh: '闁?,
+    ch: 't闁?,
+    ph: 'f',
+    ng: '闁?,
+    ee: 'i闁?,
+    oo: 'u闁?,
+    ea: 'i闁?,
+    ai: 'e闁?,
+    ay: 'e闁?,
+    oa: 'o闁?,
+    ow: 'o闁?,
+    ou: 'a闁?,
+    oi: '闁藉啫顕幉?,
+    oy: '闁藉啫顕幉?,
+    er: '闁?,
+    ir: '闁?,
+    ur: '闁?,
+    ar: '闁藉啰婀?,
+    or: '闁藉啰顥?,
+    qu: 'kw',
+};
+
+const LETTER_TO_IPA: Record<string, string> = {
+    a: '闊?,
+    b: 'b',
+    c: 'k',
+    d: 'd',
+    e: 'e',
+    f: 'f',
+    g: '濞?,
+    h: 'h',
+    i: '闁?,
+    j: 'd闁?,
+    k: 'k',
+    l: 'l',
+    m: 'm',
+    n: 'n',
+    o: 'o',
+    p: 'p',
+    q: 'k',
+    r: '闁?,
+    s: 's',
+    t: 't',
+    u: '闁?,
+    v: 'v',
+    w: 'w',
+    x: 'ks',
+    y: 'j',
+    z: 'z',
+};
+
+function toIpaSymbol(input: string): string {
+    const raw = String(input || '').trim();
+    if (!raw) return '';
+    const core = raw.replace(/^[\[/]+|[\]/]+$/g, '').trim();
+    if (!core) return '';
+    if (/[闁藉啫宕换鏍嫼閿曚焦鎳愰柦鍐攰閹界敻鎷戦幑鎰嚐闁荤喓鍠曢弳宸寀e闁煎啿鍟崯瀣嫼濞戞粍娈柤瑙勫姈濡惧ジ宕氶悩鐑橈紜]/.test(core)) return core;
+
+    const arpabet = core.toUpperCase().replace(/\d+$/, '');
+    if (ARPABET_TO_IPA[arpabet]) return ARPABET_TO_IPA[arpabet];
+
+    const lower = core.toLowerCase();
+    if (PSEUDO_TO_IPA[lower]) return PSEUDO_TO_IPA[lower];
+
+    if (lower.length === 1 && LETTER_TO_IPA[lower]) return LETTER_TO_IPA[lower];
+    return core;
+}
+
+function buildWordPhonemeBreakdown(data: ReportData | null): Record<number, WordPhonemeCell[]> {
+    const out: Record<number, WordPhonemeCell[]> = {};
+    if (!data) return out;
+    const words = data.alignment?.words || [];
+    const phonemes = data.alignment?.phonemes || [];
+    words.forEach((_, i) => { out[i] = []; });
+    if (!words.length || !phonemes.length) return out;
+
+    const assigned = new Array(phonemes.length).fill(false);
+
+    phonemes.forEach((p, pi) => {
+        const symbol = toIpaSymbol(String(p.phoneme || '').trim());
+        const ps = Number(p.start);
+        const pe = Number(p.end);
+        if (!symbol || !Number.isFinite(ps) || !Number.isFinite(pe) || pe <= ps) return;
+
+        let bestIdx = -1;
+        let bestOverlap = 0;
+        words.forEach((w, wi) => {
+            const ws = Number(w.start);
+            const we = Number(w.end);
+            if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return;
+            const overlap = Math.min(we, pe) - Math.max(ws, ps);
+            if (overlap > bestOverlap) {
+                bestOverlap = overlap;
+                bestIdx = wi;
+            }
+        });
+
+        if (bestIdx >= 0 && bestOverlap > 0.003) {
+            out[bestIdx].push({ symbol, score: Number(p.score || 0), start: ps });
+            assigned[pi] = true;
+        }
+    });
+
+    const tokenSlots = new Map<string, number[]>();
+    words.forEach((w, wi) => {
+        const token = normalizeToken(w.word);
+        if (!token) return;
+        const arr = tokenSlots.get(token) || [];
+        arr.push(wi);
+        tokenSlots.set(token, arr);
+    });
+    const tokenCursor = new Map<string, number>();
+
+    phonemes.forEach((p, pi) => {
+        if (assigned[pi]) return;
+        const symbol = toIpaSymbol(String(p.phoneme || '').trim());
+        if (!symbol) return;
+        const token = normalizeToken(String(p.in_word || ''));
+        const slots = tokenSlots.get(token);
+        if (!slots || !slots.length) return;
+        const cursor = tokenCursor.get(token) || 0;
+        const targetIdx = slots[Math.min(cursor, slots.length - 1)];
+        tokenCursor.set(token, cursor + 1);
+        out[targetIdx].push({ symbol, score: Number(p.score || 0), start: Number(p.start || 0) });
+    });
+
+    Object.values(out).forEach((row) => row.sort((a, b) => a.start - b.start));
+    return out;
+}
+
+function buildWordDetailData(
+    word: ReportData['alignment']['words'][number],
+    idx: number,
+    breakdown: Record<number, WordPhonemeCell[]>,
+): WordDetailData {
+    const baseScore = Math.round(Number(word.score || 0));
+    const row = breakdown[idx] || [];
+    if (row.length > 0) {
+        const symbols = row.map((r) => r.symbol).join('  ');
+        const scores = row.map((r) => String(Math.round(Number(r.score || 0)))).join('  ');
+        return {
+            header: `${word.word} : ${baseScore}`,
+            symbols,
+            scores,
+        };
+    }
+
+    const pauseScoreMap: Record<string, number> = {
+        good: 92,
+        optional: 76,
+        bad: 38,
+        missed: 42,
+        none: 82,
+    };
+    const stabilityMap: Record<string, number> = {
+        ok: 90,
+        weak: 72,
+        poor: 48,
+        missing: 20,
+    };
+    const pauseType = String(word.pause?.type || 'none');
+    const pauseScore = pauseScoreMap[pauseType] ?? 70;
+    const stability = stabilityMap[String(word.tag || '').toLowerCase()] ?? 70;
+    return {
+        header: `${word.word} : ${baseScore}`,
+        fallbackRows: [
+        `Pronunciation ${baseScore}`,
+        `Pause impact ${pauseScore}`,
+        `Stability ${stability}`,
+        ],
+    };
+}
+
+function formatScoreCompact(value: number, digits = 1): string {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '--';
+    const factor = Math.pow(10, digits);
+    const rounded = Math.round(n * factor) / factor;
+    if (Number.isInteger(rounded)) return String(Math.trunc(rounded));
+    return rounded.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+}
+
+function isLowConfidenceTimeline(words: ReportData['alignment']['words']): boolean {
+    if (!Array.isArray(words) || words.length < 7) return false;
+    const gaps: number[] = [];
+    for (let i = 0; i < words.length - 1; i += 1) {
+        const left = Number(words[i]?.end);
+        const right = Number(words[i + 1]?.start);
+        if (!Number.isFinite(left) || !Number.isFinite(right)) continue;
+        gaps.push(Math.max(0, right - left));
+    }
+    if (gaps.length < 6) return false;
+    const sorted = [...gaps].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const near = gaps.filter((g) => Math.abs(g - median) <= 0.02).length / Math.max(1, gaps.length);
+    const mean = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+    const variance = gaps.reduce((s, g) => s + (g - mean) * (g - mean), 0) / Math.max(1, gaps.length);
+    const std = Math.sqrt(variance);
+    if (median >= 0.07 && median <= 0.16 && near >= 0.65) return true;
+    if (median <= 0.20 && std <= 0.02 && near >= 0.55) return true;
+    return false;
+}
+
+export default function ReportBuilder() {
+    const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
+    const [reportData, setReportData] = useState<ReportData | null>(null);
+    const [reports, setReports] = useState<Array<{ id: string; student_name: string; score: number }>>([]);
+    const [selectedModules, setSelectedModules] = useState<string[]>(
+        AVAILABLE_MODULES.filter(m => m.isDefault).map(m => m.id)
+    );
+    const [draggedModule, setDraggedModule] = useState<string | null>(null);
+    const [isCapturing, setIsCapturing] = useState(false);
+
+    // 闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻忓洭鏌ｉ埡鍐剧劸闁告鍥ㄥ亹闁煎摜顣介崑?
+    const [selectedReportIds, setSelectedReportIds] = useState<Set<string>>(new Set());
+    const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, name: '' });
+
+    const reportRef = useRef<HTMLDivElement>(null);
+    const lowConfidenceTimeline = useMemo(() => {
+        if (!reportData) return false;
+        const profile = reportData.engine_raw?.pause_profile;
+        if (profile) {
+            if (Number(profile.synthetic_timeline || 0) >= 0.5) return true;
+            if (Number(profile.low_confidence_timing || 0) >= 0.5) return true;
+            if (String(profile.timing_confidence || '').toLowerCase() === 'low') return true;
+        }
+        return isLowConfidenceTimeline(reportData.alignment?.words || []);
+    }, [reportData]);
+    const displayWords = useMemo(() => {
+        const words = reportData?.alignment?.words || [];
+        if (!lowConfidenceTimeline) return words;
+        return words.map((w) => {
+            if (!w.pause || w.pause.type !== 'missed') return w;
+            return { ...w, pause: { ...w.pause, type: 'optional' as const } };
+        });
+    }, [reportData, lowConfidenceTimeline]);
+
+    useEffect(() => {
+        fetch('http://localhost:8000/api/reports')
+            .then(res => res.json())
+            .then(data => setReports(data))
+            .catch(console.error);
+    }, []);
+
+    useEffect(() => {
+        if (selectedReportId) {
+            fetch(`http://localhost:8000/api/reports/${selectedReportId}/data`)
+                .then(res => res.json())
+                .then(data => setReportData(data))
+                .catch(console.error);
+        }
+    }, [selectedReportId]);
+
+    const handleDragStart = (moduleId: string) => setDraggedModule(moduleId);
+    const handleDragOver = (e: React.DragEvent) => e.preventDefault();
+    const handleDrop = (e: React.DragEvent) => {
+        e.preventDefault();
+        if (draggedModule && !selectedModules.includes(draggedModule)) {
+            setSelectedModules([...selectedModules, draggedModule]);
+        }
+        setDraggedModule(null);
+    };
+    const removeModule = (moduleId: string) => setSelectedModules(selectedModules.filter(id => id !== moduleId));
+    const addModule = (moduleId: string) => {
+        if (!selectedModules.includes(moduleId)) setSelectedModules([...selectedModules, moduleId]);
+    };
+    const resetToDefault = () => setSelectedModules(AVAILABLE_MODULES.filter(m => m.isDefault).map(m => m.id));
+    const handlePrint = useCallback(() => window.print(), []);
+
+    // 闂佽鎯屾禍婊兠瑰鈧畷婵嬫偄鐠囨彃骞?- 婵炶揪缍€濞夋洟寮妶澶婄煑闁挎洍鍋撻柣掳鍔嶇粙澶愬传閸曢潧娈搁柣鐘叉处缁诲啴銆?
+    const handleCapture = async () => {
+        if (!reportRef.current || !reportData) return;
+        setIsCapturing(true);
+
+        try {
+            const { toPng, toBlob } = await import('html-to-image');
+
+            // html-to-image 闁诲酣娼у﹢閬嶇嵁閸ャ劎顩?CSS 闂佽　鍋撴い鏍ㄧ☉閻︻噣鏌￠崶銊︾稇闁?
+            const dataUrl = await toPng(reportRef.current, {
+                backgroundColor: '#ffffff',
+                cacheBust: true,
+                pixelRatio: 2,
+            });
+
+            const fileName = `${reportData.meta.student_name || reportData.meta.student_id}_report.png`;
+
+            // 闁诲繐绻戠换鍡涙儊椤栨稒濯撮悹鎭掑妽閺?File System Access API
+            if ('showSaveFilePicker' in window) {
+                try {
+                    const blob = await toBlob(reportRef.current, {
+                        backgroundColor: '#ffffff',
+                        pixelRatio: 2,
+                    });
+
+                    if (blob) {
+                        const handle = await (window as any).showSaveFilePicker({
+                            suggestedName: fileName,
+                            types: [{
+                                description: 'PNG 闂佹悶鍎辨晶鑺ユ櫠?,
+                                accept: { 'image/png': ['.png'] },
+                            }],
+                        });
+
+                        const writable = await handle.createWritable();
+                        await writable.write(blob);
+                        await writable.close();
+                        return;
+                    }
+                } catch (e: any) {
+                    if (e.name === 'AbortError') return;
+                }
+            }
+
+            // 闂佹悶鍎抽崑銈夊焵椤戣棄浜炬繛鎴炴尭椤戝牆霉?
+            const link = document.createElement('a');
+            link.download = fileName;
+            link.href = dataUrl;
+            link.click();
+        } catch (err) {
+            console.error('闂佽鎯屾禍婊兠瑰Ο璇茬窞閺夊牜鍋夎:', err);
+            alert(`闂佽鎯屾禍婊兠瑰Ο璇茬窞閺夊牜鍋夎: ${err instanceof Error ? err.message : '闂佸搫鐗滄禍鐐烘偂閿熺姵鐓ユ繛鍡樺俯閸?}`);
+        } finally {
+            setIsCapturing(false);
+        }
+    };
+
+    // 闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻忓洭鏌涢妷銉モ挃濠?
+    const handleBatchGenerate = async () => {
+        if (selectedReportIds.size === 0) {
+            alert('闁荤姴娲ら崲鏌ュ储濞戙垺鐒诲璺侯儏椤忋儵鎮烽弴姘冲厡闁轰焦鎹囬獮瀣箛椤旂晫鏆犻梺纭呯堪閸庨亶骞?);
+            return;
+        }
+
+        setIsCapturing(true);
+        const ids = Array.from(selectedReportIds);
+        setBatchProgress({ current: 0, total: ids.length, name: '' });
+        let successCount = 0;
+        let errorList: string[] = [];
+
+        let dirHandle: any = null;
+        const zip = new JSZip();
+
+        try {
+            console.log('濠碘槅鍋€閸嬫捇鏌?showDirectoryPicker 闂佽　鍋撴い鏍ㄧ☉閻︻噣鏌熼姘櫣闁?..', 'showDirectoryPicker' in window);
+            if ('showDirectoryPicker' in window) {
+                try {
+                    dirHandle = await (window as any).showDirectoryPicker({
+                        mode: 'readwrite'
+                    });
+                } catch (e: any) {
+                    if (e.name === 'AbortError') {
+                        setIsCapturing(false);
+                        return;
+                    }
+                    console.warn('闂佸搫鍟版慨鐢垫兜閸洘鍤旂€瑰嫭婢樼徊鍧楁煟閳哄﹤鏋涚紓宥呯Ч瀵爼宕橀绛嬧偓娆撴煥濞戞瀚伴柣銊ｅ灲瀹曞爼鎮欑悰鈥充壕闁逞屽墴瀹?ZIP 闂佺懓鐏氶幐鍝モ偓鍨灒闁炽儱纾涵鈧?);
+                }
+            } else {
+                console.warn('閻熸粎澧楅幐鍛婃櫠閻樿纭呯疀濮樺吋缍岄梺闈╃祷閸斿绮径鎰哗妞ゆ牗绋戦惁?Directory Picker API闂佹寧绋戦懟顖炴儍閵忊剝濯撮悹鎭掑妽閺?ZIP 闂佺懓鐏氶幐鍝モ偓鍨灒闁炽儱纾涵鈧?);
+            }
+
+            const { toBlob } = await import('html-to-image');
+
+            for (let i = 0; i < ids.length; i++) {
+                const id = ids[i];
+                const report = reports.find(r => r.id === id);
+                const studentName = report?.student_name || id;
+                setBatchProgress({ current: i + 1, total: ids.length, name: studentName });
+
+                try {
+                    const res = await fetch(`http://localhost:8000/api/reports/${id}/data`);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    const data = await res.json();
+                    setReportData(data);
+
+                    // 缂備焦绋戦ˇ顖滄閻旀灚鈧帡宕ｆ径灞藉脯
+                    await new Promise<void>(resolve => {
+                        requestAnimationFrame(() => {
+                            requestAnimationFrame(() => {
+                                setTimeout(resolve, 600);
+                            });
+                        });
+                    });
+
+                    if (reportRef.current) {
+                        const fileName = `${data.meta?.student_name || data.meta?.student_id || studentName}_report.png`;
+
+                        if (dirHandle) {
+                            // 闂佺儵鏅涢悺銊ф暜閹绢喖绀冩繛鍡楃箰瀵娊鏌￠崒姘煑婵炲棎鍨哄?
+                            const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
+                            if (blob) {
+                                const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+                                const writable = await fileHandle.createWritable();
+                                await writable.write(blob);
+                                await writable.close();
+                                successCount++;
+                            }
+                        } else {
+                            // 濠电儑缍€椤曆勬叏閻愬搫绀?ZIP
+                            const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
+                            if (blob) {
+                                zip.file(fileName, blob);
+                                successCount++;
+                            }
+                        }
+
+                        await new Promise(resolve => setTimeout(resolve, 200));
+                    }
+                } catch (err) {
+                    console.error(`闂佹眹鍨婚崰鎰板垂?${studentName} 闂佺缈伴崕閬嶅箟閳╁啫绶為弶鍫亯琚?`, err);
+                    errorList.push(studentName);
+                }
+            }
+
+            // 婵犵鈧啿鈧綊鎮樻径瀣閻犳亽鍔嶉弳蹇涙煟閵娿儱顏俊?ZIP 濠碘槅鍨埀顒€纾涵鈧梺鎸庣☉閺堫剙銆掗崼鏇炶Е閹兼番浼嗛弴銏犵煑闁瑰瓨绮庨杈ㄧ箾閸″繆鍋撻懠顒傛啴闁?
+            if (!dirHandle && successCount > 0) {
+                setBatchProgress(prev => ({ ...prev, name: '濠殿喗绻愮徊钘夛耿椤忓牆绠ラ柟鎯у暱閻?ZIP...' }));
+                const content = await zip.generateAsync({ type: 'blob' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(content);
+                link.download = `reports_batch_${new Date().getTime()}.zip`;
+                link.click();
+            }
+
+            if (errorList.length === 0) {
+                alert(`闂?閻庡湱顭堝鍫曞垂濮樿泛绀夐柣鏃傚劋閺呮悂鏌?${successCount} 婵炲濮炬慨銈嗘叏閵堝宸濆┑鐘茬箳绾?{dirHandle ? '闂佸搫鍊稿ú锝呪枎閵忕媭鍟呴柟缁樺笧閹界娀鏌涜箛瀣姕閻庡灚姘ㄩ埀顒冾潐濮樸劌煤閹峰被浜归柡鍥ㄇ氶崑? : '濠殿喗绻愮徊钘夛耿椤忓懐鈻旈悗锝庡幗缁佷即鏌涘Ο渚剳缂傚倸顦靛畷鐘诲川椤愮喎浜?}`);
+            } else {
+                alert(`闂佸疇娉曟刊瀵哥箔?闁诲海鎳撻張顒勫垂濮樿埖鏅ù锝囨嚀閻忓洭鏌?${successCount} 婵炲濮甸弸鑽ゆ濠靛洤绶為弶鍫亯琚?${errorList.length} 婵炲濮风粊绺╂繝銏″劶缁墽鎲? ${errorList.join(', ')}`);
+            }
+        } catch (err) {
+            console.error('闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻忓洤顭块幆鎵翱閻?', err);
+            alert(`闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻忓洤顭块幆鎵翱閻? ${err instanceof Error ? err.message : '闂佸搫鐗滄禍鐐烘偂閿熺姵鐓ユ繛鍡樺俯閸?}`);
+        } finally {
+            setIsCapturing(false);
+            setBatchProgress({ current: 0, total: 0, name: '' });
+        }
+    };
+
+    // 闂佺绻堥崝鎴﹀焵?闂佸憡鐟﹂悧妤冪矓閻戣棄绀傞柕濞炬杹閸?
+    const toggleSelectAll = () => {
+        if (selectedReportIds.size === reports.length) {
+            setSelectedReportIds(new Set());
+        } else {
+            setSelectedReportIds(new Set(reports.map(r => r.id)));
+        }
+    };
+
+    // 闂佸憡甯掑ú锕€鐣烽弻銉ョ闁哄洦宀搁崵瀣⒑椤愩埄妲归悗?
+    const toggleReportSelection = (id: string) => {
+        const newSet = new Set(selectedReportIds);
+        if (newSet.has(id)) {
+            newSet.delete(id);
+        } else {
+            newSet.add(id);
+        }
+        setSelectedReportIds(newSet);
+    };
+
+    const getTagColor = (tag: string) => {
+        switch (tag) {
+            case 'ok': return '#22C55E';
+            case 'weak': return '#F59E0B';
+            case 'poor': case 'missing': return '#EF4444';
+            default: return '#1F2937';
+        }
+    };
+
+    const getLevelLabel = (score: number) => {
+        if (score >= 90) return { label: 'Native Like', color: '#A855F7' };
+        if (score >= 80) return { label: 'Advanced', color: '#22C55E' };
+        if (score >= 60) return { label: 'High-Intermediate', color: '#3B82F6' };
+        return { label: 'Beginner', color: '#EF4444' };
+    };
+
+    const wordPhonemeBreakdown = useMemo(
+        () => buildWordPhonemeBreakdown(reportData),
+        [reportData]
+    );
+
+    return (
+        <div className="min-h-screen bg-[#0a0a0a] pt-20">
+            <div className="max-w-7xl mx-auto px-4 py-8 flex gap-6">
+                {/* 閻庡綊娼荤紓姘跺疾鐠轰綍鐔煎灳閾忣偄浠撮梻渚囧亜椤︽壆鈧哎鍔戝畷?*/}
+                <div className="w-72 shrink-0 print:hidden">
+                    <div className="bg-[#1e1e24] border border-white/10 rounded-2xl p-5 sticky top-24">
+                        <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
+                            <span className="text-2xl">濡絽鍟幉</span> 闂佸憡鐟崹鎶藉极閵堝憘鐔煎灳閾忣偄浠?
+                        </h2>
+                        <p className="text-xs text-gray-500 mb-4">闂佺粯鍔楅幊鎾诲吹?+ 闂佺懓鐡ㄩ悧妤冣偓姘儔楠炲繘鎳為妷銉︾秹闂佸憡姊绘慨浣冨暞闂?/p>
+
+                        <div className="space-y-2">
+                            {AVAILABLE_MODULES.map(module => {
+                                const isAdded = selectedModules.includes(module.id);
+                                return (
+                                    <div
+                                        key={module.id}
+                                        draggable={!isAdded}
+                                        onDragStart={() => handleDragStart(module.id)}
+                                        className={`p-3 rounded-xl border transition-all cursor-grab active:cursor-grabbing
+                                            ${isAdded ? 'bg-primary/10 border-primary/30 opacity-60' : 'bg-white/5 border-white/10 hover:bg-white/10'}`}
+                                    >
+                                        <div className="flex items-center gap-3">
+                                            <GripVertical className="w-4 h-4 text-gray-500" />
+                                            <span className="text-xl">{module.icon}</span>
+                                            <div className="flex-1 min-w-0">
+                                                <div className="text-sm font-medium text-white truncate">{module.name}</div>
+                                                <div className="text-xs text-gray-500 truncate">{module.description}</div>
+                                            </div>
+                                            {isAdded ? (
+                                                <Check className="w-4 h-4 text-primary" />
+                                            ) : (
+                                                <button onClick={() => addModule(module.id)} className="p-1 hover:bg-white/10 rounded">
+                                                    <Plus className="w-4 h-4 text-gray-400" />
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        <div className="mt-4 pt-4 border-t border-white/10">
+                            <button onClick={resetToDefault} className="w-full py-2 text-sm text-gray-400 hover:text-white transition-colors">
+                                闂備焦褰冪粔鍫曟偪閸℃鈻旀繛宸簽鐢盯鎮?
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* 闂佸憡鐟ラ崢鏍疾閸洖绠柕澶堝劜閸熺偛螞閺夊灝顏い?*/}
+                <div className="flex-1">
+                    {/* 閻庤鎮堕崕閬嶅矗閸ф鍐€?*/}
+                    <div className="flex flex-col gap-4 mb-6 print:hidden">
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                                <h1 className="text-2xl font-bold text-white flex items-center gap-3">
+                                    <span className="text-3xl">濡絽鍟幆</span> 闂佺缈伴崕閬嶅箟閿熺姵鍋ㄩ柣鏃傤焾閻忓洭鏌?
+                                </h1>
+                                <select
+                                    value={selectedReportId || ''}
+                                    onChange={(e) => setSelectedReportId(e.target.value || null)}
+                                    className="bg-[#1e1e24] border border-white/10 rounded-lg px-4 py-2 text-sm text-white focus:outline-none focus:border-primary/50"
+                                >
+                                    <option value="">闂備緡鍋勯ˇ鎵偓姘ュ妿閳ь剚鍐绘俊鍥极閹捐绠柕澶堝劜閸?..</option>
+                                    {reports.map(r => (
+                                        <option key={r.id} value={r.id}>
+                                            {r.student_name} ({Math.round(r.score)}闂?
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={handleCapture}
+                                    disabled={!reportData || isCapturing}
+                                    className="bg-blue-500 text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 hover:bg-blue-600 disabled:opacity-50 transition-all"
+                                >
+                                    {isCapturing && batchProgress.total === 0 ? <Download className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
+                                    婵烇絽娲︾换鍌炴偤閵娾晛鐐婇柛鎾楀喚鏆?
+                                </button>
+                                <button
+                                    onClick={handlePrint}
+                                    disabled={!reportData}
+                                    className="bg-primary text-black px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 hover:bg-primary/90 disabled:opacity-50 transition-all"
+                                >
+                                    <Printer className="w-4 h-4" />
+                                    闂佺懓鐏氶幐绋跨暤閸愵喖绠柕澶堝劜閸?
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* 闂佸綊娼х紞濠囧闯濞差亜绠肩€广儱瀚粙濠囨煕?*/}
+                        <div className="bg-[#1e1e24] border border-white/10 rounded-xl p-4">
+                            <div className="flex items-center gap-4">
+                                {/* 婵炴垶鎸搁鍡樺垔濞差亝鐒诲璺侯儏椤忋儵鏌?*/}
+                                <div className="relative flex-1">
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            onClick={toggleSelectAll}
+                                            className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 border border-white/10 hover:border-white/30 transition-colors"
+                                        >
+                                            <div className={`w-4 h-4 border rounded flex items-center justify-center ${selectedReportIds.size === reports.length && reports.length > 0 ? 'bg-primary border-primary' : 'border-gray-500'}`}>
+                                                {selectedReportIds.size === reports.length && reports.length > 0 && <Check className="w-3 h-3 text-black" />}
+                                            </div>
+                                            <span className="text-sm text-gray-300">闂佺绻堥崝鎴﹀焵</span>
+                                        </button>
+
+                                        <span className="text-sm text-gray-500">閻庣懓鎲￠悡锟犲焵?{selectedReportIds.size}/{reports.length}</span>
+                                    </div>
+
+                                    {/* 闂佸憡娲熺粻鏍焵椤掆偓椤︻垶宕归鍡樺仒?*/}
+                                    <div className="mt-3 max-h-32 overflow-y-auto scrollbar-thin scrollbar-track-gray-800 scrollbar-thumb-gray-600">
+                                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
+                                            {reports.map(r => (
+                                                <label
+                                                    key={r.id}
+                                                    className={`flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-all ${selectedReportIds.has(r.id)
+                                                        ? 'bg-primary/20 border border-primary'
+                                                        : 'bg-white/5 border border-transparent hover:bg-white/10'
+                                                        }`}
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedReportIds.has(r.id)}
+                                                        onChange={() => toggleReportSelection(r.id)}
+                                                        className="w-4 h-4 rounded border-gray-500 text-primary focus:ring-primary focus:ring-offset-0 bg-transparent"
+                                                    />
+                                                    <span className={`text-sm truncate ${selectedReportIds.has(r.id) ? 'text-primary' : 'text-gray-300'}`}>
+                                                        {r.student_name}
+                                                    </span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* 闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻忓洭鏌熺粙娆炬█闁?*/}
+                                <button
+                                    onClick={handleBatchGenerate}
+                                    disabled={selectedReportIds.size === 0 || isCapturing}
+                                    className="bg-gradient-to-r from-purple-500 to-pink-500 text-white px-6 py-3 rounded-xl font-bold flex items-center gap-2 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap"
+                                >
+                                    {isCapturing && batchProgress.total > 0 ? (
+                                        <>
+                                            <Download className="w-4 h-4 animate-spin" />
+                                            {batchProgress.current}/{batchProgress.total}
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Camera className="w-4 h-4" />
+                                            闂佸綊娼х紞濠囧闯濞差亝鍋ㄩ柣鏃傤焾閻?({selectedReportIds.size})
+                                        </>
+                                    )}
+                                </button>
+                            </div>
+
+                            {/* 闁哄鏅滅粙鎴犫偓瑙勫▕瀵?*/}
+                            {batchProgress.total > 0 && (
+                                <div className="mt-3">
+                                    <div className="flex justify-between text-xs text-gray-400 mb-1">
+                                        <span>濠殿喗绻愮徊钘夛耿椤忓牊鍋ㄩ柣鏃傤焾閻? {batchProgress.name}</span>
+                                        <span>{batchProgress.current}/{batchProgress.total}</span>
+                                    </div>
+                                    <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                                        <div
+                                            className="h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all duration-300"
+                                            style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
+                                        />
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* A4 婵☆偅婢樼€氼垶锝炲澶婄?*/}
+                    <div
+                        ref={reportRef}
+                        onDragOver={handleDragOver}
+                        onDrop={handleDrop}
+                        className={`bg-white rounded-lg shadow-2xl mx-auto print:shadow-none print:rounded-none
+                            ${draggedModule ? 'ring-2 ring-primary ring-dashed' : ''}`}
+                        style={{ width: '210mm', minHeight: '297mm', padding: '12mm' }}
+                    >
+                        {!reportData ? (
+                            <div className="h-full flex flex-col items-center justify-center text-gray-400 py-32">
+                                <Eye className="w-16 h-16 mb-4 opacity-30" />
+                                <p className="text-lg font-medium">闁荤姴娲ㄩ崗姗€鍩€椤掆偓椤︽壆鈧哎鍔嶇粙澶愬焵椤掍胶鈻旀い蹇撳閸斿懘鏌ｉ姀銏犳瀾濠殿喓鍊濆畷?/p>
+                                <p className="text-sm text-gray-500 mt-1">闂佸綊鏀遍悧妤冣偓姘仢椤斿繘鏁傞幐搴㈢彿濠碘槅鍨埀顒冩珪閸嬨儵鏌ゆ總澶夌盎闁伙絿鍋撶粙濠冨緞鐎ｎ€捇鏌涘☉姗堝伐闁哥偛顕埀?/p>
+                            </div>
+                        ) : (
+                            <div className="text-gray-800 space-y-4">
+                                {/* 闂佺缈伴崕閬嶅箟閳╁啫绶為柟缁㈠枛閸?*/}
+                                <div className="text-center pb-3 border-b-2 border-gray-200">
+                                    <h1 className="text-xl font-bold text-gray-900">闂佸吋妲掔划楣冾敋閵忋倕瀚夋俊銈呭閸ゃ垽鎮归崶褍顏紒浣规尦楠炲酣濡烽妷锕€鏆?/h1>
+                                    <div className="flex justify-center gap-8 mt-1 text-sm text-gray-600">
+                                        <span>闁诲孩鍐绘俊鍥极? <strong>{reportData.meta.student_name || reportData.meta.student_id}</strong></span>
+                                        <span>闂佸搫鍟ㄩ崕鎻掞耿? {new Date(reportData.meta.timestamp).toLocaleDateString()}</span>
+                                    </div>
+                                </div>
+
+                                {/* 濠碘槅鍨埀顒冩珪閸嬨儲绻涢幘鍐茬骇闁?*/}
+                                {selectedModules.map(moduleId => (
+                                    <div key={moduleId} className="relative group print:break-inside-avoid">
+                                        <button
+                                            onClick={() => removeModule(moduleId)}
+                                            className="absolute -right-2 -top-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity print:hidden z-10"
+                                        >
+                                            <X className="w-3 h-3" />
+                                        </button>
+
+                                        {/* 闂佽鍓濋褔宕规惔鈽嗘健闁稿本绻嶅?*/}
+                                        {moduleId === 'score_overview' && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-3">濡絽鍟幆?闂佽鍓濋褔宕规惔鈽嗘健闁稿本绻嶅</h3>
+                                                <div className="flex items-center gap-6">
+                                                    <div className="relative w-20 h-20">
+                                                        <svg className="w-full h-full transform -rotate-90">
+                                                            <circle cx="40" cy="40" r="35" stroke="#E5E7EB" strokeWidth="6" fill="none" />
+                                                            <circle cx="40" cy="40" r="35"
+                                                                stroke={getLevelLabel(reportData.scores.overall_100).color}
+                                                                strokeWidth="6" fill="none"
+                                                                strokeDasharray={2 * Math.PI * 35}
+                                                                strokeDashoffset={2 * Math.PI * 35 * (1 - reportData.scores.overall_100 / 100)}
+                                                                strokeLinecap="round"
+                                                            />
+                                                        </svg>
+                                                        <div className="absolute inset-0 flex items-center justify-center">
+                                                            <span className="text-xl font-bold" style={{ color: getLevelLabel(reportData.scores.overall_100).color }}>
+                                                                {Math.round(reportData.scores.overall_100)}
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="grid grid-cols-2 gap-2 flex-1">
+                                                        {[
+                                                            { label: '闂佸憡鐟﹂崹鍧楁偂?, score: reportData.scores.pronunciation_100, color: '#3B82F6' },
+                                                            { label: '闁荤姴娴傞崣鈧柣?, score: reportData.scores.intonation_100, color: '#22C55E' },
+                                                            { label: '濠电偟绻濈粈渚€宕洪崟顒佸劅?, score: reportData.scores.fluency_100, color: '#F59E0B' },
+                                                            { label: '闁诲海鎳撻張顒勫汲閿濆棙鍎?, score: reportData.scores.completeness_100, color: '#A855F7' },
+                                                        ].map(item => (
+                                                            <div key={item.label} className="p-2 border rounded text-center" style={{ borderColor: item.color + '40' }}>
+                                                                <div className="text-lg font-bold" style={{ color: item.color }}>{Math.round(item.score)}</div>
+                                                                <div className="text-xs text-gray-500">{item.label}</div>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* 闂佸搫鐗婇〃澶愵敋閹殿喒鍋撻棃娑欒础闁?*/}
+                                        {moduleId === 'text_highlight' && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-2">濡絽鍟幉?闂佸搫鐗婇〃澶愵敋閹殿喒鍋撻棃娑欒础闁</h3>
+                                                <div className="flex flex-wrap items-center gap-1 leading-loose text-sm">
+                                                    {displayWords.map((word, idx) => {
+                                                        const prev = idx > 0 ? displayWords[idx - 1] : null;
+                                                        const prevPauseType = prev?.pause?.type || '';
+                                                        const detail = buildWordDetailData(word, idx, wordPhonemeBreakdown);
+                                                        const detailTitle = detail.fallbackRows
+                                                            ? [detail.header, ...detail.fallbackRows].join('\n')
+                                                            : [detail.header, detail.symbols || '', detail.scores || ''].join('\n');
+                                                        return (
+                                                            <span key={idx} className="inline-flex items-center gap-1">
+                                                                {prevPauseType === 'bad' && (
+                                                                    <span
+                                                                        className="inline-flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-300"
+                                                                        title="Unexpected break"
+                                                                    >
+                                                                        UB
+                                                                    </span>
+                                                                )}
+                                                                {!lowConfidenceTimeline && prevPauseType === 'missed' && (
+                                                                    <span
+                                                                        className="inline-flex items-center justify-center w-5 h-5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-300"
+                                                                        title="Missing break"
+                                                                    >
+                                                                        MB
+                                                                    </span>
+                                                                )}
+                                                                <span className="relative group">
+                                                                    <span style={{ color: getTagColor(word.tag) }} className="font-medium cursor-help" title={detailTitle}>
+                                                                        {word.tag === 'missing' ? (
+                                                                            <>
+                                                                                <span className="inline-block min-w-6 text-center px-1 rounded bg-pink-100 text-pink-700 border border-pink-300 mr-1">[ ]</span>
+                                                                                <span className="line-through">{word.word}</span>
+                                                                            </>
+                                                                        ) : (
+                                                                            word.word
+                                                                        )}
+                                                                    </span>
+                                                                    <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-30 hidden group-hover:block">
+                                                                        <span className="block min-w-[118px] rounded-md border border-gray-200 bg-white px-2 py-1.5 shadow-lg text-[13px] text-gray-800 leading-6 whitespace-pre">
+                                                                            <span className="block">{detail.header}</span>
+                                                                            {detail.symbols && <span className="block tracking-wide">{detail.symbols}</span>}
+                                                                            {detail.scores && <span className="block tracking-wide">{detail.scores}</span>}
+                                                                            {detail.fallbackRows?.map((row, ridx) => (
+                                                                                <span key={ridx} className="block">{row}</span>
+                                                                            ))}
+                                                                        </span>
+                                                                        <span className="block w-2.5 h-2.5 bg-white border-r border-b border-gray-200 rotate-45 mx-auto -mt-1"></span>
+                                                                    </span>
+                                                                </span>
+                                                            </span>
+                                                        );
+                                                    })}
+                                                </div>
+                                                <div className="flex flex-wrap gap-3 mt-2 text-xs">
+                                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500"></span> 濠殿喗绻愮徊鍧楀灳</span>
+                                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-yellow-500"></span> 閻庡灚婢橀幊搴㈡叏閻愬樊鍤</span>
+                                                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500"></span> 闂傚倸娲犻崑鎾绘煛閳ь剛娑甸崨顖滎啋</span>
+                                                    <span className="flex items-center gap-1"><span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-100 border border-amber-300 text-amber-800 text-[10px] font-bold" title="Unexpected break">UB</span></span>
+                                                    {!lowConfidenceTimeline && (
+                                                        <span className="flex items-center gap-1"><span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-slate-100 border border-slate-300 text-slate-700 text-[10px] font-bold" title="Missing break">MB</span></span>
+                                                    )}
+                                                    {lowConfidenceTimeline && (
+                                                        <span className="text-[11px] text-slate-500">Missing break hidden on low-confidence timing</span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* 闂佸搫绉堕…鍫㈢紦妤ｅ啫鐭楅柟杈惧閸欓箖鎮归崶褝鏀婚柡?*/}
+                                        {moduleId === 'pronunciation_diagnosis' && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-2">濡絽鍟粻?闂佸搫绉堕…鍫㈢紦妤ｅ啫鐭楅柟杈惧閸欓箖鎮归崶褝鏀婚柡</h3>
+                                                {reportData.analysis.weak_words?.length > 0 ? (
+                                                    <div className="space-y-2">
+                                                        <div className="text-sm text-gray-600">闂傚倸娲犻崑鎾绘⒑閹绘帞肖闁稿绲跨槐鎺楀礃瑜忛惁搴ㄦ煟閵娿儱顏╃€规洜鍠撻幏?</div>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {reportData.analysis.weak_words.slice(0, 8).map((word, idx) => (
+                                                                <span key={idx} className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-sm font-medium">
+                                                                    {word}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                        {reportData.analysis.weak_phonemes?.length > 0 && (
+                                                            <div className="mt-2">
+                                                                <div className="text-sm text-gray-600">閻庢鍠涚划楣冾敋娴煎瓨顥婄€规洖娲ㄩˇ?</div>
+                                                                <div className="flex gap-2 mt-1">
+                                                                    {reportData.analysis.weak_phonemes.map((ph, idx) => (
+                                                                        <span key={idx} className="bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-sm">
+                                                                            /{ph}/
+                                                                        </span>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ) : (
+                                                    <div className="text-green-600 text-sm">闂?闂佸憡鐟﹂崹鍧楁偂閸洖鏋佺紓鍫㈠Х缁夊ジ鏌ょ拠鈥崇仩闁靛牅绮欓弫</div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {/* 缂傚倷鑳堕崢褔骞冩惔銊ョ煑鐎广儱顦藉ú?*/}
+                                        {moduleId === 'ai_feedback' && reportData.engine_raw?.integrated_feedback && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-2">Integrated Feedback</h3>
+                                                <div className="text-sm text-gray-700 mb-2">
+                                                    {reportData.engine_raw.integrated_feedback.overall_comment}
+                                                </div>
+                                                {reportData.engine_raw.integrated_feedback.specific_suggestions?.length > 0 && (
+                                                    <ul className="text-sm text-gray-600 space-y-1 mb-2">
+                                                        {reportData.engine_raw.integrated_feedback.specific_suggestions.slice(0, 2).map((s, i) => (
+                                                            <li key={i}>- {s}</li>
+                                                        ))}
+                                                    </ul>
+                                                )}
+                                                {reportData.engine_raw.integrated_feedback.fun_challenge && (
+                                                    <div className="mt-2 p-2 bg-purple-50 rounded text-sm text-purple-700">
+                                                        {reportData.engine_raw.integrated_feedback.fun_challenge}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {/* 濠电偟绻濈粈渚€宕洪崟顒佸劅闁挎洍鍋撻柛銊ラ叄瀵?*/}
+                                        {moduleId === 'fluency_analysis' && (() => {
+                                            // 闁荤姳绶ょ槐鏇㈡偩婵犳艾纾绘繝濠傜墑閳ь剚鍨圭槐鎺楁偄濞茶鎮?
+                                            const pauseWords = displayWords.filter(w => w.pause);
+                                            const badPauses = pauseWords.filter(w => w.pause?.type === 'bad');
+                                            const goodPauses = pauseWords.filter(w => w.pause?.type === 'good');
+                                            const totalPauseDuration = pauseWords.reduce((s, w) => s + (w.pause?.duration || 0), 0);
+                                            const wpm = reportData.engine_raw.wpm || 0;
+                                            const fluencyScore = reportData.scores.fluency_100;
+                                            const fluencyComponents = (reportData.engine_raw as any)?.fluency_components || {};
+                                            const pausingSub = Number(fluencyComponents.pausing_score);
+                                            const paceSub = Number(fluencyComponents.pace_score);
+                                            const hesitationSub = Number(fluencyComponents.hesitation_score);
+
+                                            // 闂佺顑嗙划鎾诲Υ閹寸姷绠旈柨鏇楀亾鐟滄澘鐏濋妴鎺楀矗婢跺苯甯?
+                                            const renderPauseMarker = (pause: { type: string; duration: number }) => {
+                                                if (pause.type === 'good') {
+                                                    return <span className="mx-1 text-green-500 text-lg">闂</span>;
+                                                } else if (pause.type === 'optional') {
+                                                    return <span className="mx-1 text-gray-400 text-sm">闂</span>;
+                                                } else if (pause.type === 'bad') {
+                                                    return <span className="mx-1 text-red-500 font-bold">闂</span>;
+                                                } else if (pause.type === 'missed') {
+                                                    if (lowConfidenceTimeline) return null;
+                                                    return <span className="mx-1 text-red-400 text-xs">I</span>;
+                                                }
+                                                return null;
+                                            };
+
+                                            return (
+                                                <div className="border border-gray-200 rounded-lg p-4">
+                                                    {/* 婵犮垼鍩栭幐鎶藉磿閹绢喗鏅慨姗嗗墮閻庡鏌?+ 闂佹悶鍎辫ぐ鐐垫?*/}
+                                                    <div className="flex items-center justify-between mb-4">
+                                                        <h3 className="text-base font-bold flex items-center gap-2">
+                                                            Fluency Analysis
+                                                            <span className="text-2xl font-bold text-blue-500">{formatScoreCompact(fluencyScore)}%</span>
+                                                        </h3>
+                                                        <div className="flex gap-4 text-xs text-gray-600">
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="text-green-500 text-lg">闂</span> 闂佸憡鑹鹃悧蹇涘箖婵犲洤纾绘繝濠傜墑閳?
+                                                            </span>
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="text-gray-400">闂</span> 闂佸憡鐟崹鍫曞焵椤掆偓椤︻垱绂掗悩鐐戒簻?
+                                                            </span>
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="text-red-500 font-bold">闂</span> 婵炴垶鎸哥粔瀵哥礊鐎ｎ喖纭€闁跨喓濮伴埀?
+                                                            </span>
+                                                            {!lowConfidenceTimeline && (
+                                                                <span className="flex items-center gap-1">
+                                                                    <span className="text-red-400 text-xs">I</span> Missing break
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                    </div>
+
+                                                    {/* 闂佸搫鐗婇〃澶愵敋娴兼潙妫橀柛銉ｅ妽閹?+ 闂佺顑嗙划鎾诲Υ閹达箑鍐€闁搞儺浜堕崬?*/}
+                                                    {lowConfidenceTimeline && (
+                                                        <div className="mb-3 text-xs text-slate-500">
+                                                            Missing break hidden due low-confidence timing.
+                                                        </div>
+                                                    )}
+
+                                                    <div className="grid grid-cols-3 gap-2 mb-3 text-center text-xs">
+                                                        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                                                            <div className="font-semibold text-slate-800">{Number.isFinite(pausingSub) ? formatScoreCompact(pausingSub) : '--'}</div>
+                                                            <div className="text-slate-500">Pausing</div>
+                                                        </div>
+                                                        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                                                            <div className="font-semibold text-slate-800">{Number.isFinite(paceSub) ? formatScoreCompact(paceSub) : '--'}</div>
+                                                            <div className="text-slate-500">Pace</div>
+                                                        </div>
+                                                        <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                                                            <div className="font-semibold text-slate-800">{Number.isFinite(hesitationSub) ? formatScoreCompact(hesitationSub) : '--'}</div>
+                                                            <div className="text-slate-500">Hesitation (sub)</div>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="bg-gray-50 rounded-lg p-4 mb-4 leading-loose text-base">
+                                                        {displayWords.map((word, idx) => (
+                                                            <span key={idx}>
+                                                                <span className="text-gray-800">{word.word} </span>
+                                                                {word.pause && renderPauseMarker(word.pause)}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+
+                                                    {/* 闂佽桨鑳舵晶妤€鐣垫担铏圭＜闁绘梹妞块崥鈧梺?*/}
+                                                    <div className="grid grid-cols-4 gap-3 text-center">
+                                                        <div className="bg-blue-50 rounded-lg py-2">
+                                                            <div className="text-lg font-bold text-blue-600">{Math.round(wpm)}</div>
+                                                            <div className="text-xs text-gray-500">闁?闂佸憡甯掑Λ婵嬪箰</div>
+                                                        </div>
+                                                        <div className="bg-green-50 rounded-lg py-2">
+                                                            <div className="text-lg font-bold text-green-600">{goodPauses.length}</div>
+                                                            <div className="text-xs text-gray-500">闂佸憡鑹鹃悧蹇涘箖婵犲洤纾绘繝濠傜墑閳</div>
+                                                        </div>
+                                                        <div className="bg-red-50 rounded-lg py-2">
+                                                            <div className="text-lg font-bold text-red-600">{badPauses.length}</div>
+                                                            <div className="text-xs text-gray-500">婵炴垶鎸哥粔瀵哥礊鐎ｎ喖纭€闁跨喓濮伴埀</div>
+                                                        </div>
+                                                        <div className="bg-purple-50 rounded-lg py-2">
+                                                            <div className="text-lg font-bold text-purple-600">{totalPauseDuration.toFixed(1)}s</div>
+                                                            <div className="text-xs text-gray-500">闂佽鍓濋褎绂掗悩鐐戒簻闁圭瀛╅ˇ褔姊婚埀</div>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* 闂傚倸鍋嗛崳锝夈€傞悾灞惧珰鐎广儱妫楃徊鍦磼閳?*/}
+                                                    {badPauses.length > 0 && (
+                                                        <div className="mt-3 p-2 bg-red-50 rounded-lg text-sm text-red-700">
+                                                            闂佸疇娉曟刊瀵哥箔?闂佸憡顨愮换婵嬪Υ閹寸偞濯寸€广儱娲ㄩ弸? {badPauses.slice(0, 5).map(w => `"${w.word}"`).join('闂?)}
+                                                            {badPauses.length > 5 && ` 缂?{badPauses.length}婵犮垼娉涢崹绉?
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* 闁荤姴娴傞崣鈧柣銊у枛瀹曟岸宕卞Ο灏栧亾?- 閻庢鍠氶、濠囨倻閿曞倹鍋犻柛鎰╁妼鐠佹煡鎮峰▎蹇旑棞閻?*/}
+                                        {moduleId === 'intonation_analysis' && (() => {
+                                            const intonation = reportData.analysis.intonation_analysis;
+                                            const intonationScore = reportData.scores.intonation_100;
+
+                                            // 濠电偞鎸稿鍫曟偂鐎ｎ亶鍤曠痪顓炴噽閸庢煡鏌ｉ悙鎻掓殭鐟滄壆鍋熼埀?
+                                            const renderBouncingBalls = (words: Array<{ word: string; is_stressed: boolean; stress_correct: boolean }>) => (
+                                                <div className="flex flex-wrap items-end gap-1 py-2">
+                                                    {words.map((w, i) => (
+                                                        <div key={i} className="flex flex-col items-center">
+                                                            {/* 闂?*/}
+                                                            <div
+                                                                className={`rounded-full transition-all ${w.is_stressed
+                                                                    ? w.stress_correct
+                                                                        ? 'w-4 h-4 bg-green-500 mb-1'
+                                                                        : 'w-4 h-4 bg-red-500 mb-1'
+                                                                    : 'w-2 h-2 bg-gray-400 mb-2'
+                                                                    }`}
+                                                                style={{
+                                                                    transform: w.is_stressed ? 'translateY(-8px)' : 'translateY(0)',
+                                                                }}
+                                                            />
+                                                            {/* 闂佸憡顨嗗ú婵嬫儊?*/}
+                                                            <span className={`text-sm ${w.is_stressed
+                                                                ? w.stress_correct ? 'font-bold text-green-700' : 'font-bold text-red-600'
+                                                                : 'text-gray-600'
+                                                                }`}>
+                                                                {w.word}
+                                                            </span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            );
+
+                                            return (
+                                                <div className="border border-gray-200 rounded-lg p-4">
+                                                    {/* 婵犮垼鍩栭幐鎶藉磿?*/}
+                                                    <div className="flex items-center justify-between mb-4">
+                                                        <h3 className="text-base font-bold flex items-center gap-2">
+                                                            Prosody Analysis
+                                                            <span className="text-2xl font-bold text-purple-500">{formatScoreCompact(intonationScore)}%</span>
+                                                        </h3>
+                                                        <div className="flex gap-4 text-xs text-gray-600">
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="w-3 h-3 rounded-full bg-green-500"></span> 闂備焦褰冪粔鐑筋敋閺夋娼伴柨婵嗘礌閳?
+                                                            </span>
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="w-3 h-3 rounded-full bg-red-500"></span> 闂備焦褰冪粔鐑筋敋娴煎瓨鐓ユ繛鍡樺俯閸?
+                                                            </span>
+                                                            <span className="flex items-center gap-1">
+                                                                <span className="w-2 h-2 rounded-full bg-gray-400"></span> 闂傚倸鐗忛崑銈夊闯閸濄儲瀚?
+                                                            </span>
+                                                        </div>
+                                                    </div>
+
+                                                    {intonation?.best_sentence ? (
+                                                        <div className="space-y-4">
+                                                            {/* 闂佸搫鐗冮崑鎾趁归敐鍛毐鐟滄壆鍋熼埀?*/}
+                                                            <div className="bg-green-50 rounded-lg p-3">
+                                                                <div className="text-xs text-green-600 font-medium mb-2">闂?闂佸搫鐗冮崑鎾趁归敐鍛毐鐟滄壆鍋熼埀?(闂備焦褰冪粔鐑筋敋娴兼潙绀勯柛鈩冪憿閳ь剚锕㈤幃?{intonation.best_sentence.stress_accuracy.toFixed(0)}%)</div>
+                                                                {renderBouncingBalls(intonation.best_sentence.words)}
+                                                                <div className="text-xs text-gray-500 mt-2">{intonation.best_sentence.tip}</div>
+                                                            </div>
+
+                                                            {/* 闂傚倸娲犻崑鎾绘煛閳ь剛娑甸崨顖滎啋闂佸憡鐟ｉ崕閬嶆偤?*/}
+                                                            {intonation.problem_sentences?.slice(0, 2).map((ps, idx) => (
+                                                                <div key={idx} className="bg-yellow-50 rounded-lg p-3">
+                                                                    <div className="flex items-center justify-between mb-2">
+                                                                        <span className="text-xs text-yellow-600 font-medium">闂傚倸娲犻崑鎾绘煛閳ь剛娑甸崨顖滎啋</span>
+                                                                        <span className="text-xs text-gray-500">闂佸憡鍨靛Λ娑㈠灳濮椻偓閹?{ps.stress_accuracy.toFixed(0)}%</span>
+                                                                    </div>
+                                                                    {renderBouncingBalls(ps.words)}
+                                                                    <div className="text-xs text-orange-600 mt-2">{ps.tip}</div>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    ) : (
+                                                        <div className="text-gray-500 text-sm">闁荤姴娴傞崣鈧柣銊у枛瀵偊鎮ч崼婵堛偊闂佸憡甯掑Λ娆撴倵閼恒儳鈻?..</div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* 闁诲海鎳撻張顒勫汲閿濆棙鍎熼柨鏇楀亾闁搞劌閰ｅ?*/}
+                                        {moduleId === 'completeness' && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-2">濡絽鍟幉?闁诲海鎳撻張顒勫汲閿濆棙鍎熼柨鏇楀亾闁搞劌閰ｅ</h3>
+                                                {reportData.analysis.missing_words?.length > 0 ? (
+                                                    <div>
+                                                        <div className="text-sm text-gray-600 mb-1">濠电姵娲栫换妤咁敋閹殿喗瀚氱€广儱妫涘﹢?</div>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {reportData.analysis.missing_words.map((word, idx) => (
+                                                                <span key={idx} className="bg-red-100 text-red-700 px-2 py-0.5 rounded text-sm">
+                                                                    {word}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="text-green-600 text-sm">闂?闂佸搫鐗婇〃澶愵敋閹殿喒鍋撻悷鐗堟拱闁哄棴缍侀弫宥囦沪閻愵剨楠忓┑鐘虫礀缁绘顢氶幍顔藉珰鐎广儱妫涘﹢</div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {/* 闁哄鏅濋崰鎾诲几閹烘绀嗛柛鈩冾焽閳?*/}
+                                        {moduleId === 'hesitation' && (
+                                            <div className="border border-gray-200 rounded-lg p-4">
+                                                <h3 className="text-base font-bold mb-2">闂?闁哄鏅濋崰鎾诲几閹烘绀嗛柛鈩冾焽閳</h3>
+                                                {reportData.analysis.hesitations ? (
+                                                    <div className="grid grid-cols-3 gap-2 text-center">
+                                                        <div className="p-2 bg-gray-50 rounded">
+                                                            <div className="text-lg font-bold text-blue-600">{reportData.analysis.hesitations.total_count}</div>
+                                                            <div className="text-xs text-gray-500">闂佽鍓氬Σ鎺旀崲濠婂牊鍋柟瀵稿剱閸嬔囨煛</div>
+                                                        </div>
+                                                        <div className="p-2 bg-gray-50 rounded">
+                                                            <div className="text-lg font-bold text-yellow-600">{reportData.analysis.hesitations.filler_count}</div>
+                                                            <div className="text-xs text-gray-500">婵犻潧顦介崑鍕储閺嶎偅瀚</div>
+                                                        </div>
+                                                        <div className="p-2 bg-gray-50 rounded">
+                                                            <div className="text-lg font-bold text-red-600">{reportData.analysis.hesitations.long_pause_count}</div>
+                                                            <div className="text-xs text-gray-500">闂傚倵鍋撻柛顭戝枙缁顪</div>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="text-green-600 text-sm">闂?濠电偟绻濈粈渚€宕洪崟顖氬珘婵°倕瀚烽崵銏ゆ煥濞戞ɑ婀版俊顐犲€濆鐗堟償閵忊檧鏋栭柡澶嗘櫇閸犳捇寮</div>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+
+                                {selectedModules.length === 0 && (
+                                    <div className="py-16 text-center text-gray-400 border-2 border-dashed border-gray-300 rounded-xl">
+                                        闂佸綊鏀遍悧妤冣偓姘仢椤斿繘鏁傞幐搴㈢彿濠碘槅鍨埀顒冩珪閸嬨儵鏌涢幒鏂款暭妞ゆ帗绻冨?
+                                    </div>
+                                )}
+
+                                <div className="text-center text-xs text-gray-400 pt-3 border-t border-gray-200">
+                                    Generated by SpeechMaster 婵?2026
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            <style>{`
+                @media print {
+                    body { background: white !important; }
+                    .print\\:hidden { display: none !important; }
+                    @page { size: A4; margin: 0; }
+                }
+            `}</style>
+        </div>
+    );
+}
