@@ -46,9 +46,14 @@ class AudioMetrics:
 
 @dataclass
 class PauseInfo:
-    """停顿信息"""
+    """鍋滈】淇℃伅"""
     type: str  # good, bad, optional, missed
     duration: float = 0.0
+    issue: str = ""  # too_long / too_short
+    target_min: float = 0.0
+    target_max: float = 0.0
+    adjust_sec: float = 0.0
+    expected_type: str = ""
 
 
 @dataclass
@@ -231,7 +236,7 @@ class ScoringResult:
                         "end": round(w.end, 3),
                         "tag": w.tag.value,
                         "score": round(w.score, 1),
-                        "pause": {"type": w.pause.type, "duration": w.pause.duration} if w.pause else None,
+                        "pause": {"type": w.pause.type, "duration": w.pause.duration, "issue": w.pause.issue, "target_min": w.pause.target_min, "target_max": w.pause.target_max, "adjust_sec": w.pause.adjust_sec, "expected_type": w.pause.expected_type} if w.pause else None,
                         "stress": w.stress,
                         "is_linked": w.is_linked,
                         "diagnosis": w.diagnosis,

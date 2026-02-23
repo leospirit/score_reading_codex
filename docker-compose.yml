@@ -12,10 +12,16 @@ services:
       - ./score_reading:/app/score_reading
     environment:
       - USER_CONFIG_PATH=/app/data/config.yaml
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_API_BASE=${GEMINI_API_BASE}
-      - AZURE_API_KEY=${AZURE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_API_BASE=${GEMINI_API_BASE:-}
+      - AZURE_API_KEY=${AZURE_API_KEY:-}
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
+      - YTDLP_PO_TOKENS=${YTDLP_PO_TOKENS:-}
+      - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
+      - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-}
+      - UPLOAD_STORAGE_WARN_GB=${UPLOAD_STORAGE_WARN_GB:-20}
+      - YTDLP_PO_TOKEN_FILE=/app/data/yt_po_tokens.json
       - GENTLE_URL=http://gentle:8765
     depends_on:
       - gentle
@@ -28,6 +34,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        VITE_API_HOST: ${VITE_API_HOST:-}
+    environment:
+      - NGINX_UPLOAD_MAX_BODY_SIZE=${UPLOAD_MAX_MB:-30}m
     container_name: speech-scoring-web
     ports:
       - "80:80"

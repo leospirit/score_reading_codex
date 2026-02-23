@@ -428,6 +428,35 @@
             text-decoration-thickness: 2px;
         }
 
+        .highlighted-text .word.pause-flagged {
+            font-weight: 700;
+            text-decoration: underline;
+            text-decoration-style: wavy;
+            text-decoration-thickness: 1.5px;
+            text-underline-offset: 3px;
+        }
+
+        .highlighted-text .word.pause-too-long {
+            background: #FFE4E6;
+            color: #9F1239;
+            box-shadow: inset 0 -2px 0 #F43F5E;
+            text-decoration-color: #F43F5E;
+        }
+
+        .highlighted-text .word.pause-phrase-break {
+            background: #FEE2E2;
+            color: #991B1B;
+            box-shadow: inset 0 -2px 0 #EF4444;
+            text-decoration-color: #EF4444;
+        }
+
+        .highlighted-text .word.pause-too-short {
+            background: #FFFBEB;
+            color: #92400E;
+            box-shadow: inset 0 -2px 0 #F59E0B;
+            text-decoration-color: #F59E0B;
+        }
+
         .word-factor-pop {
             position: absolute;
             left: 50%;
@@ -500,27 +529,36 @@
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            margin: 0 4px 0 1px;
-            width: 18px;
-            height: 18px;
+            margin: 0 6px 0 2px;
+            padding: 2px 8px;
+            min-height: 20px;
             border-radius: 999px;
-            font-size: 0.62rem;
+            font-size: 0.64rem;
             line-height: 1;
-            font-weight: 700;
+            font-weight: 800;
+            letter-spacing: 0.02em;
             vertical-align: middle;
             border: 1px solid transparent;
+            text-transform: uppercase;
         }
 
         .break-chip.unexpected {
-            background: #FEF3C7;
-            color: #92400E;
-            border-color: #FCD34D;
+            background: #FEE2E2;
+            color: #991B1B;
+            border-color: #EF4444;
+            box-shadow: 0 0 0 1px rgba(153, 27, 27, 0.08);
+        }
+
+        .break-chip.unexpected.phrase-break {
+            background: #FFE4E6;
+            color: #9F1239;
+            border-color: #FB7185;
         }
 
         .break-chip.missing {
-            background: #F1F5F9;
-            color: #475569;
-            border-color: #CBD5E1;
+            background: #FFFBEB;
+            color: #92400E;
+            border-color: #FBBF24;
         }
         
         /* cleaned comment */
@@ -557,6 +595,13 @@
                 break-inside: avoid;
             }
             .print-btn { display: none; }
+            .pause-guide-tag.inline[data-print-hint]::after {
+                content: " (" attr(data-print-hint) ")";
+                font-size: 0.66rem;
+                font-weight: 600;
+                color: #475569;
+                margin-left: 2px;
+            }
         }
         
         .print-btn {
@@ -577,13 +622,66 @@
             background: #2962FF;
         }
         
-        .legend-item.ok { color: var(--text-primary); font-weight: 500; }
-        .legend-item.weak { color: var(--color-weak); font-weight: 600; }
-        .legend-item.poor { color: var(--color-missing); font-weight: 600; }
-        .legend-item.missing { color: var(--color-missing); text-decoration: line-through; font-weight: 600; opacity: 0.7; }
-        .legend-item.linking { color: var(--accent); font-weight: 600; border-bottom: 2px solid var(--accent); border-radius: 0 0 8px 8px; padding-bottom: 1px; }
-        .legend-item.break-unexpected { color: #92400E; font-weight: 600; }
-        .legend-item.break-missing { color: #475569; font-weight: 600; }
+        .reading-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+
+        .reading-legend .legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
+            padding: 3px 9px;
+            border: 1px solid transparent;
+            font-size: 0.78rem;
+            font-weight: 700;
+            line-height: 1.1;
+            white-space: nowrap;
+        }
+
+        .reading-legend .legend-item.ok {
+            color: var(--text-primary);
+            background: rgba(15, 23, 42, 0.06);
+        }
+
+        .reading-legend .legend-item.weak {
+            color: var(--color-weak);
+            background: rgba(245, 158, 11, 0.18);
+        }
+
+        .reading-legend .legend-item.poor {
+            color: var(--color-missing);
+            background: rgba(239, 68, 68, 0.16);
+        }
+
+        .reading-legend .legend-item.missing {
+            color: var(--color-missing);
+            text-decoration: line-through;
+            background: rgba(239, 68, 68, 0.1);
+            border-color: rgba(239, 68, 68, 0.28);
+            opacity: 0.92;
+        }
+
+        .reading-legend .legend-item.break-unexpected {
+            color: #991B1B;
+            background: #FEE2E2;
+            border-color: #FCA5A5;
+        }
+
+        .reading-legend .legend-item.break-phrase {
+            color: #9F1239;
+            background: #FFE4E6;
+            border-color: #FDA4AF;
+        }
+
+        .reading-legend .legend-item.break-missing {
+            color: #92400E;
+            background: #FFFBEB;
+            border-color: #FCD34D;
+        }
 
         /* cleaned comment */
         .link-arc {
@@ -949,6 +1047,7 @@
             
             <!-- cleaned comment -->
             <div class="breakdown-grid">
+                {% set completeness_display_score = (completeness_analysis.coverage if completeness_analysis and completeness_analysis.coverage is defined else scores.completeness_100) %}
                 <div class="skill-card pronunciation" onclick="openPronunciationModal()" style="cursor: pointer;">
                     <div class="skill-score">{{ score_int(scores.pronunciation_100) }}%</div>
                     <div class="skill-label">Pronunciation</div>
@@ -968,9 +1067,9 @@
                 </div>
                 
                 <div class="skill-card completeness" onclick="openCompletenessModal()" style="cursor: pointer;">
-                    <div class="skill-score">{{ score_int(scores.completeness_100) }}%</div>
+                    <div class="skill-score">{{ score_int(completeness_display_score) }}%</div>
                     <div class="skill-label">Completeness</div>
-                    <div class="skill-level">{{ get_level(scores.completeness_100) }}</div>
+                    <div class="skill-level">{{ get_level(completeness_display_score) }}</div>
                 </div>
             </div>
         </div>
@@ -988,7 +1087,8 @@
         {% endif %}
 
         {% set _pause_profile = engine_raw.pause_profile if engine_raw and engine_raw.pause_profile else {} %}
-        {% set show_missing_break = not ((_pause_profile.synthetic_timeline | default(0) | float >= 0.5) or (_pause_profile.low_confidence_timing | default(0) | float >= 0.5) or ((_pause_profile.timing_confidence | default('') | lower) == 'low')) %}
+        {% set low_conf_pause = ((_pause_profile.synthetic_timeline | default(0) | float >= 0.5) or (_pause_profile.low_confidence_timing | default(0) | float >= 0.5) or ((_pause_profile.timing_confidence | default('') | lower) == 'low')) %}
+        {% set show_missing_break = not low_conf_pause %}
         <!-- cleaned comment -->
         <div class="text-section">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
@@ -1002,14 +1102,32 @@
             </div>
             <div class="highlighted-text" id="highlightedText">
                 {% for word in alignment.words %}
+                {% set pause_before_cls = '' %}
                 {% if not loop.first and loop.previtem.pause %}
-                    {% if loop.previtem.pause.type == 'bad' %}
-                    <span class="break-chip unexpected" title="Unexpected break before this word">UB</span>
-                    {% elif show_missing_break and loop.previtem.pause.type == 'missed' %}
-                    <span class="break-chip missing" title="Missing break before this word">MB</span>
+                    {% set prev_pause_issue = (loop.previtem.pause.issue | default('') | lower) %}
+                    {% if prev_pause_issue == '' %}
+                        {% if loop.previtem.pause.type == 'bad' %}
+                            {% set prev_pause_issue = 'too_long' %}
+                        {% elif loop.previtem.pause.type == 'missed' %}
+                            {% set prev_pause_issue = 'too_short' %}
+                        {% endif %}
+                    {% endif %}
+                    {% if prev_pause_issue == 'too_long' %}
+                        {% set prev_expected_type = (loop.previtem.pause.expected_type | default('') | lower) %}
+                        {% set prev_phrase_break = (prev_expected_type in ['none', 'light', 'medium'] or (word.is_linked | default(false))) %}
+                        {% if prev_phrase_break %}
+                            {% set pause_before_cls = 'phrase-break' %}
+                            <span class="break-chip unexpected phrase-break" title="Phrase break: pause too long before this word">Phrase Break</span>
+                        {% else %}
+                            {% set pause_before_cls = 'too-long' %}
+                            <span class="break-chip unexpected" title="Pause too long before this word">Too Long</span>
+                        {% endif %}
+                    {% elif show_missing_break and prev_pause_issue == 'too_short' %}
+                        {% set pause_before_cls = 'too-short' %}
+                        <span class="break-chip missing" title="Pause too short before this word">Too Short</span>
                     {% endif %}
                 {% endif %}
-                <span class="word {{ word.tag }}" 
+                <span class="word {{ word.tag }}{% if pause_before_cls %} pause-flagged pause-{{ pause_before_cls }}{% endif %}" 
                       title="{% if word.diagnosis %}Diagnosis: {{ word.diagnosis }}{% else %}Score: {{ ('%.1f' % (word.score | float)).rstrip('0').rstrip('.') }}{% endif %}"
                       data-start="{{ word.start }}"
                       data-end="{{ word.end }}"
@@ -1038,16 +1156,17 @@
                 </span>
                 {% endfor %}
             </div>
-            <div class="legend">
+            <div class="legend reading-legend">
                 <span class="legend-item ok">Correct</span>
                 <span class="legend-item weak">Weak</span>
                 <span class="legend-item poor">Needs Improvement</span>
                 <span class="legend-item missing">Missing</span>
-                <span class="legend-item break-unexpected" title="Unexpected break">UB</span>
+                <span class="legend-item break-unexpected" title="Pause too long">Too Long Pause</span>
+                <span class="legend-item break-phrase" title="Pause splits linked words">Phrase Break</span>
                 {% if show_missing_break %}
-                <span class="legend-item break-missing" title="Missing break">MB</span>
+                <span class="legend-item break-missing" title="Pause too short">Too Short Pause</span>
                 {% else %}
-                <span class="legend-item break-missing" title="Missing break hidden on low-confidence timing">MB off</span>
+                <span class="legend-item break-missing" title="Too-short label hidden on low-confidence timing">Too Short Hidden (low confidence)</span>
                 {% endif %}
             </div>
         </div>
@@ -1199,11 +1318,6 @@
                                                 onclick="jumpToWord('{{ w_name }}')"
                                                 style="cursor: pointer;">
                                                 {{ w_name }}
-                                                {% for w in alignment.words if w.word.lower() == w_name.lower() and w.diagnosis %}
-                                                <span style="display:block; font-size: 0.8rem; font-weight: normal; color: #DC2626; margin-top:2px;">
-                                                    Diagnosis: {{ w.diagnosis }}
-                                                </span>
-                                                {% endfor %}
                                             </li>
                                             {% endfor %}
                                         {% else %}
@@ -2140,7 +2254,31 @@
                  </div>
                   
                  <!-- Tab 1: Pausing -->
-                 <div id="tab-pausing" class="tab-content active">
+                 <div id="tab-pausing" class="tab-content active pause-mode-student">
+                    {% set pause_stats = namespace(good=0, optional=0, bad=0, missed=0, bad_examples=[], missed_examples=[], optional_examples=[]) %}
+                    {% for w in alignment.words %}
+                        {% if w.pause and w.pause.type %}
+                            {% if w.pause.type == 'good' %}
+                                {% set pause_stats.good = pause_stats.good + 1 %}
+                            {% elif w.pause.type == 'optional' %}
+                                {% set pause_stats.optional = pause_stats.optional + 1 %}
+                                {% if pause_stats.optional_examples|length < 3 %}
+                                    {% set _ = pause_stats.optional_examples.append(w.word) %}
+                                {% endif %}
+                            {% elif w.pause.type == 'bad' %}
+                                {% set pause_stats.bad = pause_stats.bad + 1 %}
+                                {% if pause_stats.bad_examples|length < 3 %}
+                                    {% set _ = pause_stats.bad_examples.append(w.word) %}
+                                {% endif %}
+                            {% elif w.pause.type == 'missed' %}
+                                {% set pause_stats.missed = pause_stats.missed + 1 %}
+                                {% if pause_stats.missed_examples|length < 3 %}
+                                    {% set _ = pause_stats.missed_examples.append(w.word) %}
+                                {% endif %}
+                            {% endif %}
+                        {% endif %}
+                    {% endfor %}
+                    {% set pause_issue_total = pause_stats.bad + (pause_stats.missed if show_missing_break else 0) %}
                     <!-- cleaned comment -->
                     <div class="pro-header">
                         <div class="ring-container small">
@@ -2174,36 +2312,236 @@
 
                     <!-- cleaned comment -->
                     <div class="legend-bar">
-                        <div class="legend-item"><span class="mark-icon good">H</span> Good Pauses</div>
-                        <div class="legend-item"><span class="mark-icon optional">H</span> Optional Pauses</div>
-                        <div class="legend-item"><span class="mark-icon bad">H</span> Bad Pauses</div>
-                        {% if show_missing_break %}
-                        <div class="legend-item"><span class="mark-icon missed">I</span> Missed Pauses</div>
+                        {% if low_conf_pause %}
+                        <div class="legend-item"><span class="mark-icon optional">~</span> Low-confidence timing: labels below are estimated from punctuation anchors.</div>
+                        {% else %}
+                        <div class="legend-item"><span class="mark-icon bad">||</span> Too Long: pause is longer than target range.</div>
+                        <div class="legend-item"><span class="mark-icon missed">|</span> Too Short: pause is shorter than target range.</div>
+                        <div class="legend-item"><span class="mark-icon good">||</span> Good: pause length is in target range.</div>
                         {% endif %}
                     </div>
-                    {% if not show_missing_break %}
-                    <div style="margin: 8px 0 10px; color:#64748B; font-size:12px;">
-                        Missing break is hidden because timestamp confidence is low.
+                    <div class="pause-view-toolbar">
+                        <div class="pause-view-toggle" role="tablist" aria-label="Pause view mode">
+                            <button type="button" class="pause-view-btn active" data-pause-view="student" onclick="setPauseViewMode('student', this)">Student</button>
+                            <button type="button" class="pause-view-btn" data-pause-view="teacher" onclick="setPauseViewMode('teacher', this)">Teacher</button>
+                        </div>
+                        <div class="pause-view-meta pause-teacher-only">Azure threshold: 0.75</div>
                     </div>
-                    {% endif %}
-
+                    <div class="pausing-coach">
+                        <div class="pausing-coach-head">
+                            <div class="pausing-coach-title">How to improve pauses</div>
+                            {% if low_conf_pause %}
+                            <div class="pausing-coach-score pause-student-only">Reading quality and pause timing are scored separately. This pausing score is conservative when timing confidence is low.</div>
+                            {% else %}
+                            <div class="pausing-coach-score pause-student-only">Focus on smooth and natural pauses.</div>
+                            {% endif %}
+                            {% if low_conf_pause %}
+                            <div class="pausing-coach-score pause-teacher-only">Low-confidence plan (estimated timing)</div>
+                            {% else %}
+                            <div class="pausing-coach-score pause-teacher-only">{{ pause_issue_total }} key pause issue{{ 's' if pause_issue_total != 1 else '' }}</div>
+                            {% endif %}
+                        </div>
+                        {% if low_conf_pause %}
+                        <div class="pausing-clarity-box">
+                            <div class="pausing-clarity-title">Why a good reader can still get a lower Pausing score</div>
+                            <div class="pausing-clarity-text pause-student-only">Your reading quality and pause timing are different dimensions. When timing confidence is low, pausing is scored more conservatively.</div>
+                            <div class="pausing-clarity-text pause-teacher-only">Timing confidence is low in this sample, so pause diagnostics are treated as estimated guidance, not strong timing evidence.</div>
+                            <div class="pausing-clarity-row">
+                                <span class="pausing-chip good">Pronunciation {{ score_int(scores.pronunciation_100) }}%</span>
+                                <span class="pausing-chip good">Completeness {{ score_int(scores.completeness_100) }}%</span>
+                                <span class="pausing-chip optional">Timing confidence: low</span>
+                            </div>
+                        </div>
+                        {% endif %}
+                        {% set low_issue = namespace(too_long=0, too_short=0) %}
+                        {% if low_conf_pause and _pause_profile.practice_focus_points %}
+                            {% for p in _pause_profile.practice_focus_points %}
+                                {% if p.issue == 'too_long' %}
+                                    {% set low_issue.too_long = low_issue.too_long + 1 %}
+                                {% elif p.issue == 'too_short' %}
+                                    {% set low_issue.too_short = low_issue.too_short + 1 %}
+                                {% endif %}
+                            {% endfor %}
+                        {% endif %}
+                        <div class="pausing-chip-row">
+                            {% if low_conf_pause %}
+                            <span class="pausing-chip optional">Low-confidence mode</span>
+                            <span class="pausing-chip bad">Too Long {{ low_issue.too_long }}</span>
+                            <span class="pausing-chip missed">Too Short {{ low_issue.too_short }}</span>
+                            {% if low_issue.too_long == 0 and low_issue.too_short == 0 %}
+                            <span class="pausing-chip optional">Evidence limited</span>
+                            {% endif %}
+                            {% else %}
+                            <span class="pausing-chip good">Good {{ pause_stats.good }}</span>
+                            <span class="pausing-chip bad">Too Long {{ pause_stats.bad }}</span>
+                            {% if show_missing_break %}
+                            <span class="pausing-chip missed">Too Short {{ pause_stats.missed }}</span>
+                            {% endif %}
+                            {% endif %}
+                        </div>
+                        {% if low_conf_pause %}
+                        <ul class="pausing-tip-list pause-teacher-only">
+                            {% if _pause_profile.practice_focus_points %}
+                                {% for p in _pause_profile.practice_focus_points %}
+                                <li>
+                                    {% if p.issue == 'too_long' %}
+                                    After "{{ p.left_word }}" before "{{ p.right_word }}": pause too long ({{ ((p.actual_gap | default(0) | float) * 1000) | round | int }} ms). Target {{ ((p.target_min | default(0) | float) * 1000) | round | int }}-{{ ((p.target_max | default(0) | float) * 1000) | round | int }} ms. Shorten by about {{ ((p.adjust_sec | default(0) | float) * 1000) | round | int }} ms.
+                                    {% elif p.issue == 'too_short' %}
+                                    After "{{ p.left_word }}" before "{{ p.right_word }}": pause too short ({{ ((p.actual_gap | default(0) | float) * 1000) | round | int }} ms). Target {{ ((p.target_min | default(0) | float) * 1000) | round | int }}-{{ ((p.target_max | default(0) | float) * 1000) | round | int }} ms. Add about {{ ((p.adjust_sec | default(0) | float) * 1000) | round | int }} ms.
+                                    {% endif %}
+                                </li>
+                                {% endfor %}
+                            {% else %}
+                            <li>No clear pause timing issue found in low-confidence mode.</li>
+                            {% endif %}
+                            <li>If a label shows Phrase Break, connect the phrase and avoid a full-stop pause.</li>
+                            <li>Sentence end target: 600-900 ms. Comma break target: 250-500 ms.</li>
+                        </ul>
+                        {% else %}
+                        <ul class="pausing-tip-list pause-teacher-only">
+                            <li>Too Long: shorten to the target range shown on the label.</li>
+                            <li>Too Short: add pause time to the target range shown on the label.</li>
+                            <li>If a label shows Phrase Break, keep that word group connected.</li>
+                            <li>Sentence end target: 600-900 ms. Comma break target: 250-500 ms.</li>
+                        </ul>
+                        {% endif %}
+                        <ul class="pausing-tip-list pause-student-only">
+                            <li>Too Long: make the break shorter and keep your sentence flowing.</li>
+                            <li>Too Short: add a clearer pause at commas and sentence endings.</li>
+                            <li>Phrase Break: connect the words as one chunk.</li>
+                            <li>Aim for stable rhythm before chasing exact milliseconds.</li>
+                        </ul>
+                        {% if (pause_stats.bad_examples or (show_missing_break and pause_stats.missed_examples)) and (not low_conf_pause) %}
+                        <div class="pausing-focus-line pause-teacher-only">
+                            Focus near:
+                            {% if pause_stats.bad_examples %}
+                                too long: {{ pause_stats.bad_examples | join(', ') }}
+                            {% endif %}
+                            {% if pause_stats.bad_examples and show_missing_break and pause_stats.missed_examples %} | {% endif %}
+                            {% if show_missing_break and pause_stats.missed_examples %}
+                                too short: {{ pause_stats.missed_examples | join(', ') }}
+                            {% endif %}
+                        </div>
+                        {% endif %}
+                        <div class="pausing-read-hint pause-student-only">Tip: focus on red/orange pause labels first, then re-read smoothly.</div>
+                        {% if low_conf_pause %}
+                        <div class="pausing-read-hint pause-teacher-only">Tip: hover each pause label to see likely fix (timing confidence is low).</div>
+                        {% else %}
+                        <div class="pausing-read-hint pause-teacher-only">Tip: hover each pause label in transcript to see duration and exact fix.</div>
+                        {% endif %}
+                    </div>
                     <!-- Transcript Area -->
                     <div class="transcript-box">
                         <h3>Transcript</h3>
+                        <div class="pause-guide-legend">
+                            <span class="pause-guide-tag phrase-break">Phrase Break</span>
+                            <span class="pause-guide-tag too-long">Too Long</span>
+                            {% if low_conf_pause or show_missing_break %}
+                            <span class="pause-guide-tag too-short">Too Short</span>
+                            {% endif %}
+                        </div>
                         <div class="transcript-content">
                             {% for word in alignment.words %}
                                 <span class="t-word">{{ word.word }}</span>
-                                
-                                {% if word.pause %}
-                                    {% if word.pause.type == 'missed' %}
-                                        {% if show_missing_break %}
-                                        <span class="pause-mark missed" title="Missed Pause"></span>
+
+                                {% if low_conf_pause and _pause_profile.practice_focus_points %}
+                                    {% set focus = namespace(item=None) %}
+                                    {% for p in _pause_profile.practice_focus_points %}
+                                        {% if (p.idx | default(-1) | int) == loop.index0 %}
+                                            {% set focus.item = p %}
                                         {% endif %}
-                                    {% else %}
-                                        <!-- Dynamic width based on duration (mock logic: 0.1s = 5px) -->
-                                        <span class="pause-mark h-bar {{ word.pause.type }}" 
-                                              style="width: 40px;" 
-                                              title="{{ word.pause.type|capitalize }}: {{ word.pause.duration }}">
+                                    {% endfor %}
+                                    {% if focus.item is none %}
+                                        {% for p in _pause_profile.practice_focus_points %}
+                                            {% if (p.left_word | default('') | lower) == (word.word | default('') | lower) %}
+                                                {% set focus.item = p %}
+                                            {% endif %}
+                                        {% endfor %}
+                                    {% endif %}
+                                    {% if focus.item and (focus.item.issue == 'too_long' or focus.item.issue == 'too_short') %}
+                                        {% set left_word = focus.item.left_word | default(word.word) %}
+                                        {% set right_word = focus.item.right_word | default('next word') %}
+                                        {% set actual_ms = ((focus.item.actual_gap | default(0) | float) * 1000) | round | int %}
+                                        {% set target_min_ms = ((focus.item.target_min | default(0) | float) * 1000) | round | int %}
+                                        {% set target_max_ms = ((focus.item.target_max | default(0) | float) * 1000) | round | int %}
+                                        {% set adjust_ms = ((focus.item.adjust_sec | default(0) | float) * 1000) | round | int %}
+                                        {% set issue_label = 'TOO SHORT' %}
+                                        {% set issue_cls = 'too-short' %}
+                                        {% set issue_tip = 'After ' ~ left_word ~ ' before ' ~ right_word ~ ': pause too short (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Add about ' ~ adjust_ms ~ ' ms.' %}
+                                        {% set issue_print = 'add ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
+                                        {% set student_title = 'Too Short: add a clearer pause here' %}
+                                        {% if focus.item.issue == 'too_long' %}
+                                            {% set issue_label = 'TOO LONG' %}
+                                            {% set issue_cls = 'too-long' %}
+                                            {% set issue_tip = 'After ' ~ left_word ~ ' before ' ~ right_word ~ ': pause too long (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Shorten by about ' ~ adjust_ms ~ ' ms.' %}
+                                            {% set issue_print = 'shorten ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
+                                            {% set student_title = 'Too Long: shorten this pause' %}
+                                            {% set expected_pause_type = (focus.item.pause_type | default('') | lower) %}
+                                            {% set linked_next = (loop.nextitem is defined and (loop.nextitem.is_linked | default(false))) %}
+                                            {% set phrase_break = false %}
+                                            {% if expected_pause_type in ['none', 'light', 'medium'] or linked_next %}
+                                                {% set phrase_break = true %}
+                                            {% endif %}
+                                            {% if phrase_break %}
+                                                {% set issue_label = 'PHRASE BREAK' %}
+                                                {% set issue_cls = 'phrase-break' %}
+                                                {% set issue_tip = 'After ' ~ left_word ~ ' before ' ~ right_word ~ ': this pause is too long and breaks a connected phrase (' ~ actual_ms ~ ' ms). Keep the phrase connected; target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms.' %}
+                                                {% set issue_print = 'phrase split: connect words; shorten ~' ~ adjust_ms ~ ' ms' %}
+                                                {% set student_title = 'Phrase Break: keep these words connected' %}
+                                            {% endif %}
+                                        {% endif %}
+                                        <span class="pause-guide-tag inline {{ issue_cls }}"
+                                              title="{{ issue_tip }}"
+                                              data-student-title="{{ student_title }}"
+                                              data-print-hint="{{ issue_print }}">
+                                            {{ issue_label }}
+                                        </span>
+                                    {% endif %}
+                                {% elif word.pause %}
+                                    {% set pause_issue = (word.pause.issue | default('') | lower) %}
+                                    {% if pause_issue == '' %}
+                                        {% if word.pause.type == 'bad' %}
+                                            {% set pause_issue = 'too_long' %}
+                                        {% elif word.pause.type == 'missed' %}
+                                            {% set pause_issue = 'too_short' %}
+                                        {% endif %}
+                                    {% endif %}
+                                    {% if pause_issue == 'too_long' or (show_missing_break and pause_issue == 'too_short') %}
+                                        {% set right_word = loop.nextitem.word if loop.nextitem is defined else 'next word' %}
+                                        {% set actual_ms = ((word.pause.duration | default(0) | float) * 1000) | round | int %}
+                                        {% set target_min_ms = ((word.pause.target_min | default(0) | float) * 1000) | round | int %}
+                                        {% set target_max_ms = ((word.pause.target_max | default(0) | float) * 1000) | round | int %}
+                                        {% set adjust_ms = ((word.pause.adjust_sec | default(0) | float) * 1000) | round | int %}
+                                        {% set issue_label = 'TOO SHORT' %}
+                                        {% set issue_cls = 'too-short' %}
+                                        {% set issue_tip = 'After ' ~ word.word ~ ' before ' ~ right_word ~ ': pause too short (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Add about ' ~ adjust_ms ~ ' ms.' %}
+                                        {% set issue_print = 'add ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
+                                        {% set student_title = 'Too Short: add a clearer pause here' %}
+                                        {% if pause_issue == 'too_long' %}
+                                            {% set issue_label = 'TOO LONG' %}
+                                            {% set issue_cls = 'too-long' %}
+                                            {% set issue_tip = 'After ' ~ word.word ~ ' before ' ~ right_word ~ ': pause too long (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Shorten by about ' ~ adjust_ms ~ ' ms.' %}
+                                            {% set issue_print = 'shorten ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
+                                            {% set student_title = 'Too Long: shorten this pause' %}
+                                            {% set expected_pause_type = (word.pause.expected_type | default('') | lower) %}
+                                            {% set linked_next = (loop.nextitem is defined and (loop.nextitem.is_linked | default(false))) %}
+                                            {% set phrase_break = false %}
+                                            {% if expected_pause_type in ['none', 'light', 'medium'] or linked_next %}
+                                                {% set phrase_break = true %}
+                                            {% endif %}
+                                            {% if phrase_break %}
+                                                {% set issue_label = 'PHRASE BREAK' %}
+                                                {% set issue_cls = 'phrase-break' %}
+                                                {% set issue_tip = 'After ' ~ word.word ~ ' before ' ~ right_word ~ ': this pause is too long and breaks a connected phrase (' ~ actual_ms ~ ' ms). Keep the phrase connected; target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms.' %}
+                                                {% set issue_print = 'phrase split: connect words; shorten ~' ~ adjust_ms ~ ' ms' %}
+                                                {% set student_title = 'Phrase Break: keep these words connected' %}
+                                            {% endif %}
+                                        {% endif %}
+                                        <span class="pause-guide-tag inline {{ issue_cls }}"
+                                              title="{{ issue_tip }}"
+                                              data-student-title="{{ student_title }}"
+                                              data-print-hint="{{ issue_print }}">
+                                            {{ issue_label }}
                                         </span>
                                     {% endif %}
                                 {% endif %}
@@ -2211,7 +2549,6 @@
                         </div>
                     </div>
                  </div>
-
                  <div id="tab-pace" class="tab-content">
                     {% set avg_wpm = 0 %}
                     {# Unified data path to avoid nested scoping issues #}
@@ -2412,6 +2749,63 @@
             color: #2563EB;
             border-bottom-color: #2563EB;
         }
+        .pause-view-toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            margin: 2px 0 10px;
+        }
+        .pause-view-toggle {
+            display: inline-flex;
+            border: 1px solid #D1D5DB;
+            border-radius: 999px;
+            overflow: hidden;
+            background: #fff;
+        }
+        .pause-view-btn {
+            border: none;
+            background: #fff;
+            color: #475569;
+            font-size: 0.75rem;
+            font-weight: 700;
+            padding: 5px 11px;
+            cursor: pointer;
+        }
+        .pause-view-btn.active {
+            background: #2563EB;
+            color: #fff;
+        }
+        .pause-view-meta {
+            font-size: 0.75rem;
+            color: #64748B;
+        }
+        .pausing-clarity-box {
+            margin: 8px 0 10px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid #FCD34D;
+            background: #FFFBEB;
+        }
+        .pausing-clarity-title {
+            font-size: 0.82rem;
+            font-weight: 800;
+            color: #92400E;
+            margin-bottom: 6px;
+        }
+        .pausing-clarity-text {
+            font-size: 0.8rem;
+            color: #374151;
+            line-height: 1.45;
+        }
+        .pausing-clarity-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        #tab-pausing.pause-mode-student .pause-teacher-only { display: none !important; }
+        #tab-pausing.pause-mode-teacher .pause-student-only { display: none !important; }
         
         .tab-content {
             display: none;
@@ -2448,13 +2842,78 @@
         
         .mark-icon {
             display: inline-block;
-            font-weight: bold;
+            font-weight: 800;
             font-size: 0.8rem;
+            min-width: 14px;
+            text-align: center;
         }
         .mark-icon.good { color: #4CAF50; }
         .mark-icon.bad { color: #FF5252; }
         .mark-icon.optional { color: #9E9E9E; }
         .mark-icon.missed { color: #FF5252; border-left: 3px solid #FF5252; height: 12px; width: 0; content: ' '; }
+
+        .pausing-coach {
+            margin-bottom: 14px;
+            padding: 12px 14px;
+            border-radius: 10px;
+            border: 1px solid #E2E8F0;
+            background: #F8FAFC;
+        }
+        .pausing-coach-head {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .pausing-coach-title {
+            font-size: 0.9rem;
+            font-weight: 800;
+            color: #0F172A;
+        }
+        .pausing-coach-score {
+            font-size: 0.82rem;
+            color: #334155;
+            font-weight: 700;
+        }
+        .pausing-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .pausing-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 9px;
+            border-radius: 999px;
+            font-size: 0.76rem;
+            font-weight: 700;
+            border: 1px solid transparent;
+        }
+        .pausing-chip.good { background: #ECFDF3; color: #166534; border-color: #BBF7D0; }
+        .pausing-chip.optional { background: #F1F5F9; color: #334155; border-color: #E2E8F0; }
+        .pausing-chip.bad { background: #FFF1F2; color: #B91C1C; border-color: #FFE4E6; }
+        .pausing-chip.missed { background: #FEF2F2; color: #991B1B; border-color: #FECACA; }
+        .pausing-tip-list {
+            margin: 0;
+            padding-left: 18px;
+            color: #334155;
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }
+        .pausing-focus-line {
+            margin-top: 8px;
+            font-size: 0.79rem;
+            color: #1E293B;
+            font-weight: 600;
+        }
+        .pausing-read-hint {
+            margin-top: 6px;
+            font-size: 0.75rem;
+            color: #64748B;
+        }
         
         .transcript-box {
             background: white;
@@ -2468,9 +2927,97 @@
             line-height: 2.2; /* High line-height for pause bars */
             color: #333;
         }
+
+        .pause-guide-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 0 0 12px;
+        }
+
+        .pause-guide-tag {
+            display: inline-block;
+            margin: 0 6px 0 4px;
+            padding: 2px 7px;
+            border-radius: 999px;
+            border: 1px solid #dbeafe;
+            background: #eff6ff;
+            color: #1e3a8a;
+            font-size: 0.72rem;
+            font-weight: 700;
+            line-height: 1.2;
+            vertical-align: middle;
+            white-space: nowrap;
+        }
+        .pause-guide-tag.phrase-break { background: #fee2e2; border-color: #fca5a5; color: #991b1b; }
+        .pause-guide-tag.strong { background: #fff1f2; border-color: #fecdd3; color: #9f1239; }
+        .pause-guide-tag.too-long { background: #fff1f2; border-color: #fecdd3; color: #9f1239; }
+        .pause-guide-tag.too-short { background: #fffbeb; border-color: #fcd34d; color: #92400e; }
+        .pause-guide-tag.medium { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+        .pause-guide-tag.light { background: #ecfeff; border-color: #a5f3fc; color: #155e75; }
+        .pause-guide-tag.none { background: #ecfdf3; border-color: #bbf7d0; color: #166534; }
+        .pause-guide-tag.inline {
+            margin: 0 8px 0 4px;
+            padding: 3px 9px;
+            border-width: 2px;
+            font-size: 0.75rem;
+            font-weight: 800;
+            letter-spacing: 0.01em;
+        }
+        .pause-guide-tag.inline.too-long {
+            background: #FFE4E6;
+            border-color: #F43F5E;
+            color: #9F1239;
+            box-shadow: 0 0 0 1px rgba(159, 18, 57, 0.1);
+        }
+        .pause-guide-tag.inline.too-short {
+            background: #FFFBEB;
+            border-color: #F59E0B;
+            color: #92400E;
+            box-shadow: 0 0 0 1px rgba(146, 64, 14, 0.08);
+        }
+        .pause-guide-tag.inline.phrase-break {
+            background: #FEE2E2;
+            border-color: #EF4444;
+            color: #991B1B;
+            border-width: 2px;
+            box-shadow: 0 0 0 1px rgba(153, 27, 27, 0.12);
+        }
         
         .t-word {
             display: inline-block;
+            padding: 0 2px;
+            border-radius: 4px;
+            transition: background-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .t-word.pause-issue-word {
+            font-weight: 700;
+            text-decoration: underline;
+            text-decoration-style: wavy;
+            text-decoration-thickness: 1.5px;
+            text-underline-offset: 3px;
+        }
+
+        .t-word.pause-issue-word.too-long {
+            background: #FFE4E6;
+            color: #9F1239;
+            box-shadow: inset 0 -2px 0 #F43F5E;
+            text-decoration-color: #F43F5E;
+        }
+
+        .t-word.pause-issue-word.phrase-break {
+            background: #FEE2E2;
+            color: #991B1B;
+            box-shadow: inset 0 -2px 0 #EF4444;
+            text-decoration-color: #EF4444;
+        }
+
+        .t-word.pause-issue-word.too-short {
+            background: #FFFBEB;
+            color: #92400E;
+            box-shadow: inset 0 -2px 0 #F59E0B;
+            text-decoration-color: #F59E0B;
         }
         
         /* Pause Visualization */
@@ -2635,6 +3182,9 @@
                 console.error("Tab content NOT found in DOM:", `tab-${tabName}`);
             }
             
+            if (tabName === 'pausing') {
+                applyPauseViewMode(currentPauseViewMode);
+            }
             // 4. Handle Pace Chart Specifics
             if (tabName === 'pace') {
                 if (typeof initPaceChart === 'function') {
@@ -2644,13 +3194,78 @@
                 }
             }
         }
+
+        function annotateReadingPauseWords() {
+            const root = document.getElementById('highlightedText');
+            if (!root) return;
+            root.querySelectorAll('.word').forEach((el) => {
+                el.classList.remove('pause-flagged', 'pause-too-long', 'pause-too-short', 'pause-phrase-break');
+            });
+            root.querySelectorAll('.break-chip').forEach((chip) => {
+                const nextWord = chip.nextElementSibling;
+                if (!nextWord || !nextWord.classList.contains('word')) return;
+                nextWord.classList.add('pause-flagged');
+                if (chip.classList.contains('phrase-break')) {
+                    nextWord.classList.add('pause-phrase-break');
+                } else if (chip.classList.contains('unexpected')) {
+                    nextWord.classList.add('pause-too-long');
+                } else if (chip.classList.contains('missing')) {
+                    nextWord.classList.add('pause-too-short');
+                }
+            });
+        }
+
+        function annotatePausingPauseWords() {
+            const root = document.querySelector('#tab-pausing .transcript-content');
+            if (!root) return;
+            root.querySelectorAll('.t-word').forEach((el) => {
+                el.classList.remove('pause-issue-word', 'too-long', 'too-short', 'phrase-break');
+            });
+            root.querySelectorAll('.pause-guide-tag.inline').forEach((tag) => {
+                const prevWord = tag.previousElementSibling;
+                if (!prevWord || !prevWord.classList.contains('t-word')) return;
+                prevWord.classList.add('pause-issue-word');
+                if (tag.classList.contains('phrase-break')) {
+                    prevWord.classList.add('phrase-break');
+                } else if (tag.classList.contains('too-long')) {
+                    prevWord.classList.add('too-long');
+                } else if (tag.classList.contains('too-short')) {
+                    prevWord.classList.add('too-short');
+                }
+            });
+        }
         
+        let currentPauseViewMode = 'student';
+        function applyPauseViewMode(mode) {
+            const root = document.getElementById('tab-pausing');
+            if (!root) return;
+            annotatePausingPauseWords();
+            root.classList.remove('pause-mode-student', 'pause-mode-teacher');
+            root.classList.add(mode === 'teacher' ? 'pause-mode-teacher' : 'pause-mode-student');
+            root.querySelectorAll('.pause-view-btn').forEach((btn) => {
+                btn.classList.toggle('active', btn.getAttribute('data-pause-view') === mode);
+            });
+            root.querySelectorAll('.pause-guide-tag.inline[data-student-title]').forEach((el) => {
+                if (!el.dataset.teacherTitle) {
+                    el.dataset.teacherTitle = el.getAttribute('title') || '';
+                }
+                const title = mode === 'teacher' ? (el.dataset.teacherTitle || '') : (el.dataset.studentTitle || 'Pause adjustment');
+                if (title) {
+                    el.setAttribute('title', title);
+                }
+            });
+        }
+        function setPauseViewMode(mode, btnElement) {
+            currentPauseViewMode = mode === 'teacher' ? 'teacher' : 'student';
+            applyPauseViewMode(currentPauseViewMode);
+        }
         // Fluency Modal
         let paceChartInstance = null;
         
         function openFluencyModal() {
             document.getElementById('fluencyModal').classList.add('active');
             document.body.style.overflow = 'hidden';
+            applyPauseViewMode(currentPauseViewMode);
             
             // Re-init chart if we are on the pace tab
             const activeBtn = document.querySelector('.modal-tabs .tab-btn.active');
@@ -2968,6 +3583,13 @@
                      e.preventDefault();
                      if (window.openCompletenessModal) window.openCompletenessModal();
                 });
+            }
+
+            if (window.annotateReadingPauseWords) {
+                window.annotateReadingPauseWords();
+            }
+            if (window.annotatePausingPauseWords) {
+                window.annotatePausingPauseWords();
             }
 
             // All tab clicks are handled by switchFluencyTab(tabName, this) via onclick attribute.

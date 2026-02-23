@@ -4,6 +4,7 @@ import os
 from typing import Any, Dict
 
 from src.analysis.openai_provider import OpenAIProvider
+from src.advice.playbook import build_playbook_runtime_hints
 from src.config import load_config
 from src.models import Feedback, PhonemeTag, ScoringResult, WordTag
 
@@ -199,12 +200,20 @@ class LLMAdvisor:
         if result.analysis.hesitations and result.analysis.hesitations.fillers:
             hesitations = result.analysis.hesitations.fillers
 
+        playbook_hints = build_playbook_runtime_hints(
+            script_text=result.script_text or "",
+            weak_words=[str(item.get("word", "")) for item in weak_words_data[:20]],
+            phoneme_symbols=[str(item.get("phoneme", "")) for item in phoneme_issues[:20]],
+            max_items=5,
+        )
+
         return {
             "instruction": (
                 f"Start with '{nickname}' and provide precise, actionable coaching in Chinese. "
                 "Do not use generic address like the generic Chinese term for classmate."
             ),
             "student_nickname": nickname,
+            "playbook_hints": playbook_hints,
             "text": result.script_text,
             "scores": {
                 "pronunciation": round(result.scores.pronunciation_100, 1),
@@ -245,10 +254,15 @@ Rules:
 - Respond in Chinese.
 - Always address the student with provided student_nickname.
 - Use concrete, physical pronunciation instructions.
+- Prefer playbook_hints when they match evidence; ignore irrelevant entries.
 - Keep overall_comment to 1-2 sentences and <= 45 Chinese chars.
 - Mention exactly one strongest point and one key fix.
 - specific_feedback must contain at most 1 item.
 - practice_tips must contain at most 1 item.
+- top_errors should include 1-3 concrete items when evidence exists.
+- Each top_errors[i].improvement should include one drill + one vivid mnemonic, suitable for Chinese Grade-6 daily life.
+- Mnemonic can be playful/humorous, but must remain positive and executable.
+- Avoid repeating the same wording across top_errors improvements.
 - Keep tone encouraging but evidence-based.
 """
 

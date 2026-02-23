@@ -89,6 +89,38 @@ def encode_audio_base64(audio_path: Path) -> str | None:
         return None
 
 
+def _find_uploaded_audio_for_submission(submission_id: str, json_path: Path) -> Path | None:
+    """
+    Locate uploaded audio by submission id under data/uploads.
+
+    This is used by regenerate_report_from_json so regenerated HTML can still
+    include playback audio even when JSON does not embed audio_base64.
+    """
+    sid = str(submission_id or "").strip()
+    if not sid:
+        return None
+
+    data_root = None
+    for parent in json_path.parents:
+        if parent.name == "data":
+            data_root = parent
+            break
+    if data_root is None:
+        return None
+
+    uploads_dir = data_root / "uploads"
+    if not uploads_dir.exists():
+        return None
+
+    allowed_ext = {".mp3", ".wav", ".m4a", ".ogg", ".webm"}
+    candidates = [p for p in uploads_dir.rglob(f"{sid}.*") if p.suffix.lower() in allowed_ext]
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def get_phoneme_tips(weak_phonemes: list[str]) -> list[dict[str, Any]]:
     """
     根据弱音素列表获取发音指导
@@ -451,9 +483,73 @@ def _build_word_phoneme_breakdown(result: ScoringResult) -> list[list[dict[str, 
             buckets[wi] = row
         return buckets
 
-    # Pass 1: assign by time overlap when timestamps are available.
+    # Pass 1: prioritize lexical in_word mapping from engine output.
     assigned: list[bool] = [False] * len(phonemes)
+    token_slots: dict[str, list[int]] = defaultdict(list)
+    for wi, w in enumerate(words):
+        token = _normalize_token(getattr(w, "word", ""))
+        if token:
+            token_slots[token].append(wi)
+
+    token_cursor: dict[str, int] = defaultdict(int)
     for pi, p in enumerate(phonemes):
+        p_symbol = _to_ipa_symbol(str(getattr(p, "phoneme", "") or "").strip())
+        if not p_symbol:
+            continue
+
+        token = _normalize_token(getattr(p, "in_word", ""))
+        slots = token_slots.get(token) or []
+        if not slots:
+            continue
+
+        try:
+            p_start = float(getattr(p, "start", 0.0) or 0.0)
+            p_end = float(getattr(p, "end", -1.0) or -1.0)
+        except Exception:
+            p_start = 0.0
+            p_end = -1.0
+
+        chosen_idx = None
+        best_overlap = 0.0
+        if p_end > p_start >= 0.0:
+            for wi in slots:
+                try:
+                    ws = float(getattr(words[wi], "start", 0.0))
+                    we = float(getattr(words[wi], "end", 0.0))
+                except Exception:
+                    continue
+                overlap = min(we, p_end) - max(ws, p_start)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    chosen_idx = wi
+
+        if chosen_idx is None:
+            cursor = token_cursor[token]
+            slot_pos = min(cursor, len(slots) - 1)
+            chosen_idx = slots[slot_pos]
+            token_cursor[token] = cursor + 1
+        else:
+            # Keep occurrence mapping monotonic for repeated tokens.
+            try:
+                slot_pos = slots.index(chosen_idx)
+                token_cursor[token] = max(token_cursor[token], slot_pos + 1)
+            except ValueError:
+                pass
+
+        buckets[chosen_idx].append(
+            {
+                "symbol": p_symbol,
+                "score": float(getattr(p, "score", 0.0) or 0.0),
+                "start": max(0.0, p_start),
+            }
+        )
+        assigned[pi] = True
+
+    # Pass 2: assign remaining phonemes by time overlap when timestamps are available.
+    for pi, p in enumerate(phonemes):
+        if assigned[pi]:
+            continue
+
         p_symbol = _to_ipa_symbol(str(getattr(p, "phoneme", "") or "").strip())
         if not p_symbol:
             continue
@@ -492,39 +588,6 @@ def _build_word_phoneme_breakdown(result: ScoringResult) -> list[list[dict[str, 
             }
         )
         assigned[pi] = True
-
-    # Pass 2: fallback by lexical in_word matching.
-    token_slots: dict[str, list[int]] = defaultdict(list)
-    for wi, w in enumerate(words):
-        token = _normalize_token(getattr(w, "word", ""))
-        if token:
-            token_slots[token].append(wi)
-
-    token_cursor: dict[str, int] = defaultdict(int)
-    for pi, p in enumerate(phonemes):
-        if assigned[pi]:
-            continue
-
-        p_symbol = _to_ipa_symbol(str(getattr(p, "phoneme", "") or "").strip())
-        if not p_symbol:
-            continue
-
-        token = _normalize_token(getattr(p, "in_word", ""))
-        slots = token_slots.get(token) or []
-        if not slots:
-            continue
-
-        cursor = token_cursor[token]
-        wi = slots[min(cursor, len(slots) - 1)]
-        token_cursor[token] = cursor + 1
-
-        buckets[wi].append(
-            {
-                "symbol": p_symbol,
-                "score": float(getattr(p, "score", 0.0) or 0.0),
-                "start": float(getattr(p, "start", 0.0) or 0.0),
-            }
-        )
 
     # Stable ordering inside each word.
     for row in buckets:
@@ -592,8 +655,13 @@ def render_html_report(
         # 如果存在 Pause 信息，转换为字典
         if word.pause:
             word_data["pause"] = {
-                "type": word.pause.type, # 假设是字符串或 Enum.value
-                "duration": word.pause.duration
+                "type": word.pause.type,
+                "duration": word.pause.duration,
+                "issue": getattr(word.pause, "issue", "") or "",
+                "target_min": float(getattr(word.pause, "target_min", 0.0) or 0.0),
+                "target_max": float(getattr(word.pause, "target_max", 0.0) or 0.0),
+                "adjust_sec": float(getattr(word.pause, "adjust_sec", 0.0) or 0.0),
+                "expected_type": getattr(word.pause, "expected_type", "") or "",
             }
         alignment_words.append(word_data)
     
@@ -829,9 +897,17 @@ def regenerate_report_from_json(json_path: Path, output_path: Path) -> None:
     weak_phonemes = data.get("analysis", {}).get("weak_phonemes", [])
     data["phoneme_tips"] = get_phoneme_tips(weak_phonemes or [])
     
-    # 确保没有 audio_base64（从 JSON 重新生成时不嵌入音频）
-    if "audio_base64" not in data:
-        data["audio_base64"] = None
+    # Try to preserve/recover audio for regenerated HTML.
+    audio_base64 = data.get("audio_base64")
+    if not audio_base64:
+        meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+        submission_id = str(meta.get("submission_id", "") or "")
+        recovered_audio_path = _find_uploaded_audio_for_submission(submission_id, json_path)
+        if recovered_audio_path:
+            audio_base64 = encode_audio_base64(recovered_audio_path)
+            if audio_base64:
+                logger.info(f"Recovered audio for regenerated report: {recovered_audio_path}")
+    data["audio_base64"] = audio_base64
 
     # 确保 advisor_feedback 存在，并清洗 top_errors 的空壳项
     if "advisor_feedback" not in data:

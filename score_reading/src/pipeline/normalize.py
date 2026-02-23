@@ -50,7 +50,29 @@ def _extract_number(value: Any) -> float | None:
         return None
 
 
-def _compute_pause_profile(alignment: Alignment) -> dict[str, float] | None:
+def _timeline_duration_for_wpm(
+    timed_words: list[Any],
+    audio_duration_sec: float = 0.0,
+) -> tuple[float, float, float]:
+    """
+    Return (duration_used, raw_duration, timeline/audio ratio).
+    """
+    if not timed_words:
+        return 0.2, 0.2, 0.0
+    start_t = float(timed_words[0].start)
+    end_t = float(timed_words[-1].end)
+    raw_duration = max(0.2, end_t - start_t)
+    audio_dur = max(0.0, float(audio_duration_sec or 0.0))
+    ratio = (raw_duration / audio_dur) if audio_dur > 0 else 0.0
+    if audio_dur >= 1.5 and (ratio < 0.65 or ratio > 1.45):
+        return max(0.2, audio_dur), raw_duration, ratio
+    return raw_duration, raw_duration, ratio
+
+
+def _compute_pause_profile(
+    alignment: Alignment,
+    audio_duration_sec: float = 0.0,
+) -> dict[str, float] | None:
     timed_words = [
         w for w in alignment.words
         if float(w.end or 0) > float(w.start or 0)
@@ -58,9 +80,11 @@ def _compute_pause_profile(alignment: Alignment) -> dict[str, float] | None:
     if len(timed_words) < 3:
         return None
 
-    start_t = float(timed_words[0].start)
-    end_t = float(timed_words[-1].end)
-    duration = max(0.2, end_t - start_t)
+    duration, raw_duration, timeline_audio_ratio = _timeline_duration_for_wpm(
+        timed_words,
+        audio_duration_sec=audio_duration_sec,
+    )
+    duration_calibrated = 1.0 if abs(duration - raw_duration) > 1e-6 else 0.0
     wpm = (len(timed_words) / duration) * 60.0
 
     pause_count = 0
@@ -102,6 +126,10 @@ def _compute_pause_profile(alignment: Alignment) -> dict[str, float] | None:
                 synthetic_timeline = 1.0
                 low_confidence_timing = 1.0
             elif median_gap <= 0.20 and gap_std <= 0.02 and fixed_gap_ratio >= 0.55:
+                synthetic_timeline = 1.0
+                low_confidence_timing = 1.0
+            elif median_gap <= 0.45 and gap_std <= 0.012 and fixed_gap_ratio >= 0.90:
+                synthetic_timeline = 1.0
                 low_confidence_timing = 1.0
     return {
         "wpm": wpm,
@@ -116,6 +144,10 @@ def _compute_pause_profile(alignment: Alignment) -> dict[str, float] | None:
         "fixed_gap_ratio": fixed_gap_ratio,
         "synthetic_timeline": synthetic_timeline,
         "low_confidence_timing": low_confidence_timing,
+        "timeline_duration": raw_duration,
+        "duration_used": duration,
+        "duration_calibrated": duration_calibrated,
+        "timeline_audio_ratio": timeline_audio_ratio,
     }
 
 
@@ -133,6 +165,8 @@ def _is_low_confidence_timing(profile: dict[str, float] | None) -> bool:
         return True
     if median_gap <= 0.20 and gap_std <= 0.02 and fixed_gap_ratio >= 0.55:
         return True
+    if median_gap <= 0.45 and gap_std <= 0.012 and fixed_gap_ratio >= 0.90:
+        return True
     return False
 
 
@@ -149,14 +183,19 @@ def _collect_script_words_and_punctuation(script_text: str) -> tuple[list[str], 
     return words, punct_after
 
 
-def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str, float] | None:
+def _estimate_pausing_score(
+    alignment: Alignment,
+    script_text: str,
+    engine_raw: dict[str, Any] | None = None,
+) -> dict[str, float] | None:
     timed_words = [
         w for w in alignment.words
         if float(w.end or 0) > float(w.start or 0)
     ]
     if len(timed_words) < 3:
         return None
-    timing_profile = _compute_pause_profile(alignment)
+    audio_duration = float(_extract_number((engine_raw or {}).get("audio_duration_sec")) or 0.0)
+    timing_profile = _compute_pause_profile(alignment, audio_duration_sec=audio_duration)
     low_confidence_timing = _is_low_confidence_timing(timing_profile)
 
     script_words, script_punct = _collect_script_words_and_punctuation(script_text)
@@ -167,6 +206,8 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
     missed = 0
     optional = 0
     long_bad = 0
+    strong_target_count = 0
+    strong_zero_gap_count = 0
 
     # Prefer analyzed pause labels if available to keep scoring consistent with UI.
     has_pause_marks = any(getattr(w, "pause", None) for w in timed_words[:-1])
@@ -177,6 +218,11 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
                 continue
             p_type = str(getattr(pause, "type", "") or "").lower()
             p_dur = float(getattr(pause, "duration", 0.0) or 0.0)
+            p_expected = str(getattr(pause, "expected_type", "") or "").lower()
+            if p_expected == "strong":
+                strong_target_count += 1
+                if p_dur <= 0.03:
+                    strong_zero_gap_count += 1
             if p_type == "good":
                 good += 1
                 expected_targets += 1
@@ -193,6 +239,12 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
             elif p_type == "optional":
                 optional += 1
         expected_targets = max(expected_targets, good + missed)
+        # Extra safeguard: if most strong boundaries have near-zero gaps,
+        # the timestamp grid is likely too coarse for reliable pause scoring.
+        if strong_target_count >= 6:
+            strong_zero_ratio = strong_zero_gap_count / max(1, strong_target_count)
+            if strong_zero_ratio >= 0.70:
+                low_confidence_timing = True
     else:
         for i in range(len(timed_words) - 1):
             left = timed_words[i]
@@ -231,8 +283,11 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
     bad_rate = bad / transitions
     miss_rate = missed / max(1, expected_targets)
     good_rate = good / max(1, expected_targets)
+    optional_rate = optional / transitions
     long_rate = long_bad / transitions
     missing_rate = missing_words / max(1, len(script_words) if script_words else len(timed_words))
+    pause_per_min = float(timing_profile.get("pause_per_min", 0.0))
+    pause_ratio = float(timing_profile.get("pause_ratio", 0.0))
 
     # Piecewise-friendly scoring:
     # - light penalty for small error counts
@@ -245,16 +300,54 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
         miss_scale = 1.2
     elif expected_targets <= 2:
         miss_scale = 0.7
-    score -= min(24.0, missed * 2.9 * miss_scale)
+    # Keep light tolerance for a few too-short misses, then penalize sharply.
+    if missed <= 3:
+        miss_penalty = missed * 1.1 * miss_scale
+    else:
+        miss_penalty = 3.0 * 1.1 * miss_scale + (missed - 3.0) * 3.0 * miss_scale
+    score -= min(24.0, miss_penalty)
 
     score -= min(12.0, missing_words * 1.2)
     score += min(10.0, good * 0.8)
+    # Optional pauses are not hard errors, but dense optional labels indicate broken rhythm.
+    score -= min(18.0, max(0.0, optional - 12.0) * 0.35)
+    if not low_confidence_timing:
+        score -= min(10.0, max(0.0, pause_per_min - 14.0) * 0.9)
+        score -= min(9.0, max(0.0, pause_ratio - 0.20) * 45.0)
 
     # ratio-based penalties for dense pausing errors in long texts
     if transitions >= 20:
         score -= max(0.0, bad_rate - 0.10) * 70.0
-        score -= max(0.0, miss_rate - 0.18) * 32.0
+        miss_density_weight = 32.0
+        if bad == 0 and long_bad == 0:
+            # If there are almost no long/over pauses, treat dense too-short as a
+            # moderate rhythm issue rather than a severe collapse.
+            miss_density_weight = 14.0
+        score -= max(0.0, miss_rate - 0.18) * miss_density_weight
         score -= max(0.0, long_rate - 0.06) * 50.0
+        if low_confidence_timing:
+            score -= max(0.0, optional_rate - 0.55) * 18.0
+        else:
+            score -= max(0.0, optional_rate - 0.30) * 45.0
+
+    # Do not over-credit pausing when timing confidence is low.
+    if low_confidence_timing:
+        score = min(score, 78.0)
+        if bad == 0 and missed == 0:
+            # Tiered cap for low-confidence timelines:
+            # allow strong readers with only light optional pauses to score higher,
+            # but keep dense optional pauses conservative.
+            if optional_rate <= 0.25 and pause_per_min <= 10.0 and pause_ratio <= 0.16:
+                score = min(score, 78.0)
+            elif optional_rate <= 0.40 and pause_per_min <= 16.0 and pause_ratio <= 0.22:
+                score = min(score, 74.0)
+            else:
+                score = min(score, 70.0)
+        if optional_rate >= 0.45 or pause_per_min >= 20.0 or pause_ratio >= 0.26:
+            score = min(score, 62.0)
+        if optional_rate >= 0.65 or pause_per_min >= 30.0 or pause_ratio >= 0.34:
+            score = min(score, 55.0)
+
     score = max(0.0, min(100.0, score))
 
     # Hard caps to prevent disfluent samples getting unrealistically high Pausing.
@@ -264,15 +357,37 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
         score = min(score, 68.0)
     if missed >= 8:
         score = min(score, 65.0)
+    if optional >= 40:
+        score = min(score, 62.0)
+    if optional >= 80:
+        score = min(score, 55.0)
+
+    # Pausing should not greatly exceed hesitation quality for the same sample.
+    hesitation_proxy = _hesitation_score_from_profile(timing_profile)
+    if hesitation_proxy < 85.0:
+        score = min(score, hesitation_proxy + 14.0)
+    if hesitation_proxy < 65.0:
+        score = min(score, hesitation_proxy + 9.0)
+    if hesitation_proxy < 50.0:
+        score = min(score, hesitation_proxy + 6.0)
+    if low_confidence_timing and bad == 0 and missed == 0:
+        score = max(score, 40.0)
 
     # Floors for clearly stable pausing behavior.
-    total_err = bad + missed
-    if total_err <= 1 and long_bad == 0:
-        score = max(score, 84.0)
-    elif total_err <= 2 and long_bad <= 1:
-        score = max(score, 78.0)
-    elif bad <= 2 and missed <= 1 and good_rate >= 0.60:
-        score = max(score, 80.0)
+    if not low_confidence_timing:
+        total_err = bad + missed
+        if bad == 0 and long_bad == 0 and missed <= 3 and optional_rate <= 0.35:
+            score = max(score, 68.0)
+            if missed <= 2 and optional <= 8:
+                score = max(score, 74.0)
+        if bad == 0 and long_bad == 0 and missed <= 8 and optional_rate <= 0.35:
+            score = max(score, 60.0)
+        if total_err <= 1 and long_bad == 0:
+            score = max(score, 84.0)
+        elif total_err <= 2 and long_bad <= 1:
+            score = max(score, 78.0)
+        elif bad <= 2 and missed <= 1 and good_rate >= 0.60:
+            score = max(score, 80.0)
 
     return {
         "pausing_score": score,
@@ -285,8 +400,11 @@ def _estimate_pausing_score(alignment: Alignment, script_text: str) -> dict[str,
         "bad_rate": bad_rate,
         "miss_rate": miss_rate,
         "good_rate": good_rate,
+        "optional_rate": optional_rate,
         "long_rate": long_rate,
         "missing_rate": missing_rate,
+        "pause_per_min": pause_per_min,
+        "pause_ratio": pause_ratio,
         "low_confidence_timing": 1.0 if low_confidence_timing else 0.0,
     }
 
@@ -323,8 +441,9 @@ def _compose_fluency_from_components(
     script_text: str,
     engine_raw: dict[str, Any],
 ) -> float:
-    profile = _compute_pause_profile(alignment)
-    pausing = _estimate_pausing_score(alignment, script_text)
+    audio_duration = float(_extract_number((engine_raw or {}).get("audio_duration_sec")) or 0.0)
+    profile = _compute_pause_profile(alignment, audio_duration_sec=audio_duration)
+    pausing = _estimate_pausing_score(alignment, script_text, engine_raw)
     if not profile or not pausing:
         return max(0.0, min(100.0, base_fluency))
 
@@ -373,9 +492,65 @@ def _apply_fluency_guardrails(
     We intentionally avoid hidden hard caps here so the final fluency score
     stays consistent with the visible Pausing/Pace/Hesitation components.
     """
-    profile = _compute_pause_profile(alignment)
+    audio_duration = float(_extract_number((engine_raw or {}).get("audio_duration_sec")) or 0.0)
+    profile = _compute_pause_profile(alignment, audio_duration_sec=audio_duration)
     if not profile:
         return max(0.0, min(100.0, fluency))
+
+    existing_profile = (engine_raw or {}).get("pause_profile")
+    if isinstance(existing_profile, dict):
+        profile["synthetic_timeline"] = max(
+            float(profile.get("synthetic_timeline", 0.0)),
+            float(existing_profile.get("synthetic_timeline", 0.0)),
+        )
+        profile["low_confidence_timing"] = max(
+            float(profile.get("low_confidence_timing", 0.0)),
+            float(existing_profile.get("low_confidence_timing", 0.0)),
+            1.0 if str(existing_profile.get("timing_confidence", "")).lower() == "low" else 0.0,
+        )
+        if "expected_pause_targets" in existing_profile:
+            profile["expected_pause_targets"] = float(existing_profile.get("expected_pause_targets", 0.0) or 0.0)
+        if isinstance(existing_profile.get("practice_focus_words"), list):
+            profile["practice_focus_words"] = [
+                str(w).strip() for w in existing_profile.get("practice_focus_words", []) if str(w).strip()
+            ][:3]
+        if isinstance(existing_profile.get("practice_focus_points"), list):
+            points: list[dict[str, Any]] = []
+            for row in existing_profile.get("practice_focus_points", []):
+                if not isinstance(row, dict):
+                    continue
+                left_word = str(row.get("left_word", "")).strip()
+                right_word = str(row.get("right_word", "")).strip()
+                pause_type = str(row.get("pause_type", "")).strip().lower()
+                if pause_type not in {"strong", "medium", "light", "none"}:
+                    pause_type = "medium"
+                issue = str(row.get("issue", "")).strip().lower()
+                if issue not in {"too_long", "too_short"}:
+                    issue = ""
+                target_min = max(0.0, float(_extract_number(row.get("target_min")) or 0.0))
+                target_max = max(target_min, float(_extract_number(row.get("target_max")) or target_min))
+                actual_gap = max(0.0, float(_extract_number(row.get("actual_gap")) or 0.0))
+                adjust_sec = max(0.0, float(_extract_number(row.get("adjust_sec")) or 0.0))
+                if not left_word:
+                    continue
+                points.append(
+                    {
+                        "left_word": left_word,
+                        "right_word": right_word,
+                        "pause_type": pause_type,
+                        "boundary_score": _clamp_0_100(row.get("boundary_score", 100.0), 100.0),
+                        "idx": int(_extract_number(row.get("idx")) or -1),
+                        "issue": issue,
+                        "target_min": round(target_min, 3),
+                        "target_max": round(target_max, 3),
+                        "actual_gap": round(actual_gap, 3),
+                        "adjust_sec": round(adjust_sec, 3),
+                    }
+                )
+                if len(points) >= 3:
+                    break
+            if points:
+                profile["practice_focus_points"] = points
 
     # Expose profile for downstream diagnostics/debug, but do not alter score.
     if _is_low_confidence_timing(profile):
@@ -404,7 +579,11 @@ def _calibrate_fluency_by_script_reference(
     if len(timed_words) < 4:
         return max(0.0, min(100.0, base_fluency))
 
-    duration = float(timed_words[-1].end) - float(timed_words[0].start)
+    audio_duration = float(_extract_number((engine_raw or {}).get("audio_duration_sec")) or 0.0)
+    duration, raw_duration, timeline_audio_ratio = _timeline_duration_for_wpm(
+        timed_words,
+        audio_duration_sec=audio_duration,
+    )
     if duration <= 0.2:
         return max(0.0, min(100.0, base_fluency))
     observed_wpm = (len(timed_words) / duration) * 60.0
@@ -472,12 +651,15 @@ def _calibrate_fluency_by_script_reference(
 
     adjusted = max(0.0, min(100.0, adjusted))
     logger.info(
-        "Fluency calibrated by script reference: base=%.1f observed_wpm=%.1f range=[%.1f, %.1f] final=%.1f",
+        "Fluency calibrated by script reference: base=%.1f observed_wpm=%.1f range=[%.1f, %.1f] final=%.1f raw_dur=%.2f used_dur=%.2f ratio=%.3f",
         base_fluency,
         observed_wpm,
         low,
         high,
         adjusted,
+        raw_duration,
+        duration,
+        timeline_audio_ratio,
     )
     return adjusted
 

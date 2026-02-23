@@ -1,48 +1,83 @@
-# 英语朗读评测系统（Docker 一键部署）
+# 英语朗读评测系统
 
-## 快速启动（Windows）
+## 🚀 一键部署（Windows）
+
+### 前置要求
 1. 安装 [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-2. 双击 `启动.bat`
-3. 浏览器访问 `http://localhost`
+2. 获取以下至少一个 AI 引擎的 API Key:
+   - [OpenAI API Key](https://platform.openai.com/api-keys) (推荐)
+   - [Google Gemini API Key](https://aistudio.google.com/app/apikey) (用于 Pro 评估)
+   - [Azure Speech Key](https://portal.azure.com/) (用于 Azure 引擎)
 
-首次运行会自动构建镜像（约 5-10 分钟）。  
-`.env` 已预置为空 key，可先启动，再按需填写。
+### 启动步骤
+1. 双击 `启动.bat`
+2. 首次运行会弹出记事本提示填入 API Key（OpenAI/Gemini/Azure 选填）
+3. 等待构建完成（首次约 5-10 分钟）
+4. 浏览器自动打开 http://localhost
 
-## API Key 配置
-编辑根目录 `.env`：
+### 常用操作
+| 操作 | 方法 |
+|------|------|
+| 启动服务 | 双击 `启动.bat` |
+| 停止服务 | 双击 `停止.bat` |
+| 查看日志 | 双击 `查看日志.bat` |
 
+---
+
+## 📁 目录结构
+```
+├── 启动.bat              # Windows 一键启动
+├── 停止.bat              # 停止服务
+├── 查看日志.bat          # 查看运行日志
+├── docker-compose.yml    # Docker 编排配置
+├── Dockerfile.api        # 后端镜像
+├── Dockerfile.web        # 前端镜像
+├── .env                  # 环境变量（API Key）
+├── data/                 # 数据目录（自动创建）
+│   ├── uploads/          # 上传的音频
+│   └── out/              # 分析结果
+└── score_reading/        # 核心评测引擎
+```
+
+---
+
+## ⚙️ 配置说明
+
+### 环境变量 (.env)
 ```env
-OPENAI_API_KEY=
-GEMINI_API_KEY=
-GEMINI_API_BASE=
-AZURE_API_KEY=
+OPENAI_API_KEY=sk-xxx     # OpenAI API Key（必填）
 ```
 
-说明：
-- 可全部留空（可启动，但云端能力会受限）
-- 可只填你要用的一个或多个 key
-- 多个 Gemini key 用英文逗号分隔
+### 端口占用
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| Web | 80 | 前端界面 |
+| API | 8000 | 后端接口 |
+| Gentle | 8765 | 语音对齐（内部） |
 
-## 常用命令
-- 启动：`启动.bat`
-- 停止：`停止.bat`
-- 日志：`查看日志.bat`
+---
 
-或手动执行：
+## 🔧 故障排除
 
-```bash
-docker compose up -d --build
-docker compose down
-docker compose logs -f
+### Docker 未启动
 ```
+[错误] Docker 未运行
+```
+→ 打开 Docker Desktop，等待启动完成
 
-## 端口
-- Web: `80`
-- API: `8000`
+### API Key 无效
+```
+OpenAI API error: Invalid API key
+```
+→ 编辑 `.env` 文件，检查 API Key 是否正确
 
-## 目录说明
-- `docker-compose.yml`: 编排
-- `Dockerfile.api`: 后端镜像
-- `Dockerfile.web`: 前端镜像
-- `score_reading/`: 核心评分引擎
-- `data/`: 上传与结果目录
+### 端口被占用
+```
+Bind for 0.0.0.0:80 failed: port is already allocated
+```
+→ 修改 `docker-compose.yml` 中的端口映射，如 `8080:80`
+
+---
+
+## 📞 技术支持
+如有问题，请联系开发者。

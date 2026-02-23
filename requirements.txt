@@ -25,6 +25,9 @@ textgrid
 pydantic>=2.0.0
 jinja2
 pyyaml
+yt-dlp>=2025.1.15
+yt-dlp-ejs>=0.4.0
+curl-cffi>=0.11.0
 
 # === OpenAI API ===
 openai>=1.0.0

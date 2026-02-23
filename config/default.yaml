@@ -48,7 +48,8 @@ analysis:
   phoneme_thresholds:
     ok: 75
     weak: 45
-
+  pause_diagnostics:
+    child_voice_mode: true      # Kid-first timing tolerance and evidence filtering
 # 回退策略配置
 fallback:
   max_missing_words_ratio: 0.25  # 超过此比例触发回退
@@ -87,8 +88,8 @@ engines:
     language: "en-US"         # 评测语言
   
   gemini:
-    api_key: ""               # 可填多个 key，逗号分隔
-    api_base: ""              # 可选代理地址，留空为官方地址
+    api_key: "AIzaSyDUmsU2NQt37O5Bzdn43xE-9mF2hINHXG0,AIzaSyAncbCINkQNy8RKlidUYFc_SjMKszmHV1U,AIzaSyA-uL-3WaB_5Zluo2UGn0JrfjsxQ_-MScc,AIzaSyAm74q-FsQDEx4I3_SnBaEiYRtYbY-MG2s,AIzaSyC0dMT69FWWDyPdHInBzkuuEK9y_zTyxAc"
+    api_base: "http://107.175.230.153"  # [Optional] Custom API Endpoint (Proxy) for regions without Google access
     model: "gemini-3-flash-preview"
     alignment_source: none
     prefer_gemini: true        # If true, use Gemini as primary engine if keys are available

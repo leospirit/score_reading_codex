@@ -1,5 +1,5 @@
 # Stage 1: Build
-FROM node:18-alpine as builder
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -7,6 +7,8 @@ COPY package*.json ./
 RUN npm install
 
 COPY . .
+ARG VITE_API_HOST=""
+ENV VITE_API_HOST=${VITE_API_HOST}
 RUN npm run build
 
 # Stage 2: Serve
@@ -15,8 +17,9 @@ FROM nginx:alpine
 # Copy built assets
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# Copy nginx config for React Router & Proxy
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Render nginx config from template with runtime env vars.
+RUN rm -f /etc/nginx/conf.d/default.conf
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 
 EXPOSE 80
 

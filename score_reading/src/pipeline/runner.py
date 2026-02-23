@@ -6,7 +6,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from src.advice.generator import generate_feedback
 from src.analysis.llm_advisor import get_llm_advisor
@@ -31,6 +31,232 @@ def _safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _normalize_word_token(text: str) -> str:
+    return re.sub(r"[^a-z']+", "", str(text or "").lower())
+
+
+def _is_generic_improvement(text: str) -> bool:
+    t = re.sub(r"\s+", "", str(text or "").lower())
+    if not t:
+        return True
+    generic_markers = [
+        "slowread",
+        "repeat",
+        "slowdown",
+        "finishwordendings",
+        "stressedvowels",
+    ]
+    hits = sum(1 for m in generic_markers if m in t)
+    return hits >= 2 or len(t) < 10
+
+
+def _diagnosis_issue_kind(diagnosis: str) -> str:
+    d = str(diagnosis or "").lower()
+
+    ending_tokens = (
+        "omission", "dropped", "missing ending", "ending sound", "word ending",
+        "final consonant", "plural ending", "not pronounced", "missing /s", "missing /z",
+        "final /s", "final /z",
+    )
+    stress_tokens = ("stress", "intonation", "prosody", "emphasis")
+    linking_tokens = ("link", "linking", "break", "pause", "hesitation", "disfluency")
+    consonant_tokens = ("consonant", "th sound", "initial sound", "final sound")
+    vowel_tokens = ("vowel", "diphthong", "schwa", "unstressed vowel", "ai", "ei")
+
+    if any(t in d for t in ending_tokens):
+        return "ending"
+    if any(t in d for t in stress_tokens):
+        return "stress"
+    if any(t in d for t in linking_tokens):
+        return "linking"
+    if any(t in d for t in consonant_tokens):
+        return "consonant"
+    if any(t in d for t in vowel_tokens):
+        return "vowel"
+    return "general"
+
+
+def _creative_improvement_for_word(word_text: str, diagnosis: str) -> str:
+    # Kept function name for compatibility; output is concise and actionable.
+    w = str(word_text or "").strip() or "this word"
+    d = str(diagnosis or "")
+    token = _normalize_word_token(w)
+
+    special = {
+        "weather": "“weather”的th要清晰，慢读2遍，回句1遍。",
+        "sausages": "“sausages”结尾iz读出，对比读3组。",
+        "hear": "“hear”元音拉满，慢读2遍，回句1遍。",
+    }
+    if token in special:
+        return special[token]
+
+    issue = _diagnosis_issue_kind(d)
+    seed = sum(ord(c) for c in (token + "|" + d.lower()))
+
+    templates = {
+        "ending": [
+            f"“{w}”词尾读完整：慢读2遍，连句2遍。",
+            f"“{w}”最后音不要丢：单词2遍，回句1遍。",
+            f"“{w}”结尾收住：慢速2遍，整句2遍。",
+            f"先把“{w}”词尾读准，再回到原句读2遍。",
+        ],
+        "vowel": [
+            f"“{w}”元音拉满：慢读2遍，回句1遍。",
+            f"“{w}”先拆元音再连读：单词2遍。",
+            f"“{w}”口型稳住：慢速2遍，跟句子1遍。",
+            f"“{w}”元音不缩：单词2遍，整句2遍。",
+        ],
+        "consonant": [
+            f"“{w}”辅音位置要到位：慢读2遍，回句1遍。",
+            f"“{w}”辅音先单独发，再连进整词2遍。",
+            f"“{w}”辅音不含糊：慢速2遍，整句1遍。",
+            f"“{w}”先字头后字尾，分步读2轮。",
+        ],
+        "stress": [
+            f"“{w}”做重读：重读更重，轻读更轻。",
+            f"“{w}”重音拍清楚：跟读整句2遍。",
+            f"读到“{w}”稍加力，前后词轻一点。",
+            f"“{w}”做节奏核心：整句跟读2遍。",
+        ],
+        "linking": [
+            f"“{w}”前后不断开：词组2遍，整句1遍。",
+            f"“{w}”处连读更顺：先短词组，再整句。",
+            f"经过“{w}”时不停顿，一口气读过去。",
+            f"“{w}”附近减少断句：整句慢读2遍。",
+        ],
+        "general": [
+            f"“{w}”先准读2遍，再放回原句读2遍。",
+            f"“{w}”单词慢读2遍，整句跟读1遍。",
+            f"“{w}”先慢后快：先清楚，再自然。",
+            f"“{w}”先拆开读，再回到原句。",
+        ],
+    }
+
+    options = templates.get(issue, templates["general"])
+    return options[seed % len(options)]
+
+
+def _personalize_top_errors_from_alignment(result: ScoringResult) -> None:
+    """
+    Make pronunciation top-errors student-specific.
+    """
+    if not result or not result.alignment or not result.alignment.words:
+        return
+
+    stop_words = {
+        "lily", "today", "you", "your", "i", "we", "the", "a", "an",
+        "is", "are", "to", "of", "in", "and", "it", "my", "me",
+    }
+
+    advisor = result.advisor_feedback if isinstance(result.advisor_feedback, dict) else {}
+    existing = advisor.get("top_errors")
+    existing_list = existing if isinstance(existing, list) else []
+
+    ranked_words = sorted(
+        [w for w in result.alignment.words if str(getattr(w, "word", "")).strip()],
+        key=lambda w: float(getattr(w, "score", 100.0)),
+    )
+    low_tokens: set[str] = set()
+    for w in ranked_words:
+        token = _normalize_word_token(getattr(w, "word", ""))
+        if not token or token in stop_words:
+            continue
+        if float(getattr(w, "score", 100.0)) <= 82 or str(getattr(w, "diagnosis", "")).strip():
+            low_tokens.add(token)
+        if len(low_tokens) >= 8:
+            break
+
+    def _clean_words(raw_words: Any) -> list[str]:
+        out: list[str] = []
+        if not isinstance(raw_words, list):
+            return out
+        for item in raw_words:
+            if isinstance(item, dict):
+                text = str(item.get("text", "")).strip()
+            else:
+                text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+
+    kept: list[dict[str, Any]] = []
+    used_tokens: set[str] = set()
+    for row in existing_list:
+        if not isinstance(row, dict):
+            continue
+        words = _clean_words(row.get("words"))
+        matched = False
+        for w in words:
+            tok = _normalize_word_token(w)
+            if tok and tok in low_tokens:
+                matched = True
+                used_tokens.add(tok)
+        if not matched:
+            continue
+        kept.append(
+            {
+                "phoneme": str(row.get("phoneme", "") or "Key Sound").strip(),
+                "type": str(row.get("type", "") or "word").strip(),
+                "description": str(row.get("description", "") or "Detected pronunciation instability on key words.").split("|")[0].strip(),
+                "words": words[:4],
+                "improvement": _creative_improvement_for_word(
+                    words[0] if words else "",
+                    str(row.get("description", "") or ""),
+                ),
+            }
+        )
+        if len(kept) >= 3:
+            break
+
+    generated: list[dict[str, Any]] = []
+    for w in ranked_words:
+        word_text = str(getattr(w, "word", "") or "").strip()
+        token = _normalize_word_token(word_text)
+        if not token or token in stop_words or token in used_tokens:
+            continue
+
+        score = float(getattr(w, "score", 100.0))
+        diagnosis = str(getattr(w, "diagnosis", "") or "").strip()
+        if score > 82 and not diagnosis:
+            continue
+
+        phoneme = "Key Sound"
+        m = re.search(r"/([^/]{1,12})/", diagnosis)
+        if m:
+            phoneme = f"/{m.group(1)}/"
+
+        description = diagnosis.split("|")[0].strip() if diagnosis else ""
+        if not description:
+            description = "Pronunciation is not stable on this word."
+
+        improvement = _creative_improvement_for_word(word_text, diagnosis)
+
+        generated.append(
+            {
+                "phoneme": phoneme,
+                "type": "word",
+                "description": description,
+                "words": [word_text],
+                "improvement": improvement,
+            }
+        )
+        used_tokens.add(token)
+        if len(generated) >= 3:
+            break
+
+    personalized = (kept + generated)[:3]
+    if not personalized:
+        return
+
+    advisor["top_errors"] = personalized
+    result.advisor_feedback = advisor
+
+    if isinstance(result.engine_raw, dict):
+        integrated = result.engine_raw.get("integrated_feedback")
+        if isinstance(integrated, dict):
+            integrated["top_errors"] = personalized
 
 
 
@@ -341,6 +567,9 @@ def run_scoring_pipeline(
                      from src.models import Feedback
                      result.feedback = Feedback(cn_summary="评分分析完成，请查收建议。", cn_actions=[], practice=[])
             
+            # Ensure top errors reflect this student's actual weak words.
+            _personalize_top_errors_from_alignment(result)
+
             # Enforce a stable final feedback style across all paths.
             _enforce_feedback_style(result)
 

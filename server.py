@@ -3,15 +3,25 @@ import sys
 import logging
 import json
 import threading
+import re
+import time
+import uuid
+import gzip
+import hmac
+import shutil
+from collections import Counter
 from typing import Any, Dict, Optional
 from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+import requests
 
 # Fix import path to prioritize backend src (inside score_reading) over frontend src
 # This is crucial because both have a 'src' folder
 sys.path.insert(0, str(Path(__file__).parent / "score_reading"))
 
-from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -25,12 +35,40 @@ logger = logging.getLogger("server")
 load_config()
 
 app = FastAPI(title="Score Reading API")
+ADMIN_API_TOKEN = str(os.getenv("ADMIN_API_TOKEN", "") or "").strip()
+ADMIN_TOKEN_HEADER = "x-admin-token"
 
-# CORS for dev (Frontend runs on port 5173 usually)
+PLAYBOOK_PATH = Path(__file__).parent / "score_reading" / "advice" / "western_pronunciation_playbook.md"
+PLAYBOOK_LOCK = threading.Lock()
+
+def _load_cors_origins() -> list[str]:
+    """
+    Load allowed CORS origins from env.
+    - `CORS_ALLOW_ORIGINS` accepts comma-separated origins.
+    - Fallback keeps common local development origins only.
+    """
+    raw = str(os.getenv("CORS_ALLOW_ORIGINS", "") or "").strip()
+    if raw:
+        items = [part.strip() for part in raw.split(",") if str(part).strip()]
+        if items:
+            return items
+    return [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+
+_cors_origins = _load_cors_origins()
+_cors_allow_credentials = "*" not in _cors_origins
+if not _cors_allow_credentials:
+    logger.warning("CORS_ALLOW_ORIGINS contains '*'; disabling credentials for CORS safety.")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -60,6 +98,25 @@ class ScriptReferenceRequest(BaseModel):
     wait: bool = False
     timeout_sec: float = 0.0
 
+
+class PlaybookUpdateRequest(BaseModel):
+    text: str
+
+
+class PlaybookIdeaRequest(BaseModel):
+    idea: str
+    ai_refine: bool = False
+
+
+class WordClipJobRequest(BaseModel):
+    word: str
+    domain: str = "education"
+    domains: Optional[list[str]] = None
+    video_count: int = 4
+    clip_seconds: float = 5.0
+    source: str = "youglish"
+    include_cambridge: bool = True
+
 # --- Async Job System ---
 import asyncio
 from enum import Enum
@@ -87,16 +144,193 @@ class Job(BaseModel):
 JOBS: Dict[str, Job] = {}
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 JOBS_FILE = Path("data/jobs.json")
+JOBS_FILE_LOCK = threading.Lock()
 REPORTS_DIR = Path("data/out") # Ensure this is defined for worker usage or import it
+WORK_TMP_DIR = Path("data/work")
+WORK_TMP_CLEANUP_LOCK = threading.Lock()
+LAST_WORK_TMP_CLEANUP_TS = 0.0
+
+# Word clip extraction jobs (YouTube keyword montage)
+WORD_CLIP_JOBS: Dict[str, Dict[str, Any]] = {}
+WORD_CLIP_LOCK = threading.Lock()
+WORD_CLIP_WORKER_SEMAPHORE = threading.Semaphore(1)
+WORD_CLIP_PO_TOKEN_PATH = Path("data/yt_po_tokens.json")
+PRON_FOCUS_CACHE_LOCK = threading.Lock()
+PRON_FOCUS_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+PRON_FOCUS_CACHE_TTL_SECONDS = 45.0
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        logger.warning("Invalid %s=%r; fallback to %s", name, raw, default)
+        return float(default)
+
+
+WORK_TMP_RETENTION_HOURS = max(0.0, _read_float_env("WORK_TMP_RETENTION_HOURS", 24.0))
+WORK_TMP_CLEANUP_INTERVAL_SECONDS = max(0.0, _read_float_env("WORK_TMP_CLEANUP_INTERVAL_SECONDS", 1800.0))
+UPLOAD_MAX_MB = max(1.0, _read_float_env("UPLOAD_MAX_MB", 30.0))
+UPLOAD_MAX_BYTES = int(UPLOAD_MAX_MB * 1024 * 1024)
+UPLOAD_STORAGE_WARN_GB = max(1.0, _read_float_env("UPLOAD_STORAGE_WARN_GB", 20.0))
+UPLOAD_STORAGE_WARN_BYTES = int(UPLOAD_STORAGE_WARN_GB * 1024 * 1024 * 1024)
+UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
+ALLOWED_AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".oga",
+    ".mpga",
+    ".mpeg",
+    ".webm",
+    ".wma",
+    ".mp4",
+}
+
+
+def _normalize_po_token_key(value: str) -> str:
+    token = str(value or "").strip().lower()
+    if not token:
+        return "web.gvs"
+    aliases = {
+        "web": "web.gvs",
+        "android": "android.gvs",
+        "mweb": "mweb.gvs",
+        "ios": "ios.gvs",
+        "tv": "tv.gvs",
+    }
+    return aliases.get(token, token if "." in token else f"{token}.gvs")
+
+
+def _extract_po_tokens_from_har(payload: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    entries = (((payload or {}).get("log") or {}).get("entries") or [])
+    if not isinstance(entries, list):
+        return []
+
+    def add_token(raw: str) -> None:
+        item = str(raw or "").strip()
+        if not item:
+            return
+        decoded = unquote(item)
+        if decoded in seen:
+            return
+        seen.add(decoded)
+        out.append(decoded)
+
+    po_pattern = re.compile(r'"poToken"\s*:\s*"([^"]+)"', re.IGNORECASE)
+    pot_pattern = re.compile(r'"pot"\s*:\s*"([^"]+)"', re.IGNORECASE)
+
+    def decode_payload_text(raw_text: str) -> str:
+        text = str(raw_text or "")
+        if not text:
+            return ""
+        try:
+            raw_bytes = text.encode("latin1", errors="ignore")
+        except Exception:
+            return text
+        if len(raw_bytes) >= 2 and raw_bytes[0] == 0x1F and raw_bytes[1] == 0x8B:
+            try:
+                return gzip.decompress(raw_bytes).decode("utf-8", errors="ignore")
+            except Exception:
+                return text
+        return text
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        request_obj = entry.get("request") or {}
+        if not isinstance(request_obj, dict):
+            request_obj = {}
+        url = str(request_obj.get("url") or "").strip()
+        if url:
+            try:
+                query = parse_qs(urlparse(url).query or "")
+            except Exception:
+                query = {}
+            for key in ("pot", "poToken"):
+                for val in query.get(key, []) or []:
+                    add_token(str(val))
+
+        post_obj = request_obj.get("postData") or {}
+        if isinstance(post_obj, dict):
+            text = decode_payload_text(str(post_obj.get("text") or ""))
+            if text:
+                for match in po_pattern.findall(text):
+                    add_token(match)
+                for match in pot_pattern.findall(text):
+                    add_token(match)
+
+        response_obj = entry.get("response") or {}
+        if isinstance(response_obj, dict):
+            content_obj = response_obj.get("content") or {}
+            if isinstance(content_obj, dict):
+                text = decode_payload_text(str(content_obj.get("text") or ""))
+                if text:
+                    for match in po_pattern.findall(text):
+                        add_token(match)
+                    for match in pot_pattern.findall(text):
+                        add_token(match)
+
+    return out
+
+
+def _load_saved_po_tokens() -> dict[str, str]:
+    if not WORD_CLIP_PO_TOKEN_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(WORD_CLIP_PO_TOKEN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in payload.items():
+        k = _normalize_po_token_key(str(key))
+        v = str(value or "").strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
+def _mask_token(value: str) -> str:
+    token = str(value or "")
+    if len(token) <= 12:
+        return token
+    return token[:8] + "..." + token[-6:]
+
+
+def _write_json_atomic(path: Path, payload: Any) -> None:
+    """Write JSON atomically to avoid partial jobs.json corruption."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 def save_jobs():
     """Persist jobs to disk"""
     try:
-        data = {k: v.dict() for k, v in JOBS.items()}
-        # Ensure directory exists
-        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(JOBS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+        with JOBS_FILE_LOCK:
+            data = {k: v.dict() for k, v in JOBS.items()}
+            _write_json_atomic(JOBS_FILE, data)
     except Exception as e:
         logger.error(f"Failed to save jobs: {e}")
 
@@ -125,8 +359,221 @@ def load_jobs():
         logger.error(f"Failed to load jobs: {e}")
 
 
+def cleanup_work_tmp_dirs(
+    older_than_hours: float = 24.0,
+    limit: int = 200,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Clean stale temporary folders under data/work/tmp*.
+    Used to avoid indefinite disk growth from interrupted jobs.
+    """
+    root = WORK_TMP_DIR
+    retention_hours = max(0.0, float(older_than_hours))
+    max_delete = max(1, int(limit))
+
+    if not root.exists():
+        return {
+            "status": "ok",
+            "root_exists": False,
+            "matched_count": 0,
+            "deleted_count": 0,
+            "error_count": 0,
+            "dry_run": bool(dry_run),
+        }
+
+    cutoff_ts = time.time() - retention_hours * 3600.0
+    candidates: list[tuple[float, Path]] = []
+    for item in root.iterdir():
+        if not item.is_dir() or not item.name.startswith("tmp"):
+            continue
+        try:
+            mtime = float(item.stat().st_mtime)
+        except Exception:
+            continue
+        if mtime <= cutoff_ts:
+            candidates.append((mtime, item))
+
+    candidates.sort(key=lambda pair: pair[0])
+    targets = candidates[:max_delete]
+
+    deleted_names: list[str] = []
+    errors: list[str] = []
+    for _, item in targets:
+        if dry_run:
+            deleted_names.append(item.name)
+            continue
+        try:
+            shutil.rmtree(item)
+            deleted_names.append(item.name)
+        except Exception as exc:
+            errors.append(f"{item.name}: {exc}")
+
+    return {
+        "status": "ok",
+        "root_exists": True,
+        "older_than_hours": retention_hours,
+        "limit": max_delete,
+        "matched_count": len(candidates),
+        "deleted_count": 0 if dry_run else len(deleted_names),
+        "error_count": len(errors),
+        "sample_ids": deleted_names[:20],
+        "dry_run": bool(dry_run),
+    }
+
+
+def maybe_cleanup_work_tmp_dirs(force: bool = False) -> None:
+    global LAST_WORK_TMP_CLEANUP_TS
+    now = time.time()
+
+    with WORK_TMP_CLEANUP_LOCK:
+        if (
+            not force
+            and WORK_TMP_CLEANUP_INTERVAL_SECONDS > 0.0
+            and (now - LAST_WORK_TMP_CLEANUP_TS) < WORK_TMP_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        LAST_WORK_TMP_CLEANUP_TS = now
+
+    try:
+        cleanup = cleanup_work_tmp_dirs(
+            older_than_hours=WORK_TMP_RETENTION_HOURS,
+            limit=300,
+            dry_run=False,
+        )
+        if int(cleanup.get("deleted_count", 0)) > 0 or int(cleanup.get("error_count", 0)) > 0:
+            logger.info(
+                "Work tmp cleanup: deleted=%s error=%s matched=%s retention_h=%s",
+                cleanup.get("deleted_count", 0),
+                cleanup.get("error_count", 0),
+                cleanup.get("matched_count", 0),
+                cleanup.get("older_than_hours", WORK_TMP_RETENTION_HOURS),
+            )
+    except Exception as exc:
+        logger.warning("Work tmp cleanup skipped: %s", exc)
+
+
+def _scan_tree_file_bytes(root: Path, allowed_suffixes: Optional[set[str]] = None) -> tuple[int, int]:
+    if not root.exists():
+        return 0, 0
+
+    total_bytes = 0
+    file_count = 0
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        if allowed_suffixes is not None:
+                            suffix = Path(entry.name).suffix.lower()
+                            if suffix not in allowed_suffixes:
+                                continue
+                        file_count += 1
+                        total_bytes += int(entry.stat(follow_symlinks=False).st_size)
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return total_bytes, file_count
+
+
+def _scan_upload_audio_metrics(root: Path, report_submission_ids: Optional[set[str]] = None) -> Dict[str, int]:
+    metrics: Dict[str, int] = {
+        "uploads_bytes": 0,
+        "uploads_file_count": 0,
+        "linked_audio_file_count": 0,
+        "orphan_audio_file_count": 0,
+    }
+    if not root.exists():
+        return metrics
+
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        suffix = Path(entry.name).suffix.lower()
+                        if suffix not in ALLOWED_AUDIO_EXTENSIONS:
+                            continue
+                        metrics["uploads_file_count"] += 1
+                        metrics["uploads_bytes"] += int(entry.stat(follow_symlinks=False).st_size)
+
+                        if report_submission_ids is not None:
+                            submission_id = Path(entry.name).stem
+                            if submission_id in report_submission_ids:
+                                metrics["linked_audio_file_count"] += 1
+                            else:
+                                metrics["orphan_audio_file_count"] += 1
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return metrics
+
+
+def _delete_upload_artifacts_for_submission(submission_id: str) -> int:
+    upload_root = Path("data/uploads")
+    if not upload_root.exists():
+        return 0
+
+    deleted = 0
+    for up in upload_root.glob(f"**/{submission_id}.*"):
+        if not up.is_file():
+            continue
+        try:
+            up.unlink()
+            deleted += 1
+        except Exception as e:
+            logger.warning(f"Failed to delete upload artifact {up}: {e}")
+    return deleted
+
+
+def _count_upload_artifacts_for_submission(submission_id: str) -> int:
+    upload_root = Path("data/uploads")
+    if not upload_root.exists():
+        return 0
+    count = 0
+    for up in upload_root.glob(f"**/{submission_id}.*"):
+        if up.is_file():
+            count += 1
+    return count
+
+
 def get_active_processing_jobs() -> int:
     return sum(1 for job in JOBS.values() if job.status == JobStatus.PROCESSING)
+
+
+def require_admin_token_if_configured(request: Request) -> None:
+    """
+    Optional admin protection:
+    - If ADMIN_API_TOKEN is not configured, requests are allowed (backward-compatible).
+    - If configured, caller must provide matching `x-admin-token` header.
+    """
+    if not ADMIN_API_TOKEN:
+        return
+
+    provided = str(request.headers.get(ADMIN_TOKEN_HEADER, "") or "").strip()
+    if not provided:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Missing admin token header: {ADMIN_TOKEN_HEADER}",
+        )
+    if not hmac.compare_digest(provided, ADMIN_API_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid admin token")
 
 async def worker():
     """Background worker to process jobs from the queue"""
@@ -165,6 +612,7 @@ async def worker():
                     rel_path = html_path.relative_to(REPORTS_DIR)
                     JOBS[job_id].result_url = f"/reports/{rel_path}"
                     save_jobs() # Save state
+                    _invalidate_report_scan_cache()
                     logger.info(f"Job {job_id} completed")
                     
             except Exception as e:
@@ -197,6 +645,7 @@ async def startup_event():
     
     # Load persistence
     load_jobs()
+    maybe_cleanup_work_tmp_dirs(force=True)
     
     # Restoring Queued Jobs
     from src.models import EngineMode
@@ -294,10 +743,13 @@ def get_config():
             "alignment_source": gemini_conf.get("alignment_source", "whisper"),
             "api_key_masked": mask_key(gemini_key or ""),
             "has_key": bool(gemini_key)
-        }
+        },
+        "upload": {
+            "max_mb": float(UPLOAD_MAX_MB),
+        },
     }
 
-@app.post("/api/config")
+@app.post("/api/config", dependencies=[Depends(require_admin_token_if_configured)])
 def update_config(data: ConfigUpdate):
     updates = data.dict(exclude_unset=True)
     logger.info(f"Received config update: {updates.keys()}")
@@ -352,7 +804,152 @@ def api_health():
     return {"status": "ok"}
 
 
-@app.post("/api/restart")
+@app.get("/api/storage/uploads-usage")
+def uploads_storage_usage():
+    upload_root = Path("data/uploads")
+    report_submission_ids: set[str] = set()
+    try:
+        cached_reports = _get_cached_reports_snapshot()
+        for row in cached_reports:
+            submission_id = str((row or {}).get("id") or "").strip()
+            if submission_id:
+                report_submission_ids.add(submission_id)
+    except Exception:
+        report_submission_ids = set()
+
+    metrics = _scan_upload_audio_metrics(upload_root, report_submission_ids)
+    uploads_bytes = int(metrics.get("uploads_bytes", 0))
+    file_count = int(metrics.get("uploads_file_count", 0))
+    linked_audio_file_count = int(metrics.get("linked_audio_file_count", 0))
+    orphan_audio_file_count = int(metrics.get("orphan_audio_file_count", 0))
+    warn_bytes = int(UPLOAD_STORAGE_WARN_BYTES)
+    over_warn = uploads_bytes >= warn_bytes
+
+    disk_total = 0
+    disk_used = 0
+    disk_free = 0
+    try:
+        probe = upload_root if upload_root.exists() else Path("data")
+        usage = shutil.disk_usage(probe)
+        disk_total = int(usage.total)
+        disk_used = int(usage.used)
+        disk_free = int(usage.free)
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "uploads_root": str(upload_root),
+        "uploads_bytes": int(uploads_bytes),
+        "uploads_gb": round(float(uploads_bytes) / (1024.0 ** 3), 3),
+        "uploads_file_count": int(file_count),
+        "report_submission_count": int(len(report_submission_ids)),
+        "linked_audio_file_count": int(linked_audio_file_count),
+        "orphan_audio_file_count": int(orphan_audio_file_count),
+        "warn_bytes": int(warn_bytes),
+        "warn_gb": float(UPLOAD_STORAGE_WARN_GB),
+        "over_warn": bool(over_warn),
+        "disk_total_bytes": int(disk_total),
+        "disk_used_bytes": int(disk_used),
+        "disk_free_bytes": int(disk_free),
+    }
+
+
+@app.get("/api/diagnostics/summary")
+def diagnostics_summary(
+    failed_limit: int = Query(default=10, ge=1, le=100),
+):
+    """Read-only diagnostics summary for quick operational checks."""
+    reports_count = 0
+    latest_report_timestamp = 0.0
+    try:
+        reports = _get_cached_reports_snapshot()
+        reports_count = len(reports)
+        if reports:
+            latest_report_timestamp = float(reports[0].get("timestamp") or 0.0)
+    except Exception:
+        reports = []
+
+    upload_root = Path("data/uploads")
+    report_submission_ids: set[str] = set()
+    for row in reports:
+        submission_id = str((row or {}).get("id") or "").strip()
+        if submission_id:
+            report_submission_ids.add(submission_id)
+
+    metrics = _scan_upload_audio_metrics(upload_root, report_submission_ids)
+    uploads_bytes = int(metrics.get("uploads_bytes", 0))
+    uploads_file_count = int(metrics.get("uploads_file_count", 0))
+    linked_audio_file_count = int(metrics.get("linked_audio_file_count", 0))
+    orphan_audio_file_count = int(metrics.get("orphan_audio_file_count", 0))
+    warn_bytes = int(UPLOAD_STORAGE_WARN_BYTES)
+
+    def _job_status_text(job: Job) -> str:
+        raw = job.status
+        return raw.value if isinstance(raw, JobStatus) else str(raw).strip().lower()
+
+    all_jobs = list(JOBS.values())
+    status_counts = Counter(_job_status_text(job) for job in all_jobs)
+    failed_jobs = [job for job in all_jobs if _job_status_text(job) == JobStatus.FAILED.value]
+    failed_jobs.sort(key=lambda x: float(x.timestamp or 0.0), reverse=True)
+
+    failed_recent = [
+        {
+            "job_id": str(job.id),
+            "submission_id": str(job.submission_id),
+            "timestamp": float(job.timestamp or 0.0),
+            "error": str(job.error or "").strip(),
+        }
+        for job in failed_jobs[: int(failed_limit)]
+    ]
+
+    disk_total = 0
+    disk_used = 0
+    disk_free = 0
+    try:
+        probe = upload_root if upload_root.exists() else Path("data")
+        usage = shutil.disk_usage(probe)
+        disk_total = int(usage.total)
+        disk_used = int(usage.used)
+        disk_free = int(usage.free)
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "generated_at": float(time.time()),
+        "reports": {
+            "count": int(reports_count),
+            "latest_timestamp": float(latest_report_timestamp),
+        },
+        "uploads": {
+            "bytes": int(uploads_bytes),
+            "gb": round(float(uploads_bytes) / (1024.0 ** 3), 3),
+            "file_count": int(uploads_file_count),
+            "linked_file_count": int(linked_audio_file_count),
+            "orphan_file_count": int(orphan_audio_file_count),
+            "warn_bytes": int(warn_bytes),
+            "warn_gb": float(UPLOAD_STORAGE_WARN_GB),
+            "over_warn": bool(uploads_bytes >= warn_bytes),
+        },
+        "jobs": {
+            "total": int(len(all_jobs)),
+            "queued": int(status_counts.get(JobStatus.QUEUED.value, 0)),
+            "processing": int(status_counts.get(JobStatus.PROCESSING.value, 0)),
+            "completed": int(status_counts.get(JobStatus.COMPLETED.value, 0)),
+            "failed": int(status_counts.get(JobStatus.FAILED.value, 0)),
+            "active": int(status_counts.get(JobStatus.QUEUED.value, 0) + status_counts.get(JobStatus.PROCESSING.value, 0)),
+        },
+        "failed_recent": failed_recent,
+        "disk": {
+            "total_bytes": int(disk_total),
+            "used_bytes": int(disk_used),
+            "free_bytes": int(disk_free),
+        },
+    }
+
+
+@app.post("/api/restart", dependencies=[Depends(require_admin_token_if_configured)])
 def restart_backend():
     """
     Trigger self-restart. Container will come back automatically via docker restart policy.
@@ -378,6 +975,82 @@ REPORTS_DIR = Path("data/out")
 if not REPORTS_DIR.exists():
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/reports", StaticFiles(directory=REPORTS_DIR, html=True), name="reports")
+
+REPORT_SCAN_CACHE_TTL_SECONDS = max(
+    0.5,
+    float(os.getenv("REPORT_SCAN_CACHE_TTL_SECONDS", "3") or "3"),
+)
+REPORT_SCAN_CACHE_LOCK = threading.Lock()
+REPORT_SCAN_CACHE: Dict[str, Any] = {
+    "expires_at": 0.0,
+    "items": [],
+}
+
+
+def _invalidate_report_scan_cache() -> None:
+    with REPORT_SCAN_CACHE_LOCK:
+        REPORT_SCAN_CACHE["expires_at"] = 0.0
+        REPORT_SCAN_CACHE["items"] = []
+
+
+def _scan_reports_from_disk() -> list[Dict[str, Any]]:
+    reports: list[Dict[str, Any]] = []
+    if not REPORTS_DIR.exists():
+        return reports
+
+    for report_file in REPORTS_DIR.glob("**/*.html"):
+        if report_file.name == "index.html":
+            continue
+
+        submission_id = report_file.stem
+        json_path = report_file.parent / f"{submission_id}.json"
+        try:
+            rel_path = report_file.relative_to(REPORTS_DIR)
+            url = f"/reports/{rel_path}"
+        except Exception:
+            continue
+
+        report_data: Dict[str, Any] = {
+            "id": submission_id,
+            "url": url,
+            "timestamp": os.path.getmtime(report_file),
+            "student_name": submission_id.split("_")[0],
+            "display_name": submission_id,
+            "original_filename": None,
+            "score": None,
+        }
+
+        if json_path.exists():
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    report_data["score"] = data.get("scores", {}).get("overall_100")
+                    meta = data.get("meta", {})
+                    if meta.get("student_id"):
+                        report_data["student_name"] = meta["student_id"]
+                        report_data["display_name"] = meta["student_id"]
+            except Exception:
+                pass
+
+        reports.append(report_data)
+
+    reports.sort(key=lambda x: x["timestamp"], reverse=True)
+    return reports
+
+
+def _get_cached_reports_snapshot() -> list[Dict[str, Any]]:
+    now_ts = time.time()
+    with REPORT_SCAN_CACHE_LOCK:
+        expires_at = float(REPORT_SCAN_CACHE.get("expires_at") or 0.0)
+        cached_items = REPORT_SCAN_CACHE.get("items")
+        if isinstance(cached_items, list) and now_ts < expires_at:
+            return [dict(row) for row in cached_items]
+
+    fresh = _scan_reports_from_disk()
+    with REPORT_SCAN_CACHE_LOCK:
+        REPORT_SCAN_CACHE["items"] = fresh
+        REPORT_SCAN_CACHE["expires_at"] = time.time() + REPORT_SCAN_CACHE_TTL_SECONDS
+        return [dict(row) for row in fresh]
 
 @app.delete("/api/reports/{submission_id}")
 async def delete_report(submission_id: str):
@@ -425,16 +1098,9 @@ async def delete_report(submission_id: str):
          pass
 
     # Also remove source upload artifacts by submission_id (audio + sidecars)
-    upload_deleted = 0
-    upload_root = Path("data/uploads")
-    if upload_root.exists():
-        for up in upload_root.glob(f"**/{submission_id}.*"):
-            if up.is_file():
-                try:
-                    up.unlink()
-                    upload_deleted += 1
-                except Exception as e:
-                    logger.warning(f"Failed to delete upload artifact {up}: {e}")
+    upload_deleted = _delete_upload_artifacts_for_submission(submission_id)
+    if upload_deleted > 0:
+        found = True
     
     if not found:
          # Try to check if it matches a JOB id (for Pending/Failed jobs that have no directory)
@@ -468,6 +1134,8 @@ async def delete_report(submission_id: str):
 
     if not found and not job_found:
          raise HTTPException(status_code=404, detail="Report/Job not found")
+    if found:
+        _invalidate_report_scan_cache()
          
     return {
         "status": "success",
@@ -514,15 +1182,7 @@ async def batch_delete_reports(request: BatchDeleteRequest):
             pass
         
         # 2. Delete source upload artifacts (audio + sidecars)
-        upload_root = Path("data/uploads")
-        if upload_root.exists():
-            for up in upload_root.glob(f"**/{sub_id}.*"):
-                if up.is_file():
-                    try:
-                        up.unlink()
-                        upload_deleted_total += 1
-                    except Exception as e:
-                        errors.append(f"Failed to delete upload artifact {sub_id}: {e}")
+        upload_deleted_total += _delete_upload_artifacts_for_submission(sub_id)
 
         # 3. Mark for Job Deletion
         # Check by key
@@ -542,6 +1202,8 @@ async def batch_delete_reports(request: BatchDeleteRequest):
             
     if ids_to_remove_from_jobs:
         save_jobs()
+    if deleted_count > 0:
+        _invalidate_report_scan_cache()
         
     return {
         "status": "success", 
@@ -552,74 +1214,104 @@ async def batch_delete_reports(request: BatchDeleteRequest):
     }
 
 @app.get("/api/reports")
-async def list_reports():
+async def list_reports(
+    page: Optional[int] = Query(default=None, ge=1),
+    page_size: Optional[int] = Query(default=None, ge=1, le=100),
+    search: str = Query(default=""),
+    status: str = Query(default="all"),
+    date_range: str = Query(default="all"),
+):
     """
     List all generated reports in the output directory.
     """
-    reports = []
-    if not REPORTS_DIR.exists():
-        return reports
-        
+    reports = _get_cached_reports_snapshot()
+
     # Build a quick lookup so UI can display the original uploaded filename.
     job_by_submission_id: Dict[str, Job] = {}
     for j in JOBS.values():
         prev = job_by_submission_id.get(j.submission_id)
         if not prev or j.timestamp > prev.timestamp:
             job_by_submission_id[j.submission_id] = j
-
-    # Scan for report.html files recursively
-    # The new structure is data/out/{task_id}/{student_id}/{submission_id}/{submission_id}.html
-    # We look for all .html files that are not index.html (if any)
-    for report_file in REPORTS_DIR.glob("**/*.html"):
-        # Skip potential system files or base templates
-        if report_file.name == "index.html":
+    for row in reports:
+        sid = str(row.get("id") or "")
+        if not sid:
             continue
-            
-        submission_id = report_file.stem # sub_...
-        json_path = report_file.parent / f"{submission_id}.json"
-        
-        # relative path from REPORTS_DIR (data/out)
-        try:
-            rel_path = report_file.relative_to(REPORTS_DIR)
-            url = f"/reports/{rel_path}"
-        except Exception:
-            continue
-
-        report_data = {
-            "id": submission_id,
-            "url": url,
-            "timestamp": os.path.getmtime(report_file),
-            "student_name": submission_id.split("_")[0], # Default fallback
-            "display_name": submission_id,
-            "original_filename": None,
-            "score": None
-        }
-        
-        # Try to load metadata from JSON
-        if json_path.exists():
-            try:
-                import json
-                with open(json_path, 'r') as f:
-                    data = json.load(f)
-                    report_data["score"] = data.get("scores", {}).get("overall_100")
-                    meta = data.get("meta", {})
-                    # Prefer student_id from meta
-                    if meta.get("student_id"):
-                        report_data["student_name"] = meta["student_id"]
-                        report_data["display_name"] = meta["student_id"]
-            except Exception:
-                pass
-
-        job = job_by_submission_id.get(submission_id)
+        job = job_by_submission_id.get(sid)
         if job and job.filename:
-            report_data["original_filename"] = job.filename
-            report_data["display_name"] = Path(job.filename).stem
-                 
-        reports.append(report_data)
-        
-    # Sort by timestamp descending
-    reports.sort(key=lambda x: x["timestamp"], reverse=True)
-    return reports
+            row["original_filename"] = job.filename
+            row["display_name"] = Path(job.filename).stem
+
+    # Backward-compatible mode:
+    # if no filtering/pagination params are provided, return plain list as before.
+    search_text = str(search or "").strip().lower()
+    status_key = str(status or "all").strip().lower()
+    date_range_key = str(date_range or "all").strip().lower()
+    use_extended_response = (
+        page is not None
+        or page_size is not None
+        or bool(search_text)
+        or status_key not in ("", "all")
+        or date_range_key not in ("", "all")
+    )
+    if not use_extended_response:
+        return reports
+
+    filtered = reports
+    if date_range_key in ("today", "7d", "last7d", "last_7_days"):
+        now_local = time.localtime()
+        cutoff_7d = time.time() - 7 * 24 * 3600
+
+        def _report_ts(row: Dict[str, Any]) -> float:
+            try:
+                return float(row.get("timestamp") or 0.0)
+            except Exception:
+                return 0.0
+
+        if date_range_key == "today":
+            def _is_today(row: Dict[str, Any]) -> bool:
+                ts = _report_ts(row)
+                if ts <= 0:
+                    return False
+                d = time.localtime(ts)
+                return d.tm_year == now_local.tm_year and d.tm_yday == now_local.tm_yday
+            filtered = [row for row in filtered if _is_today(row)]
+        else:
+            filtered = [row for row in filtered if _report_ts(row) >= cutoff_7d]
+
+    if search_text:
+        def _matches(row: Dict[str, Any]) -> bool:
+            return (
+                search_text in str(row.get("id", "")).lower()
+                or search_text in str(row.get("student_name", "")).lower()
+                or search_text in str(row.get("display_name", "")).lower()
+                or search_text in str(row.get("original_filename", "")).lower()
+            )
+        filtered = [row for row in filtered if _matches(row)]
+
+    if status_key in ("scored", "with_score"):
+        filtered = [row for row in filtered if row.get("score") is not None]
+    elif status_key in ("unscored", "without_score"):
+        filtered = [row for row in filtered if row.get("score") is None]
+
+    total = len(filtered)
+    page_size_val = int(page_size or 8)
+    total_pages = max(1, (total + page_size_val - 1) // page_size_val)
+    page_val = int(page or 1)
+    page_val = min(max(1, page_val), total_pages)
+
+    start = (page_val - 1) * page_size_val
+    end = start + page_size_val
+    items = filtered[start:end]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page_val,
+        "page_size": page_size_val,
+        "total_pages": total_pages,
+        "has_prev": page_val > 1,
+        "has_next": page_val < total_pages,
+    }
 
 
 @app.get("/api/reports/{submission_id}/data")
@@ -751,6 +1443,577 @@ async def get_report_data(submission_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to read report: {e}")
 
 
+_WORD_TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+
+
+def _normalize_word_tokens(raw: Any) -> list[str]:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return []
+    return [token for token in _WORD_TOKEN_PATTERN.findall(text) if len(token) >= 2]
+
+
+def _extract_report_student_name(payload: dict[str, Any], report_path: Path) -> str:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    if isinstance(meta, dict):
+        for key in ("student_id", "student_name"):
+            value = str(meta.get(key) or "").strip()
+            if value:
+                return value
+    # data/out/{task}/{student}/{submission}/{submission}.json
+    if len(report_path.parts) >= 3:
+        return str(report_path.parent.parent.name or "").strip()
+    return ""
+
+
+def _canonical_upload_name(filename: str) -> str:
+    name = str(filename or "").strip()
+    if not name:
+        return ""
+    stem = Path(name).stem.strip().lower()
+    if not stem:
+        return ""
+    # Normalize duplicate suffix styles from OS/browser uploads:
+    # foo_01, foo-2, foo (3)
+    stem = re.sub(r"(?:[_\-\s]0*\d{1,3}|\(\d{1,3}\))$", "", stem).strip()
+    return stem
+
+
+def _submission_filename_lookup() -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for job in JOBS.values():
+        submission = str(getattr(job, "submission_id", "") or "").strip()
+        filename = str(getattr(job, "filename", "") or "").strip()
+        if submission and filename:
+            lookup[submission] = filename
+    return lookup
+
+
+def _collect_report_focus_words(payload: dict[str, Any]) -> set[str]:
+    words: set[str] = set()
+    if not isinstance(payload, dict):
+        return words
+
+    advisor_feedback = payload.get("advisor_feedback") if isinstance(payload.get("advisor_feedback"), dict) else {}
+    engine_raw = payload.get("engine_raw") if isinstance(payload.get("engine_raw"), dict) else {}
+    integrated_feedback = (
+        engine_raw.get("integrated_feedback") if isinstance(engine_raw.get("integrated_feedback"), dict) else {}
+    )
+
+    for top_errors in (advisor_feedback.get("top_errors"), integrated_feedback.get("top_errors")):
+        if not isinstance(top_errors, list):
+            continue
+        for item in top_errors:
+            if not isinstance(item, dict):
+                continue
+            raw_candidates: list[Any] = []
+            raw_words = item.get("words")
+            if isinstance(raw_words, list):
+                raw_candidates.extend(raw_words)
+            elif isinstance(raw_words, str):
+                raw_candidates.append(raw_words)
+            for field in ("word", "target_word", "target", "token"):
+                if item.get(field):
+                    raw_candidates.append(item.get(field))
+            for raw in raw_candidates:
+                words.update(_normalize_word_tokens(raw))
+
+    return words
+
+
+@app.get("/api/pronunciation/focus-words")
+async def get_pronunciation_focus_words(
+    student: Optional[str] = None,
+    min_count: int = 2,
+    limit: int = 12,
+    recent_reports: int = 400,
+):
+    """
+    Aggregate frequently mispronounced words from recent report JSON files.
+    """
+    student_filter = str(student or "").strip()
+    min_count = max(1, min(int(min_count or 2), 20))
+    limit = max(1, min(int(limit or 12), 50))
+    recent_reports = max(20, min(int(recent_reports or 400), 3000))
+
+    candidates = [p for p in REPORTS_DIR.glob("**/*.json") if p.is_file()]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    report_files = candidates[:recent_reports]
+
+    head_signature = ""
+    if report_files:
+        newest = report_files[0]
+        try:
+            head_signature = f"{newest.as_posix()}:{newest.stat().st_mtime_ns}:{len(report_files)}"
+        except Exception:
+            head_signature = f"{newest.as_posix()}:{len(report_files)}"
+    cache_key = "|".join(
+        [
+            student_filter.lower(),
+            str(min_count),
+            str(limit),
+            str(recent_reports),
+            head_signature,
+        ]
+    )
+    now = time.time()
+    with PRON_FOCUS_CACHE_LOCK:
+        cached = PRON_FOCUS_CACHE.get(cache_key)
+        if cached and (now - cached[0]) <= PRON_FOCUS_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    word_counter: Counter[str] = Counter()
+    student_counter: dict[str, set[str]] = {}
+    last_seen_ts: dict[str, float] = {}
+    scanned_reports = 0
+    matched_reports = 0
+    deduplicated_reports = 0
+    duplicate_reports_skipped = 0
+    student_filter_lower = student_filter.lower()
+    submission_to_filename = _submission_filename_lookup()
+    seen_source_keys: set[str] = set()
+
+    for report_file in report_files:
+        try:
+            payload = json.loads(report_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        scanned_reports += 1
+
+        report_student = _extract_report_student_name(payload, report_file)
+        if student_filter_lower and student_filter_lower not in report_student.lower():
+            continue
+
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        submission_id = str((meta or {}).get("submission_id") or "").strip() if isinstance(meta, dict) else ""
+        original_filename = submission_to_filename.get(submission_id, "")
+        canonical_name = _canonical_upload_name(original_filename)
+        if canonical_name:
+            source_key = f"{report_student.lower()}|{canonical_name}"
+            if source_key in seen_source_keys:
+                duplicate_reports_skipped += 1
+                continue
+            seen_source_keys.add(source_key)
+            deduplicated_reports += 1
+
+        report_words = _collect_report_focus_words(payload)
+        if not report_words:
+            continue
+
+        matched_reports += 1
+        mtime = report_file.stat().st_mtime
+        for word_token in report_words:
+            word_counter[word_token] += 1
+            if report_student:
+                student_counter.setdefault(word_token, set()).add(report_student)
+            last_seen_ts[word_token] = max(last_seen_ts.get(word_token, 0.0), mtime)
+
+    rows: list[dict[str, Any]] = []
+    for token, count in word_counter.items():
+        if count < min_count:
+            continue
+        rows.append(
+            {
+                "word": token,
+                "count": int(count),  # appears in how many reports
+                "student_count": len(student_counter.get(token, set())),
+                "last_seen_ts": int(last_seen_ts.get(token, 0.0)),
+            }
+        )
+
+    rows.sort(key=lambda item: (-item["count"], -item["last_seen_ts"], item["word"]))
+    payload = {
+        "student_filter": student_filter,
+        "min_count": min_count,
+        "limit": limit,
+        "recent_reports": recent_reports,
+        "scanned_reports": scanned_reports,
+        "matched_reports": matched_reports,
+        "deduplicated_reports": deduplicated_reports,
+        "duplicate_reports_skipped": duplicate_reports_skipped,
+        "words": rows[:limit],
+    }
+
+    with PRON_FOCUS_CACHE_LOCK:
+        PRON_FOCUS_CACHE[cache_key] = (time.time(), payload)
+        # Keep cache size bounded.
+        if len(PRON_FOCUS_CACHE) > 24:
+            oldest_keys = sorted(PRON_FOCUS_CACHE.items(), key=lambda item: item[1][0])[:6]
+            for key, _ in oldest_keys:
+                PRON_FOCUS_CACHE.pop(key, None)
+
+    return payload
+
+
+def _clear_playbook_cache() -> None:
+    try:
+        from src.advice import playbook as playbook_module
+
+        loader = getattr(playbook_module, "_load_runtime_rows", None)
+        if loader and hasattr(loader, "cache_clear"):
+            loader.cache_clear()
+    except Exception as e:
+        logger.warning(f"Failed to clear playbook cache: {e}")
+
+
+def _parse_playbook_table_rows(text: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower() == "## runtime lookup table":
+            in_table = True
+            continue
+        if in_table and line.startswith("## "):
+            break
+        if not in_table or not line.startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip("|").split("|")]
+        if len(cols) < 6:
+            continue
+        if cols[0].lower() == "key" or set(cols[0]) == {"-"}:
+            continue
+        rows.append(
+            {
+                "key": cols[0],
+                "triggers": cols[1],
+                "focus_words": cols[2],
+                "technique": cols[3],
+                "drill_20s": cols[4],
+                "mnemonic": cols[5],
+            }
+        )
+    return rows
+
+
+def _split_csv_items(raw: str) -> list[str]:
+    parts = re.split(r"[,\s/|]+", raw or "")
+    out: list[str] = []
+    for item in parts:
+        token = item.strip().lower()
+        if token and token not in out:
+            out.append(token)
+    return out
+
+
+def _sanitize_cell(text: str) -> str:
+    clean = (text or "").replace("|", "/").replace("\n", " ").replace("\r", " ")
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:180]
+
+
+def _slugify_key(seed: str) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", seed or "")
+    if not tokens:
+        return "CUSTOM_RULE"
+    return "_".join(tokens[:4]).upper()[:48]
+
+
+def _normalize_playbook_idea(idea: str) -> dict[str, str]:
+    text = re.sub(r"\s+", " ", (idea or "").strip())
+    if not text:
+        raise HTTPException(status_code=400, detail="idea is required")
+
+    mapping: dict[str, str] = {}
+    for seg in re.split(r"[;\n]+", text):
+        part = seg.strip()
+        if not part:
+            continue
+        if ":" in part:
+            k, v = part.split(":", 1)
+        else:
+            continue
+        key = k.strip().lower()
+        value = v.strip()
+        if not value:
+            continue
+        if key in {"key", "id"}:
+            mapping["key"] = value
+        elif key in {"triggers", "trigger", "keywords"}:
+            mapping["triggers"] = value
+        elif key in {"focus", "focus_words", "words"}:
+            mapping["focus_words"] = value
+        elif key in {"technique", "method"}:
+            mapping["technique"] = value
+        elif key in {"drill", "practice", "steps"}:
+            mapping["drill_20s"] = value
+        elif key in {"mnemonic", "memory", "hook"}:
+            mapping["mnemonic"] = value
+
+    words = re.findall(r"[A-Za-z]+(?:_[A-Za-z]+)?", text)
+    lower_words: list[str] = []
+    for w in words:
+        token = w.lower()
+        if token not in lower_words:
+            lower_words.append(token)
+
+    focus_words = mapping.get("focus_words", "")
+    if not focus_words:
+        focus_words = ",".join(lower_words[:8]) if lower_words else "custom_word"
+
+    triggers = mapping.get("triggers", "")
+    if not triggers:
+        base = lower_words[:8] if lower_words else ["custom", "teacher_note"]
+        triggers = ",".join(base)
+
+    technique = mapping.get("technique", "")
+    if not technique:
+        low = text.lower()
+        if "stress" in low:
+            technique = "Stress-Beat Custom Drill"
+        elif "pause" in low:
+            technique = "Thought-Group Pause Drill"
+        elif "link" in low:
+            technique = "Connected Speech Custom Drill"
+        else:
+            technique = "Teacher Custom Pronunciation Drill"
+
+    drill = mapping.get("drill_20s", "")
+    if not drill:
+        drill = text[:160]
+
+    mnemonic = mapping.get("mnemonic", "")
+    if not mnemonic:
+        mnemonic = "Teacher custom memory hook."
+
+    key_seed = mapping.get("key", "") or f"{technique}_{focus_words}"
+    return {
+        "key": _sanitize_cell(_slugify_key(key_seed)),
+        "triggers": _sanitize_cell(",".join(_split_csv_items(triggers))),
+        "focus_words": _sanitize_cell(",".join(_split_csv_items(focus_words))),
+        "technique": _sanitize_cell(technique),
+        "drill_20s": _sanitize_cell(drill),
+        "mnemonic": _sanitize_cell(mnemonic),
+    }
+
+
+def _get_gemini_playbook_keys() -> list[str]:
+    raw = config.get("engines.gemini.api_key") or os.getenv("GEMINI_API_KEY") or ""
+    if isinstance(raw, list):
+        return [str(k).strip() for k in raw if str(k).strip()]
+    if isinstance(raw, str):
+        return [k.strip() for k in raw.split(",") if k.strip()]
+    return []
+
+
+def _extract_gemini_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        content = candidate.get("content") if isinstance(candidate, dict) else {}
+        parts = content.get("parts") if isinstance(content, dict) else []
+        for part in parts or []:
+            value = part.get("text") if isinstance(part, dict) else None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _safe_parse_json_block(text: str) -> dict[str, Any]:
+    clean = (text or "").strip()
+    if clean.startswith("```json"):
+        clean = clean[7:]
+    if clean.startswith("```"):
+        clean = clean[3:]
+    if clean.endswith("```"):
+        clean = clean[:-3]
+    clean = clean.strip()
+    return json.loads(clean) if clean else {}
+
+
+def _ai_refine_playbook_row(idea: str, base_row: dict[str, str]) -> tuple[dict[str, str], str]:
+    keys = _get_gemini_playbook_keys()
+    if not keys:
+        return base_row, "Gemini key not configured; used rule-based normalize."
+
+    model = str(config.get("engines.gemini.model", "gemini-3-flash-preview") or "gemini-3-flash-preview").strip()
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    prompt = f"""
+Normalize this teacher idea into ONE compact JSON object for pronunciation playbook row.
+Return JSON only, no markdown.
+Required keys: key,triggers,focus_words,technique,drill_20s,mnemonic
+Constraints:
+- key: UPPER_SNAKE_CASE, short.
+- triggers/focus_words: comma separated lowercase tokens.
+- technique/drill_20s/mnemonic: concise actionable text.
+- keep each value <= 180 chars.
+
+Teacher idea:
+{idea}
+
+Rule-based draft:
+{json.dumps(base_row, ensure_ascii=False)}
+"""
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1},
+    }
+
+    errors: list[str] = []
+    for key in keys[:3]:
+        try:
+            resp = requests.post(
+                endpoint,
+                params={"key": key},
+                json=payload,
+                timeout=(4, 15),
+            )
+            if resp.status_code >= 400:
+                errors.append(f"HTTP {resp.status_code}")
+                continue
+            data = resp.json()
+            value = _extract_gemini_text(data)
+            if not value:
+                errors.append("empty_text")
+                continue
+            parsed = _safe_parse_json_block(value)
+            if not isinstance(parsed, dict):
+                errors.append("bad_json")
+                continue
+            refined = {
+                "key": _sanitize_cell(_slugify_key(str(parsed.get("key", base_row["key"])))),
+                "triggers": _sanitize_cell(",".join(_split_csv_items(str(parsed.get("triggers", base_row["triggers"]))))),
+                "focus_words": _sanitize_cell(",".join(_split_csv_items(str(parsed.get("focus_words", base_row["focus_words"]))))),
+                "technique": _sanitize_cell(str(parsed.get("technique", base_row["technique"]))),
+                "drill_20s": _sanitize_cell(str(parsed.get("drill_20s", base_row["drill_20s"]))),
+                "mnemonic": _sanitize_cell(str(parsed.get("mnemonic", base_row["mnemonic"]))),
+            }
+            if not refined["triggers"]:
+                refined["triggers"] = base_row["triggers"]
+            if not refined["focus_words"]:
+                refined["focus_words"] = base_row["focus_words"]
+            if not refined["technique"]:
+                refined["technique"] = base_row["technique"]
+            if not refined["drill_20s"]:
+                refined["drill_20s"] = base_row["drill_20s"]
+            if not refined["mnemonic"]:
+                refined["mnemonic"] = base_row["mnemonic"]
+            return refined, ""
+        except Exception as e:
+            errors.append(str(e))
+            continue
+
+    return base_row, f"Gemini refine failed; used rule-based normalize ({'; '.join(errors[:2])})"
+
+
+def _append_playbook_row(md_text: str, row: dict[str, str]) -> tuple[str, dict[str, str]]:
+    lines = md_text.splitlines()
+    start_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "## runtime lookup table":
+            start_idx = i
+            break
+    if start_idx < 0:
+        raise HTTPException(status_code=500, detail="Runtime Lookup Table not found in playbook")
+
+    table_start = -1
+    for i in range(start_idx + 1, len(lines)):
+        if lines[i].strip().startswith("| key |"):
+            table_start = i
+            break
+    if table_start < 0:
+        raise HTTPException(status_code=500, detail="Playbook table header not found")
+
+    table_end = table_start
+    for i in range(table_start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith("|"):
+            table_end = i
+            continue
+        if stripped.startswith("## "):
+            break
+        if stripped == "":
+            table_end = i - 1
+            break
+
+    existing_keys = {
+        item["key"].upper()
+        for item in _parse_playbook_table_rows(md_text)
+        if item.get("key")
+    }
+
+    base_key = row["key"].upper()
+    final_key = base_key
+    suffix = 1
+    while final_key in existing_keys:
+        suffix += 1
+        final_key = f"{base_key}_{suffix}"
+
+    saved = dict(row)
+    saved["key"] = final_key
+    new_row = (
+        f"| {saved['key']} | {saved['triggers']} | {saved['focus_words']} | "
+        f"{saved['technique']} | {saved['drill_20s']} | {saved['mnemonic']} |"
+    )
+
+    lines.insert(table_end + 1, new_row)
+    return "\n".join(lines) + "\n", saved
+
+
+@app.get("/api/playbook")
+def get_playbook():
+    try:
+        if not PLAYBOOK_PATH.exists():
+            raise HTTPException(status_code=404, detail="Playbook file not found")
+        text = PLAYBOOK_PATH.read_text(encoding="utf-8", errors="ignore")
+        rows = _parse_playbook_table_rows(text)
+        return {
+            "path": str(PLAYBOOK_PATH),
+            "entry_count": len(rows),
+            "updated_at": PLAYBOOK_PATH.stat().st_mtime,
+            "text": text,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load playbook: {e}")
+
+
+@app.put("/api/playbook", dependencies=[Depends(require_admin_token_if_configured)])
+def update_playbook(payload: PlaybookUpdateRequest):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if "| key | triggers | focus_words | technique | drill_20s | mnemonic |" not in text:
+        raise HTTPException(status_code=400, detail="Playbook text missing required Runtime Lookup table header")
+
+    try:
+        with PLAYBOOK_LOCK:
+            PLAYBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PLAYBOOK_PATH.write_text(text + ("\n" if not text.endswith("\n") else ""), encoding="utf-8")
+        _clear_playbook_cache()
+        return {"status": "ok", "entry_count": len(_parse_playbook_table_rows(text))}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update playbook: {e}")
+
+
+@app.post("/api/playbook/ideas", dependencies=[Depends(require_admin_token_if_configured)])
+def append_playbook_idea(payload: PlaybookIdeaRequest):
+    row = _normalize_playbook_idea(payload.idea)
+    refine_warning = ""
+    source = "rule"
+    if payload.ai_refine:
+        row, refine_warning = _ai_refine_playbook_row(payload.idea, row)
+        if not refine_warning:
+            source = "gemini"
+    try:
+        with PLAYBOOK_LOCK:
+            if not PLAYBOOK_PATH.exists():
+                raise HTTPException(status_code=404, detail="Playbook file not found")
+            current = PLAYBOOK_PATH.read_text(encoding="utf-8", errors="ignore")
+            updated_text, saved = _append_playbook_row(current, row)
+            PLAYBOOK_PATH.write_text(updated_text, encoding="utf-8")
+        _clear_playbook_cache()
+        return {"status": "ok", "entry": saved, "source": source, "warning": refine_warning}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to append playbook idea: {e}")
+
+
 @app.post("/api/script-reference")
 async def prepare_script_reference(payload: ScriptReferenceRequest):
     """
@@ -804,6 +2067,616 @@ async def prepare_script_reference(payload: ScriptReferenceRequest):
         raise HTTPException(status_code=500, detail=f"Failed to prebuild script reference: {e}")
 
 
+WORD_CLIP_ALLOWED_DOMAINS = {
+    "education",
+    "technology",
+    "entertainment",
+    "business",
+    "sports",
+    "news",
+    "phoneme_demo",
+}
+
+
+def _word_clip_update(job_id: str, **fields: Any) -> None:
+    with WORD_CLIP_LOCK:
+        item = WORD_CLIP_JOBS.get(job_id)
+        if not item:
+            return
+        item.update(fields)
+        item["updated_at"] = time.time()
+
+
+def _run_word_clip_job(job_id: str, payload: WordClipJobRequest) -> None:
+    try:
+        from src.tools.word_clip_compiler import compile_word_clip_package
+
+        job_root = Path("data/word_clips") / job_id
+        job_root.mkdir(parents=True, exist_ok=True)
+        _word_clip_update(job_id, status="queued", message="Queued (waiting for worker)...", progress=0.0)
+
+        with WORD_CLIP_WORKER_SEMAPHORE:
+            _word_clip_update(job_id, status="processing", message="Starting pipeline...", progress=0.02)
+
+            def progress_cb(value: float, message: str) -> None:
+                _word_clip_update(job_id, progress=round(value * 100.0, 1), message=message)
+
+            result = compile_word_clip_package(
+                word=payload.word,
+                domain=payload.domain,
+                domains=list(payload.domains or []),
+                max_videos=payload.video_count,
+                clip_seconds=payload.clip_seconds,
+                source_mode=payload.source,
+                include_cambridge=bool(payload.include_cambridge),
+                job_dir=job_root,
+                progress=progress_cb,
+            )
+
+        _word_clip_update(
+            job_id,
+            status="completed",
+            progress=100.0,
+            message="Completed",
+            clips_generated=int(result.get("clips_generated", 0) or 0),
+            videos_scanned=int(result.get("videos_scanned", 0) or 0),
+            video_path=str(result.get("video_path") or ""),
+            audio_path=str(result.get("audio_path") or ""),
+            manifest_path=str(result.get("manifest_path") or ""),
+        )
+    except Exception as exc:
+        logger.exception("Word clip job failed: %s", exc)
+        _word_clip_update(
+            job_id,
+            status="failed",
+            message="Failed",
+            error=str(exc),
+        )
+
+
+def _extract_youtube_video_id(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return ""
+    host = (parsed.netloc or "").lower()
+    if "youtu.be" in host:
+        return (parsed.path or "").strip("/").split("/")[0][:11]
+    if "youtube.com" in host:
+        qs = parse_qs(parsed.query or "")
+        value = (qs.get("v") or [""])[0]
+        if value:
+            return value[:11]
+        parts = [segment for segment in (parsed.path or "").split("/") if segment]
+        if len(parts) >= 2 and parts[0] in {"embed", "shorts"}:
+            return parts[1][:11]
+    return ""
+
+
+def _build_youtube_embed_url(video_id: str, start_seconds: float | int | None = None) -> str:
+    clean_id = re.sub(r"[^A-Za-z0-9_-]", "", str(video_id or ""))[:11]
+    if not clean_id:
+        return ""
+    start = int(round(float(start_seconds or 0)))
+    # Use youtube.com embed so browser login/session cookies can be reused.
+    base = f"https://www.youtube.com/embed/{clean_id}?rel=0&modestbranding=1&playsinline=1"
+    if start > 0:
+        return f"{base}&start={start}"
+    return base
+
+
+def _parse_youglish_snapshot(markdown_text: str, *, max_nearby: int = 12) -> dict[str, Any]:
+    text = str(markdown_text or "")
+    count = 0
+    count_match = re.search(r"\|\s*(\d+)\s+pronunciations?\s+of\b", text, re.IGNORECASE)
+    if count_match:
+        try:
+            count = int(count_match.group(1))
+        except Exception:
+            count = 0
+
+    example_sentence = ""
+    lines = [line.strip() for line in text.splitlines()]
+    heading_idx = -1
+    for idx, line in enumerate(lines):
+        if line.lower().startswith("how to pronounce ") and " out of " in line.lower():
+            heading_idx = idx
+            break
+    if heading_idx >= 0:
+        banned_prefixes = (
+            "![",
+            "[[",
+            "*",
+            "speed:",
+            "arrow_",
+            "close",
+            "definition:",
+            "nearby words:",
+            "phonetic:",
+        )
+        for line in lines[heading_idx + 1 : heading_idx + 80]:
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered.startswith(banned_prefixes):
+                continue
+            if line in {"•", "••", "•••", "×", "U"}:
+                continue
+            if not re.search(r"[a-zA-Z]", line):
+                continue
+            word_count = len(re.findall(r"[A-Za-z']+", line))
+            if word_count < 5:
+                continue
+            example_sentence = line
+            break
+
+    nearby_words: list[dict[str, str]] = []
+    seen_words: set[str] = set()
+    nearby_start = text.lower().find("nearby words:")
+    scan_block = text[nearby_start:] if nearby_start >= 0 else text
+    for match in re.finditer(r"\*\s+\[([^\]]+)\]\((https?://youglish\.com/pronounce/[^)]+)\)", scan_block):
+        token = str(match.group(1) or "").strip()
+        link = str(match.group(2) or "").strip()
+        key = token.lower()
+        if not token or not link or key in seen_words:
+            continue
+        seen_words.add(key)
+        nearby_words.append({"word": token, "url": link})
+        if len(nearby_words) >= max_nearby:
+            break
+
+    return {
+        "count": count,
+        "example_sentence": example_sentence,
+        "nearby_words": nearby_words,
+    }
+
+
+@app.get("/api/word-clips/youglish-snapshot")
+async def get_youglish_snapshot(word: str, limit: int = 12):
+    token = re.sub(r"[^a-zA-Z'-]+", "", (word or "").strip())
+    if not token:
+        raise HTTPException(status_code=400, detail="word is required")
+
+    clipped_limit = max(4, min(int(limit or 12), 24))
+    source_url = f"https://youglish.com/pronounce/{quote(token)}/english"
+    proxy_url = f"https://r.jina.ai/http://youglish.com/pronounce/{quote(token)}/english"
+
+    warning = ""
+    try:
+        response = requests.get(
+            proxy_url,
+            timeout=22,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        payload = _parse_youglish_snapshot(response.text, max_nearby=clipped_limit)
+        available = bool(payload["count"] or payload["example_sentence"] or payload["nearby_words"])
+    except Exception as exc:
+        payload = {"count": 0, "example_sentence": "", "nearby_words": []}
+        available = False
+        warning = str(exc)[:220]
+
+    return {
+        "word": token,
+        "available": available,
+        "source": "youglish_snapshot",
+        "source_url": source_url,
+        "count": int(payload["count"]),
+        "example_sentence": str(payload["example_sentence"] or ""),
+        "nearby_words": payload["nearby_words"],
+        "warning": warning,
+    }
+
+
+@app.get("/api/word-clips/online-sources")
+async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = "all"):
+    token = re.sub(r"[^a-zA-Z'-]+", "", (word or "").strip())
+    if not token:
+        raise HTTPException(status_code=400, detail="word is required")
+
+    clipped_limit = max(2, min(int(limit or 8), 24))
+    accent_token = str(accent or "all").strip().lower()
+    if accent_token not in {"all", "us", "uk", "aus", "ca"}:
+        accent_token = "all"
+
+    try:
+        from src.tools.word_clip_compiler import (  # type: ignore
+            _search_sources,
+            _search_youglish_sources,
+            _search_youtube_api_sources,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Word clip module unavailable: {exc}") from exc
+
+    source_rows: list[Any] = []
+    source_name = "youglish"
+    warning = ""
+    try:
+        source_rows = _search_youglish_sources(token, max_videos=clipped_limit)
+    except Exception as exc:
+        warning = str(exc)[:240]
+        source_rows = []
+
+    if not source_rows:
+        source_name = "fallback_youtube"
+        try:
+            source_rows = _search_youtube_api_sources(token, ["phoneme_demo", "education"], clipped_limit)
+            if source_rows:
+                source_name = "fallback_youtube_api"
+        except Exception as exc:
+            warning = (warning + f" | {str(exc)[:180]}").strip(" |")
+            source_rows = []
+    if not source_rows:
+        source_name = "fallback_youtube"
+        try:
+            source_rows = _search_sources(token, ["phoneme_demo", "education"], clipped_limit)
+        except Exception as exc:
+            detail = f"Online source search failed: {exc}"
+            raise HTTPException(status_code=502, detail=detail[:500]) from exc
+
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in source_rows:
+        raw_url = str(getattr(row, "url", "") or "").strip()
+        if not raw_url:
+            continue
+        vid = _extract_youtube_video_id(raw_url)
+        if not vid:
+            continue
+        start = float(getattr(row, "start_seconds", 0.0) or 0.0)
+        bucket = int(round(start))
+        dedupe_key = f"{vid}:{bucket}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        embed_url = _build_youtube_embed_url(vid, start)
+        if not embed_url:
+            continue
+        items.append(
+            {
+                "video_id": vid,
+                "title": str(getattr(row, "title", "") or "Untitled clip"),
+                "source_url": raw_url,
+                "embed_url": embed_url,
+                "start_seconds": bucket,
+                "source_type": str(getattr(row, "source_type", "") or source_name),
+            }
+        )
+        if len(items) >= clipped_limit:
+            break
+
+    return {
+        "word": token,
+        "source": source_name,
+        "accent": accent_token,
+        "count": len(items),
+        "warning": warning,
+        "items": items,
+    }
+
+
+@app.post("/api/word-clips/po-token/extract-har")
+async def extract_word_clip_po_token_from_har(
+    har_file: UploadFile = File(...),
+    token_key: str = Form("web.gvs"),
+    merge_existing: bool = Form(True),
+):
+    name = str(har_file.filename or "").strip().lower()
+    if not name.endswith(".har") and not name.endswith(".json"):
+        raise HTTPException(status_code=400, detail="Please upload a .har file")
+
+    raw = await har_file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(raw) > 220 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="HAR file is too large (max 220MB)")
+
+    try:
+        payload = json.loads(raw.decode("utf-8-sig", errors="ignore"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid HAR JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Invalid HAR structure")
+
+    tokens = _extract_po_tokens_from_har(payload)
+    if not tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="No poToken/pot found in HAR. Please capture a playing YouTube video and retry.",
+        )
+
+    selected = max(tokens, key=len)
+    key = _normalize_po_token_key(token_key)
+
+    current: dict[str, str] = _load_saved_po_tokens() if merge_existing else {}
+
+    current[key] = selected
+    WORD_CLIP_PO_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WORD_CLIP_PO_TOKEN_PATH.write_text(
+        json.dumps(current, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    preview = selected[:12] + "..." + selected[-8:] if len(selected) > 24 else selected
+    return {
+        "status": "ok",
+        "token_key": key,
+        "tokens_found": len(tokens),
+        "selected_token_preview": preview,
+        "saved_path": str(WORD_CLIP_PO_TOKEN_PATH),
+        "saved_keys": sorted(current.keys()),
+    }
+
+
+@app.get("/api/word-clips/po-token/status")
+async def get_word_clip_po_token_status():
+    tokens = _load_saved_po_tokens()
+    updated_at = None
+    if WORD_CLIP_PO_TOKEN_PATH.exists():
+        try:
+            updated_at = WORD_CLIP_PO_TOKEN_PATH.stat().st_mtime
+        except Exception:
+            updated_at = None
+    return {
+        "status": "ok",
+        "exists": bool(tokens),
+        "saved_path": str(WORD_CLIP_PO_TOKEN_PATH),
+        "updated_at": updated_at,
+        "keys": sorted(tokens.keys()),
+        "token_previews": {key: _mask_token(value) for key, value in tokens.items()},
+    }
+
+
+@app.get("/api/word-clips/po-token/health-check")
+async def check_word_clip_po_token_health(token_key: str = "web.gvs"):
+    key = _normalize_po_token_key(token_key)
+    tokens = _load_saved_po_tokens()
+    if key not in tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token key '{key}' not found. Upload HAR first.",
+        )
+
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Missing yt-dlp: {exc}") from exc
+
+    try:
+        from src.tools.word_clip_compiler import _apply_yt_dlp_common_options  # type: ignore
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Word clip module unavailable: {exc}") from exc
+
+    player_client = "android" if key.startswith("android.") else None
+    test_urls = [
+        "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=M7lc1UVf-VE",
+    ]
+    probes = [
+        ("po_only", False),
+        ("po_plus_cookies", True),
+    ]
+    probe_results: list[dict[str, Any]] = []
+    for probe_name, use_cookies in probes:
+        options: dict[str, Any] = {
+            "quiet": True,
+            "noprogress": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "ignoreerrors": False,
+            "socket_timeout": 18,
+        }
+        options = _apply_yt_dlp_common_options(
+            options,
+            use_cookies=use_cookies,
+            use_node_runtime=True,
+            player_client=player_client,
+            use_impersonate=False,
+            use_po_token=True,
+        )
+
+        success_payload: dict[str, Any] | None = None
+        last_error = ""
+        for test_url in test_urls:
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(test_url, download=False)
+                formats = (info or {}).get("formats") or []
+                playable = [
+                    item
+                    for item in formats
+                    if isinstance(item, dict)
+                    and item.get("ext") != "mhtml"
+                    and (item.get("vcodec") != "none" or item.get("acodec") != "none")
+                ]
+                success_payload = {
+                    "probe": probe_name,
+                    "ok": True,
+                    "playable_formats": len(playable),
+                    "total_formats": len(formats),
+                    "video_id": str((info or {}).get("id") or ""),
+                    "title": str((info or {}).get("title") or ""),
+                    "test_url": test_url,
+                }
+                if playable:
+                    probe_results.append(success_payload)
+                    return {
+                        "status": "ok",
+                        "token_key": key,
+                        "token_preview": _mask_token(tokens.get(key, "")),
+                        "probe": probe_name,
+                        "video_id": str((info or {}).get("id") or ""),
+                        "title": str((info or {}).get("title") or ""),
+                        "playable_formats": len(playable),
+                        "total_formats": len(formats),
+                        "hint": "Token is usable.",
+                        "probe_results": probe_results,
+                    }
+            except Exception as exc:
+                last_error = str(exc).strip() or repr(exc)
+
+        if success_payload is not None:
+            probe_results.append(success_payload)
+        else:
+            probe_results.append({"probe": probe_name, "ok": False, "error": last_error[:500]})
+
+    if probe_results:
+        best = max(
+            [item for item in probe_results if item.get("ok")] or [{}],
+            key=lambda item: int(item.get("playable_formats") or 0),
+        )
+        if best and int(best.get("playable_formats") or 0) == 0 and best.get("ok"):
+            return {
+                "status": "degraded",
+                "token_key": key,
+                "token_preview": _mask_token(tokens.get(key, "")),
+                "probe": str(best.get("probe") or ""),
+                "video_id": str(best.get("video_id") or ""),
+                "title": str(best.get("title") or ""),
+                "playable_formats": 0,
+                "total_formats": int(best.get("total_formats") or 0),
+                "hint": "Token loaded, but no playable formats. Refresh HAR token.",
+                "probe_results": probe_results,
+            }
+        msg = str((probe_results[-1] or {}).get("error") or "").strip() or "Unknown upstream error"
+        low = msg.lower()
+        if "not a bot" in low or "sign in to confirm" in low:
+            hint = "Token appears expired/invalid. Re-export HAR and extract again."
+        elif "po token" in low:
+            hint = "PO Token mismatch. Try updating both web.gvs and android.gvs."
+        else:
+            hint = "Health check failed due to upstream/network condition."
+        return {
+            "status": "failed",
+            "token_key": key,
+            "token_preview": _mask_token(tokens.get(key, "")),
+            "error": msg[:1200],
+            "hint": hint,
+            "probe_results": probe_results,
+        }
+    return {
+        "status": "failed",
+        "token_key": key,
+        "token_preview": _mask_token(tokens.get(key, "")),
+        "error": "No probe result",
+        "hint": "Health check failed due to upstream/network condition.",
+    }
+
+
+@app.post("/api/word-clips/jobs")
+async def create_word_clip_job(payload: WordClipJobRequest):
+    word = (payload.word or "").strip()
+    if not word:
+        raise HTTPException(status_code=400, detail="word is required")
+
+    source_mode = str(payload.source or "youglish").strip().lower()
+    if source_mode not in {"youglish", "hybrid"}:
+        raise HTTPException(status_code=400, detail="source must be one of: youglish, hybrid")
+
+    raw_domains = payload.domains if isinstance(payload.domains, list) and payload.domains else [payload.domain]
+    clean_domains: list[str] = []
+    if source_mode == "youglish":
+        clean_domains = ["phoneme_demo"]
+        primary_domain = "youglish"
+    else:
+        for item in raw_domains:
+            token = str(item or "").strip().lower()
+            if not token:
+                continue
+            if token not in WORD_CLIP_ALLOWED_DOMAINS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"domain must be one of: {', '.join(sorted(WORD_CLIP_ALLOWED_DOMAINS))}",
+                )
+            if token not in clean_domains:
+                clean_domains.append(token)
+        if not clean_domains:
+            clean_domains = ["education"]
+        primary_domain = clean_domains[0]
+
+    video_count = max(1, min(int(payload.video_count or 4), 20))
+    clip_seconds = max(4.0, min(float(payload.clip_seconds or 5.0), 8.0))
+    include_cambridge = bool(payload.include_cambridge)
+
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    with WORD_CLIP_LOCK:
+        WORD_CLIP_JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "word": word,
+            "domain": primary_domain,
+            "domains": clean_domains,
+            "source": source_mode,
+            "include_cambridge": include_cambridge,
+            "video_count": video_count,
+            "clip_seconds": clip_seconds,
+            "progress": 0.0,
+            "message": "Queued",
+            "error": "",
+            "clips_generated": 0,
+            "videos_scanned": 0,
+            "video_path": "",
+            "audio_path": "",
+            "manifest_path": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    normalized_payload = WordClipJobRequest(
+        word=word,
+        domain=primary_domain,
+        domains=clean_domains,
+        video_count=video_count,
+        clip_seconds=clip_seconds,
+        source=source_mode,
+        include_cambridge=include_cambridge,
+    )
+    worker_thread = threading.Thread(target=_run_word_clip_job, args=(job_id, normalized_payload), daemon=True)
+    worker_thread.start()
+    return {"status": "queued", "job_id": job_id}
+
+
+@app.get("/api/word-clips/jobs/{job_id}")
+async def get_word_clip_job(job_id: str):
+    with WORD_CLIP_LOCK:
+        job = dict(WORD_CLIP_JOBS.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="Word clip job not found")
+
+    if job.get("video_path"):
+        job["video_download_url"] = f"/api/word-clips/jobs/{job_id}/download/video"
+    if job.get("audio_path"):
+        job["audio_download_url"] = f"/api/word-clips/jobs/{job_id}/download/audio"
+    return job
+
+
+@app.get("/api/word-clips/jobs/{job_id}/download/{asset}")
+async def download_word_clip_asset(job_id: str, asset: str):
+    if asset not in {"video", "audio"}:
+        raise HTTPException(status_code=400, detail="asset must be video or audio")
+
+    with WORD_CLIP_LOCK:
+        job = dict(WORD_CLIP_JOBS.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="Word clip job not found")
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Job is not completed yet")
+
+    path_key = "video_path" if asset == "video" else "audio_path"
+    target_path = Path(str(job.get(path_key) or ""))
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail=f"{asset} output not found")
+
+    media_type = "video/mp4" if asset == "video" else "audio/mpeg"
+    return FileResponse(path=target_path, filename=target_path.name, media_type=media_type)
+
+
 @app.post("/api/upload")
 async def upload_audio(
     file: UploadFile = File(...),
@@ -813,7 +2686,6 @@ async def upload_audio(
     """
     Async Upload: Saves file and queues job. Returns Job ID immediately.
     """
-    import shutil
     import time
     from datetime import datetime
     import hashlib
@@ -821,6 +2693,21 @@ async def upload_audio(
     import json # For serialization in save_jobs
     from src.models import EngineMode
     
+    # Opportunistic cleanup to keep temp workspace bounded over time.
+    maybe_cleanup_work_tmp_dirs(force=False)
+
+    raw_filename = str(file.filename or "").strip()
+    filename_suffix = Path(raw_filename).suffix.lower()
+    content_type = str(file.content_type or "").strip().lower()
+    if not (content_type.startswith("audio/") or filename_suffix in ALLOWED_AUDIO_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported file type. Please upload audio files "
+                "(mp3/wav/m4a/aac/flac/ogg/opus)."
+            ),
+        )
+
     # Generate IDs
     job_id = str(uuid.uuid4())
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -835,8 +2722,27 @@ async def upload_audio(
     file_path = upload_dir / f"{submission_id}.mp3"
     
     try:
+        size_bytes = 0
         with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while True:
+                chunk = file.file.read(UPLOAD_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                next_size = size_bytes + len(chunk)
+                if next_size > UPLOAD_MAX_BYTES:
+                    max_mb_text = f"{UPLOAD_MAX_MB:g}"
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (>{max_mb_text}MB). Maximum allowed is {max_mb_text}MB.",
+                    )
+                buffer.write(chunk)
+                size_bytes = next_size
+        if size_bytes <= 0:
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail="Empty file is not allowed.")
         logger.info(f"File saved to {file_path}")
         
         # Save Text Sidecar for persistence
@@ -851,6 +2757,8 @@ async def upload_audio(
             except Exception as ref_err:
                 logger.warning(f"Script reference prebuild skipped: {ref_err}")
                 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
 
@@ -921,6 +2829,84 @@ async def upload_audio(
         "queue_position": JOB_QUEUE.qsize()
     }
 
+@app.get("/api/jobs/stats")
+async def get_job_stats():
+    """
+    Lightweight job counters for dashboard/polling UIs.
+    """
+    counts: Dict[str, int] = {
+        JobStatus.QUEUED.value: 0,
+        JobStatus.PROCESSING.value: 0,
+        JobStatus.COMPLETED.value: 0,
+        JobStatus.FAILED.value: 0,
+    }
+    for job in JOBS.values():
+        raw = job.status
+        key = raw.value if isinstance(raw, JobStatus) else str(raw).strip().lower()
+        if key in counts:
+            counts[key] += 1
+
+    total = int(sum(counts.values()))
+    return {
+        "status": "ok",
+        "total": total,
+        "queued": int(counts[JobStatus.QUEUED.value]),
+        "processing": int(counts[JobStatus.PROCESSING.value]),
+        "completed": int(counts[JobStatus.COMPLETED.value]),
+        "failed": int(counts[JobStatus.FAILED.value]),
+        "active": int(counts[JobStatus.QUEUED.value] + counts[JobStatus.PROCESSING.value]),
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/api/jobs/overview")
+async def get_jobs_overview(
+    active_limit: int = Query(default=200, ge=1, le=2000),
+    failed_limit: int = Query(default=500, ge=1, le=5000),
+):
+    """
+    Aggregated jobs payload for polling UIs:
+    counters + active jobs + failed jobs in one request.
+    """
+    counts: Dict[str, int] = {
+        JobStatus.QUEUED.value: 0,
+        JobStatus.PROCESSING.value: 0,
+        JobStatus.COMPLETED.value: 0,
+        JobStatus.FAILED.value: 0,
+    }
+    active_jobs: list[Job] = []
+    failed_jobs: list[Job] = []
+
+    for job in JOBS.values():
+        raw = job.status
+        key = raw.value if isinstance(raw, JobStatus) else str(raw).strip().lower()
+        if key in counts:
+            counts[key] += 1
+        if key in (JobStatus.QUEUED.value, JobStatus.PROCESSING.value):
+            active_jobs.append(job)
+        elif key == JobStatus.FAILED.value:
+            failed_jobs.append(job)
+
+    active_jobs.sort(key=lambda x: x.timestamp, reverse=True)
+    failed_jobs.sort(key=lambda x: x.timestamp, reverse=True)
+    total = int(sum(counts.values()))
+
+    return {
+        "status": "ok",
+        "stats": {
+            "total": total,
+            "queued": int(counts[JobStatus.QUEUED.value]),
+            "processing": int(counts[JobStatus.PROCESSING.value]),
+            "completed": int(counts[JobStatus.COMPLETED.value]),
+            "failed": int(counts[JobStatus.FAILED.value]),
+            "active": int(counts[JobStatus.QUEUED.value] + counts[JobStatus.PROCESSING.value]),
+        },
+        "active_jobs": active_jobs[: int(active_limit)],
+        "failed_jobs": failed_jobs[: int(failed_limit)],
+        "timestamp": time.time(),
+    }
+
+
 @app.get("/api/jobs/{job_id}")
 async def get_job_status(job_id: str):
     if job_id not in JOBS:
@@ -929,12 +2915,135 @@ async def get_job_status(job_id: str):
     return JOBS[job_id]
 
 @app.get("/api/jobs")
-async def list_jobs():
-    """List all jobs in memory (active or recently completed)"""
-    # Fix: sort jobs by timestamp desc
+async def list_jobs(
+    status: str = Query(default="all"),
+    limit: Optional[int] = Query(default=None, ge=1, le=2000),
+):
+    """
+    List jobs in memory, optionally filtered by status.
+    Backward-compatible: default still returns all jobs.
+    """
+    status_key = str(status or "all").strip().lower()
+    status_filter: Optional[set[str]] = None
+
+    alias_filters: Dict[str, set[str]] = {
+        "active": {JobStatus.QUEUED.value, JobStatus.PROCESSING.value},
+        "terminal": {JobStatus.COMPLETED.value, JobStatus.FAILED.value},
+        "failed": {JobStatus.FAILED.value},
+        "queued": {JobStatus.QUEUED.value},
+        "processing": {JobStatus.PROCESSING.value},
+        "completed": {JobStatus.COMPLETED.value},
+    }
+    if status_key not in ("", "all"):
+        if status_key in alias_filters:
+            status_filter = alias_filters[status_key]
+        else:
+            allowed = {s.value for s in JobStatus}
+            csv_items = {part.strip().lower() for part in status_key.split(",") if part.strip()}
+            selected = {part for part in csv_items if part in allowed}
+            # If caller passes unknown statuses, keep compatibility by falling back to all.
+            status_filter = selected if selected else None
+
     all_jobs = list(JOBS.values())
+    if status_filter:
+        def _job_status_text(job: Job) -> str:
+            raw = job.status
+            return raw.value if isinstance(raw, JobStatus) else str(raw).strip().lower()
+        all_jobs = [job for job in all_jobs if _job_status_text(job) in status_filter]
+
     all_jobs.sort(key=lambda x: x.timestamp, reverse=True)
+    if limit is not None:
+        all_jobs = all_jobs[: int(limit)]
     return all_jobs
+
+
+@app.post("/api/jobs/cleanup")
+async def cleanup_jobs(
+    status: str = Query(default="failed"),
+    older_than_hours: float = Query(default=24.0, ge=0.0),
+    limit: int = Query(default=500, ge=1, le=5000),
+    delete_uploads: bool = Query(default=False),
+    dry_run: bool = Query(default=False),
+):
+    """
+    Delete old job records from in-memory JOBS and persist to jobs.json.
+    Default behavior: remove up to 500 failed jobs older than 24 hours.
+    """
+    status_key = str(status or "failed").strip().lower()
+    alias_filters: Dict[str, set[str]] = {
+        "active": {JobStatus.QUEUED.value, JobStatus.PROCESSING.value},
+        "terminal": {JobStatus.COMPLETED.value, JobStatus.FAILED.value},
+        "failed": {JobStatus.FAILED.value},
+        "queued": {JobStatus.QUEUED.value},
+        "processing": {JobStatus.PROCESSING.value},
+        "completed": {JobStatus.COMPLETED.value},
+    }
+
+    allowed = {s.value for s in JobStatus}
+    if status_key in alias_filters:
+        status_filter = alias_filters[status_key]
+    else:
+        csv_items = {part.strip().lower() for part in status_key.split(",") if part.strip()}
+        status_filter = {part for part in csv_items if part in allowed}
+        if not status_filter:
+            status_filter = {JobStatus.FAILED.value}
+
+    cutoff_ts = time.time() - float(older_than_hours) * 3600.0
+
+    def _job_status_text(job: Job) -> str:
+        raw = job.status
+        return raw.value if isinstance(raw, JobStatus) else str(raw).strip().lower()
+
+    matched = [
+        (job_id, job)
+        for job_id, job in JOBS.items()
+        if _job_status_text(job) in status_filter and float(job.timestamp or 0.0) <= cutoff_ts
+    ]
+    # Delete oldest first for predictable cleanup.
+    matched.sort(key=lambda pair: float((pair[1].timestamp or 0.0)))
+    to_delete = matched[: int(limit)]
+    delete_ids = [job_id for job_id, _ in to_delete]
+    target_delete_count = len(delete_ids)
+    estimated_upload_delete_count = 0
+    upload_deleted_count = 0
+
+    if delete_uploads and to_delete:
+        seen_submission_ids: set[str] = set()
+        for _, job in to_delete:
+            sid = str(job.submission_id or "").strip()
+            if not sid or sid in seen_submission_ids:
+                continue
+            seen_submission_ids.add(sid)
+            try:
+                estimated_upload_delete_count += _count_upload_artifacts_for_submission(sid)
+            except Exception:
+                continue
+
+    if delete_ids and not dry_run:
+        for job_id, job in to_delete:
+            if delete_uploads:
+                try:
+                    upload_deleted_count += _delete_upload_artifacts_for_submission(str(job.submission_id or "").strip())
+                except Exception:
+                    pass
+            JOBS.pop(job_id, None)
+        save_jobs()
+
+    return {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "delete_uploads": bool(delete_uploads),
+        "matched_count": len(matched),
+        "target_delete_count": int(target_delete_count),
+        "deleted_count": 0 if dry_run else int(target_delete_count),
+        "upload_delete_estimate_count": int(estimated_upload_delete_count),
+        "upload_deleted_count": int(estimated_upload_delete_count) if dry_run else int(upload_deleted_count),
+        "sample_ids": delete_ids[:20],
+        "status_filter": sorted(status_filter),
+        "older_than_hours": float(older_than_hours),
+        "limit": int(limit),
+        "remaining_jobs": len(JOBS),
+    }
 
 @app.post("/api/jobs/{job_id}/rescore")
 async def rescore_job(job_id: str):

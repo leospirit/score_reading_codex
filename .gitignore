@@ -23,18 +23,30 @@ dist-ssr
 *.sln
 *.sw?
 
-# Environment
+# Secrets / local runtime tokens
 .env
+.env.*
+!.env.example
+data/yt_po_tokens.json
+data/yt_cookies.txt
+data/config.yaml
 
-# Runtime data
+# Runtime generated data (do not version)
 data/out/
 data/uploads/
 data/work/
 data/script_references/
-data/tmp_*.json
-data/tmp_*.html
-data/tmp_*.txt
+data/word_clips/
+data/tmp*
+data/jobs.json
 
-# Python cache
+# Local caches / bytecode
 __pycache__/
-*.pyc
+*.py[cod]
+.npm-cache/
+
+# Local repair / backup worktrees
+_upstream_repair/
+_upstream_repair_2/
+src/pages/ReportBuilder.tsx.broken_backup
+backups/

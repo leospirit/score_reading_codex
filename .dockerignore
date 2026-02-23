@@ -25,6 +25,14 @@ data/
 *.swp
 *.swo
 
+# Local temporary / repair artifacts (can be very large)
+_upstream_repair_2/
+_upstream_repair/
+.npm-cache/
+.shared/
+.agent/
+*.broken_backup
+
 # macOS
 .DS_Store
 

@@ -67,15 +67,17 @@ def analyze_results(
 
     apply_gemini_missing_correction(alignment, script_text, engine_raw)
     suppress_over_missing_for_gemini(alignment, script_text, engine_raw)
-    detect_pauses(alignment, script_text, engine_raw)
+    # pause/linking detection runs after timeline repair
 
     # 1. 预处理：停顿检测 与 连读检测（这就地修改 alignment）
     detect_pauses(alignment, script_text, engine_raw)
-    detect_linking(alignment)
+    
     feedback_error_words = extract_feedback_error_words(engine_raw)
     apply_feedback_top_errors_to_alignment(alignment, feedback_error_words)
     apply_script_reference_focus_rescore(alignment, engine_raw)
     repair_alignment_timeline(alignment, engine_raw)
+    detect_pauses(alignment, script_text, engine_raw)
+    detect_linking(alignment)
     generate_expected_stress(alignment)
     ensure_stress_signal(alignment)
     
@@ -99,7 +101,11 @@ def analyze_results(
     analysis.confusions = extract_confusions(engine_raw)
     
     # 5. 语速趋势分析
-    analysis.pace_chart_data = calculate_pace_trend(alignment)
+    audio_duration_sec = _safe_float((engine_raw or {}).get("audio_duration_sec"), 0.0)
+    analysis.pace_chart_data = calculate_pace_trend(
+        alignment,
+        audio_duration_sec=audio_duration_sec,
+    )
     
     # 6. 完整度高级分析
     analysis.completeness = analyze_completeness(alignment, script_text, analysis.missing_words)
@@ -630,6 +636,20 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _timeline_wpm_scale(timeline_span: float, audio_duration_sec: float) -> float:
+    """
+    Return a duration scale for WPM/pace when alignment span is clearly off from audio span.
+    """
+    span = max(0.001, float(timeline_span or 0.0))
+    audio_dur = max(0.0, float(audio_duration_sec or 0.0))
+    if audio_dur < 1.5:
+        return 1.0
+    ratio = span / audio_dur
+    if ratio < 0.65 or ratio > 1.45:
+        return max(0.35, min(4.0, audio_dur / span))
+    return 1.0
+
+
 def repair_alignment_timeline(alignment: Alignment, engine_raw: dict[str, Any] | None = None) -> None:
     """
     Repair obviously synthetic/invalid timing so pace/hesitation modules remain meaningful.
@@ -644,6 +664,10 @@ def repair_alignment_timeline(alignment: Alignment, engine_raw: dict[str, Any] |
     timeline_end = max((_safe_float(w.end) for w in words), default=0.0)
     timeline_start = min((_safe_float(w.start) for w in words), default=0.0)
     timeline_span = max(0.001, timeline_end - timeline_start)
+    gaps = [
+        max(0.0, _safe_float(words[i + 1].start) - _safe_float(words[i].end))
+        for i in range(len(words) - 1)
+    ]
 
     if timeline_end > 500.0 and audio_duration > 0 and timeline_end > audio_duration * 5:
         for w in words:
@@ -653,10 +677,29 @@ def repair_alignment_timeline(alignment: Alignment, engine_raw: dict[str, Any] |
         timeline_start = min((_safe_float(w.start) for w in words), default=0.0)
         timeline_span = max(0.001, timeline_end - timeline_start)
 
+    gap_std = 0.0
+    fixed_gap_ratio = 0.0
+    median_gap = 0.0
+    if gaps:
+        sorted_gaps = sorted(gaps)
+        median_gap = float(sorted_gaps[len(sorted_gaps) // 2])
+        around_median = [g for g in gaps if abs(g - median_gap) <= 0.02]
+        fixed_gap_ratio = len(around_median) / max(1, len(gaps))
+        mean_gap = sum(gaps) / len(gaps)
+        gap_std = math.sqrt(sum((g - mean_gap) ** 2 for g in gaps) / max(1, len(gaps)))
+
+    uniform_gap_signature = (
+        len(gaps) >= 6
+        and (
+            (0.07 <= median_gap <= 0.18 and fixed_gap_ratio >= 0.65 and gap_std <= 0.03)
+            or (median_gap <= 0.45 and fixed_gap_ratio >= 0.90 and gap_std <= 0.012)
+        )
+    )
     likely_synthetic = (
         audio_duration > 8.0
         and timeline_span < max(6.0, audio_duration * 0.35)
         and tiny_ratio >= 0.45
+        and uniform_gap_signature
     )
     if likely_synthetic:
         n = max(1, len(words))
@@ -803,24 +846,92 @@ def _build_reference_pause_targets(
     return targets
 
 
+def _estimate_spoken_wpm(words: list[WordAlignment], audio_duration_sec: float = 0.0) -> float:
+    spoken = [
+        w for w in words
+        if (_safe_float(w.end) - _safe_float(w.start)) > 0.02 and w.tag != WordTag.MISSING
+    ]
+    if len(spoken) < 2:
+        return 0.0
+    start_t = _safe_float(spoken[0].start)
+    end_t = _safe_float(spoken[-1].end)
+    span = max(0.2, end_t - start_t)
+    span *= _timeline_wpm_scale(span, audio_duration_sec)
+    return float(len(spoken) / span * 60.0)
+
+
+def _pause_target_window(
+    pause_type: str | None,
+    *,
+    wpm: float = 0.0,
+    child_mode: bool = True,
+) -> tuple[float, float]:
+    p = str(pause_type or "").strip().lower()
+    if p == "strong":
+        base_min, base_max = 0.55, 1.05
+    elif p == "medium":
+        base_min, base_max = 0.22, 0.58
+    elif p == "light":
+        base_min, base_max = 0.10, 0.30
+    elif p == "none":
+        base_min, base_max = 0.00, 0.12
+    else:
+        base_min, base_max = 0.22, 0.58
+
+    if not child_mode or wpm <= 0.0:
+        return base_min, base_max
+
+    # Child speech is naturally less stable in boundary timing.
+    # We widen acceptance bands, especially for slower speaking rates.
+    if wpm < 105.0:
+        min_scale, max_scale = 0.82, 1.30
+    elif wpm < 125.0:
+        min_scale, max_scale = 0.86, 1.24
+    elif wpm < 145.0:
+        min_scale, max_scale = 0.90, 1.16
+    elif wpm > 185.0:
+        min_scale, max_scale = 1.04, 0.95
+    else:
+        min_scale, max_scale = 1.00, 1.00
+
+    if p == "none":
+        min_scale = 1.0
+        if wpm < 125.0:
+            max_scale = max(max_scale, 1.30)
+
+    t_min = max(0.0, base_min * min_scale)
+    t_max = max(t_min + 0.04, base_max * max_scale)
+    return round(t_min, 3), round(t_max, 3)
+
+
 def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, Any] | None = None) -> None:
     """
-    检测停顿并更新 Alignment
-    
-    规则：
-    1. Gap >= 0.2s -> Pause
-    2. 有标点 (,.!?;) -> Good Pause
-    3. 无标点 -> Bad Pause (Hesitation / Broken flow)
-    4. 有标点但 Gap 很小 -> Missed Pause (Rushed)
+    Detect pause boundaries and attach pause diagnostics to each word.
     """
     words = alignment.words
     if not words:
         return
 
+    for w in words:
+        w.pause = None
+
     script_words, script_punct = _collect_script_words_and_punctuation(script_text)
     ref_pause_targets = _build_reference_pause_targets(script_words, engine_raw)
+    child_mode = bool(config.get("analysis.pause_diagnostics.child_voice_mode", True))
+    audio_duration = _safe_float((engine_raw or {}).get("audio_duration_sec"), 0.0)
+    spoken_wpm = _estimate_spoken_wpm(words, audio_duration_sec=audio_duration)
+    if child_mode:
+        long_slack_for = {"strong": 0.11, "medium": 0.10, "light": 0.09, "none": 0.11}
+        short_slack_for = {"strong": 0.12, "medium": 0.10, "light": 0.08, "none": 0.0}
+        too_long_min_for = {"strong": 0.16, "medium": 0.14, "light": 0.12, "none": 0.16}
+        # Keep too-short diagnostics only for severe sentence-boundary misses in child mode.
+        too_short_min_for = {"strong": 0.60, "medium": 999.0, "light": 999.0, "none": 999.0}
+    else:
+        long_slack_for = {"strong": 0.10, "medium": 0.09, "light": 0.08, "none": 0.10}
+        short_slack_for = {"strong": 0.08, "medium": 0.07, "light": 0.06, "none": 0.0}
+        too_long_min_for = {"strong": 0.18, "medium": 0.16, "light": 0.12, "none": 0.20}
+        too_short_min_for = {"strong": 0.50, "medium": 999.0, "light": 999.0, "none": 999.0}
 
-    # Expected pause level from punctuation fallback.
     punct_target: dict[int, str] = {}
     for idx, marks in enumerate(script_punct):
         if any(ch in marks for ch in ".!?"):
@@ -828,16 +939,8 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         elif any(ch in marks for ch in ",;:"):
             punct_target[idx] = "medium"
 
-    # Decision thresholds in seconds.
-    min_gap_for = {
-        "strong": 0.42,
-        "medium": 0.24,
-        "light": 0.12,
-        "none": 0.0,
-    }
-
     # Detect synthetic/low-fidelity timelines (e.g. evenly spaced fallback timestamps).
-    # On such timelines, "missing break" is not reliable and should not be over-reported.
+    # On such timelines, do not emit hard good/bad labels.
     gaps: list[float] = []
     for gi in range(len(words) - 1):
         g = max(0.0, float(words[gi + 1].start) - float(words[gi].end))
@@ -846,6 +949,9 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
     median_gap = 0.0
     gap_std = 0.0
     fixed_gap_ratio = 0.0
+    timeline_start = min((_safe_float(w.start) for w in words), default=0.0)
+    timeline_end = max((_safe_float(w.end) for w in words), default=0.0)
+    timeline_span = max(0.001, timeline_end - timeline_start)
     if gaps:
         sorted_gaps = sorted(gaps)
         median_gap = float(sorted_gaps[len(sorted_gaps) // 2])
@@ -853,14 +959,140 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         fixed_gap_ratio = len(around_median) / max(1, len(gaps))
         mean_gap = sum(gaps) / len(gaps)
         gap_std = math.sqrt(sum((g - mean_gap) ** 2 for g in gaps) / max(1, len(gaps)))
+        uniform_gap_signature = (
+            len(gaps) >= 6
+            and (
+                (0.07 <= median_gap <= 0.18 and fixed_gap_ratio >= 0.65 and gap_std <= 0.03)
+                or (median_gap <= 0.45 and fixed_gap_ratio >= 0.90 and gap_std <= 0.012)
+            )
+        )
+        compressed_vs_audio = (
+            audio_duration > 8.0 and timeline_span < max(6.0, audio_duration * 0.45)
+        )
+        synthetic_timeline = uniform_gap_signature and (
+            compressed_vs_audio or audio_duration <= 0.1 or fixed_gap_ratio >= 0.92
+        )
 
-        # Heuristic: fixed/near-fixed inter-word gap timelines are usually synthetic
-        # fallback timestamps and should not emit "missed break".
-        if len(gaps) >= 6:
-            if 0.07 <= median_gap <= 0.16 and fixed_gap_ratio >= 0.65:
-                synthetic_timeline = True
-            elif median_gap <= 0.20 and gap_std <= 0.02 and fixed_gap_ratio >= 0.55:
-                synthetic_timeline = True
+    # Additional low-confidence signal:
+    # if most strong boundaries are near-zero gaps, timestamps are likely coarse.
+    upper_probe = min(len(words) - 1, len(script_words))
+    strong_boundary_count = 0
+    strong_zero_gap_count = 0
+    for idx in range(max(0, upper_probe)):
+        exp_probe = (ref_pause_targets.get(idx) or punct_target.get(idx) or "none").strip().lower()
+        if exp_probe != "strong":
+            continue
+        strong_boundary_count += 1
+        gap_probe = float(gaps[idx]) if idx < len(gaps) else 0.0
+        if gap_probe <= 0.03:
+            strong_zero_gap_count += 1
+    if strong_boundary_count >= 6:
+        zero_ratio = strong_zero_gap_count / max(1, strong_boundary_count)
+        if zero_ratio >= 0.70:
+            synthetic_timeline = True
+
+    expected_pause_targets = 0
+    practice_focus_words: list[str] = []
+    practice_focus_points: list[dict[str, Any]] = []
+    boundary_candidates: list[dict[str, Any]] = []
+    seen_focus: set[str] = set()
+    upper = min(len(words) - 1, len(script_words))
+    for idx in range(max(0, upper)):
+        exp = (ref_pause_targets.get(idx) or punct_target.get(idx) or "none").strip().lower()
+        if exp not in {"strong", "medium", "light", "none"}:
+            exp = "medium"
+        if exp != "none":
+            expected_pause_targets += 1
+
+        left_word = str(words[idx].word if idx < len(words) else script_words[idx]).strip()
+        right_word = str(words[idx + 1].word if (idx + 1) < len(words) else "").strip()
+        token = _normalize_token(left_word)
+        if not token:
+            continue
+
+        gap = float(gaps[idx]) if idx < len(gaps) else 0.0
+        target_min, target_max = _pause_target_window(
+            exp,
+            wpm=spoken_wpm,
+            child_mode=child_mode,
+        )
+        long_slack = float(long_slack_for.get(exp, 0.09))
+        short_slack = float(short_slack_for.get(exp, 0.05))
+        too_long_min = float(too_long_min_for.get(exp, 0.16))
+        too_short_min = float(too_short_min_for.get(exp, 0.12))
+        if synthetic_timeline:
+            # In low-confidence timelines, disable short-pause misses to avoid
+            # over-flagging fluent readers based on coarse timestamps.
+            too_short_min = 999.0
+            too_long_min = max(0.15, too_long_min)
+        issue = ""
+        adjust_sec = 0.0
+        obvious_long = synthetic_timeline and gap >= max(0.85, target_max + 0.10)
+        if gap > target_max + long_slack or obvious_long:
+            adjust_sec = max(0.0, gap - target_max)
+            if adjust_sec >= too_long_min:
+                issue = "too_long"
+        elif gap < max(0.0, target_min - short_slack):
+            adjust_sec = max(0.0, target_min - gap)
+            if adjust_sec >= too_short_min:
+                issue = "too_short"
+
+        left_score = _safe_float(words[idx].score if idx < len(words) else 100.0, 100.0)
+        right_score = _safe_float(words[idx + 1].score if (idx + 1) < len(words) else left_score, left_score)
+        boundary_score = round((left_score + right_score) / 2.0, 2)
+        boundary_candidates.append(
+            {
+                "left_word": left_word,
+                "right_word": right_word,
+                "pause_type": exp,
+                "boundary_score": boundary_score,
+                "is_content": 0 if (token in FUNCTION_WORDS or len(token) <= 2) else 1,
+                "idx": idx,
+                "issue": issue,
+                "actual_gap": round(gap, 3),
+                "target_min": round(target_min, 3),
+                "target_max": round(target_max, 3),
+                "adjust_sec": round(adjust_sec, 3),
+            }
+        )
+
+    # Prioritize true issues first, then larger timing deviation.
+    issue_priority = {"too_long": 0, "too_short": 1}
+    boundary_candidates.sort(
+        key=lambda c: (
+            -int(bool(c.get("issue"))),
+            int(issue_priority.get(str(c.get("issue", "")), 2)),
+            -float(c.get("adjust_sec", 0.0)),
+            float(c.get("boundary_score", 100.0)),
+            -int(c.get("is_content", 0)),
+            int(c.get("idx", 0)),
+        )
+    )
+    for cand in boundary_candidates:
+        token = _normalize_token(cand.get("left_word", ""))
+        if not token or token in seen_focus:
+            continue
+        seen_focus.add(token)
+        if not str(cand.get("issue", "")).strip():
+            continue
+
+        practice_focus_points.append(
+            {
+                "left_word": str(cand.get("left_word", "")),
+                "right_word": str(cand.get("right_word", "")),
+                "pause_type": str(cand.get("pause_type", "medium")),
+                "boundary_score": float(cand.get("boundary_score", 100.0)),
+                "idx": int(cand.get("idx", -1)),
+                "issue": str(cand.get("issue", "")),
+                "actual_gap": float(cand.get("actual_gap", 0.0)),
+                "target_min": float(cand.get("target_min", 0.0)),
+                "target_max": float(cand.get("target_max", 0.0)),
+                "adjust_sec": float(cand.get("adjust_sec", 0.0)),
+            }
+        )
+        if len(practice_focus_points) >= 3:
+            break
+    practice_focus_words = [str(p.get("left_word", "")).strip() for p in practice_focus_points if str(p.get("left_word", "")).strip()]
 
     if isinstance(engine_raw, dict):
         pause_profile = engine_raw.get("pause_profile")
@@ -870,8 +1102,12 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         pause_profile["gap_std"] = round(float(gap_std), 4)
         pause_profile["fixed_gap_ratio"] = round(float(fixed_gap_ratio), 4)
         pause_profile["synthetic_timeline"] = 1.0 if synthetic_timeline else 0.0
+        pause_profile["expected_pause_targets"] = float(expected_pause_targets)
+        pause_profile["practice_focus_words"] = practice_focus_words
+        pause_profile["practice_focus_points"] = practice_focus_points
         if synthetic_timeline:
             pause_profile["timing_confidence"] = "low"
+            pause_profile["low_confidence_timing"] = 1.0
         engine_raw["pause_profile"] = pause_profile
 
     for i in range(len(words)):
@@ -883,35 +1119,70 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         gap = max(0.0, float(next_word.start) - float(curr_word.end))
         duration = round(gap, 2)
         pause_type = None
+        issue = ""
+        adjust_sec = 0.0
 
-        expected = ref_pause_targets.get(i) or punct_target.get(i)
-        if expected:
-            if expected == "none":
-                if gap >= 0.55:
-                    pause_type = "bad"
-                elif gap >= 0.32:
+        expected = (ref_pause_targets.get(i) or punct_target.get(i) or "none").strip().lower()
+        if expected not in {"strong", "medium", "light", "none"}:
+            expected = "none"
+        target_min, target_max = _pause_target_window(
+            expected,
+            wpm=spoken_wpm,
+            child_mode=child_mode,
+        )
+        long_slack = float(long_slack_for.get(expected, 0.09))
+        short_slack = float(short_slack_for.get(expected, 0.05))
+        too_long_min = float(too_long_min_for.get(expected, 0.16))
+        too_short_min = float(too_short_min_for.get(expected, 0.12))
+        if synthetic_timeline:
+            # In low-confidence timelines, disable short-pause misses to avoid
+            # over-flagging fluent readers based on coarse timestamps.
+            too_short_min = 999.0
+            too_long_min = max(0.15, too_long_min)
+
+        if expected == "none":
+            obvious_long = synthetic_timeline and gap >= max(0.85, target_max + 0.10)
+            if gap > target_max + long_slack or obvious_long:
+                adjust_sec = max(0.0, gap - target_max)
+                if adjust_sec >= too_long_min:
+                    if not synthetic_timeline:
+                        pause_type = "bad"
+                    issue = "too_long"
+                elif gap >= 0.22 and not synthetic_timeline:
                     pause_type = "optional"
-            else:
-                min_gap = min_gap_for.get(expected, 0.24)
-                if gap >= min_gap:
-                    pause_type = "good"
-                elif gap <= max(0.08, min_gap * 0.6):
-                    if synthetic_timeline:
-                        # Do not label MB on low-confidence synthetic timelines.
-                        pause_type = "optional"
-                    else:
-                        pause_type = "missed"
-                else:
-                    pause_type = "optional"
-        else:
-            if gap >= 0.65:
-                pause_type = "bad"
-            elif gap >= 0.30:
+            elif gap >= 0.22 and not synthetic_timeline:
                 pause_type = "optional"
+        else:
+            obvious_long = synthetic_timeline and gap >= max(0.85, target_max + 0.10)
+            if gap > target_max + long_slack or obvious_long:
+                adjust_sec = max(0.0, gap - target_max)
+                if adjust_sec >= too_long_min:
+                    if not synthetic_timeline:
+                        pause_type = "bad"
+                    issue = "too_long"
+                elif not synthetic_timeline:
+                    pause_type = "optional"
+            elif gap < max(0.0, target_min - short_slack):
+                adjust_sec = max(0.0, target_min - gap)
+                if adjust_sec >= too_short_min:
+                    if not synthetic_timeline:
+                        pause_type = "missed"
+                    issue = "too_short"
+                elif not synthetic_timeline:
+                    pause_type = "optional"
+            elif not synthetic_timeline:
+                pause_type = "good"
 
         if pause_type:
-            curr_word.pause = PauseInfo(type=pause_type, duration=duration)
-
+            curr_word.pause = PauseInfo(
+                type=pause_type,
+                duration=duration,
+                issue=issue,
+                target_min=round(target_min, 3),
+                target_max=round(target_max, 3),
+                adjust_sec=round(adjust_sec, 3),
+                expected_type=expected,
+            )
 
 def detect_linking(alignment: Alignment) -> None:
     """
@@ -939,7 +1210,11 @@ def detect_linking(alignment: Alignment) -> None:
             curr_word.is_linked = True
 
 
-def calculate_pace_trend(alignment: Alignment, window_size: float = 2.0) -> list[PacePoint]:
+def calculate_pace_trend(
+    alignment: Alignment,
+    window_size: float = 2.0,
+    audio_duration_sec: float = 0.0,
+) -> list[PacePoint]:
     """
     璁＄畻璇€熻秼鍔?(WPM)
 
@@ -958,28 +1233,36 @@ def calculate_pace_trend(alignment: Alignment, window_size: float = 2.0) -> list
     start_time = _safe_float(spoken_words[0].start)
     end_time = max(_safe_float(spoken_words[-1].end), start_time + 1.0)
     duration = max(end_time - start_time, 1.0)
+    time_scale = _timeline_wpm_scale(duration, audio_duration_sec)
+    effective_duration = max(1.0, duration * time_scale)
+    centers = [
+        ((_safe_float(w.start) + _safe_float(w.end)) / 2 - start_time) * time_scale
+        for w in spoken_words
+    ]
 
     points = []
 
-    logger.info(f"Calculating Pace: {len(alignment.words)} words, duration={duration}s")
+    logger.info(
+        "Calculating Pace: words=%d raw_duration=%.2fs effective_duration=%.2fs scale=%.3f",
+        len(alignment.words),
+        duration,
+        effective_duration,
+        time_scale,
+    )
 
     step = 0.5
-    current_t = start_time
+    current_t = 0.0
     smooth: list[int] = []
 
-    while current_t <= end_time:
+    while current_t <= effective_duration:
         t_start = current_t - window_size / 2
         t_end = current_t + window_size / 2
 
-        t_start_clip = max(start_time, t_start)
-        t_end_clip = min(end_time, t_end)
+        t_start_clip = max(0.0, t_start)
+        t_end_clip = min(effective_duration, t_end)
         effective_window = max(0.35, t_end_clip - t_start_clip)
 
-        count = 0
-        for w in spoken_words:
-            w_center = (_safe_float(w.start) + _safe_float(w.end)) / 2
-            if t_start_clip <= w_center < t_end_clip:
-                count += 1
+        count = sum(1 for c in centers if t_start_clip <= c < t_end_clip)
 
         wpm = int(round((count / effective_window) * 60))
         wpm = int(_clamp(float(wpm), 20.0, 240.0))
@@ -988,7 +1271,7 @@ def calculate_pace_trend(alignment: Alignment, window_size: float = 2.0) -> list
             local = smooth[-3:]
             wpm = int(round(sum(local) / len(local)))
 
-        points.append(PacePoint(x=round(current_t - start_time, 1), y=wpm))
+        points.append(PacePoint(x=round(current_t, 1), y=wpm))
         current_t += step
 
     logger.info(f"Pace Points Generated: {len(points)}")

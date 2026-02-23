@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, History, Settings, Upload } from 'lucide-react';
+import { LayoutDashboard, History, Settings, Upload, Film, Activity } from 'lucide-react';
 import { useState } from 'react';
 import SettingsModal from './SettingsModal';
 import UploadModal from './UploadModal';
@@ -10,9 +10,6 @@ export default function Navigation() {
     const [isUploadOpen, setIsUploadOpen] = useState(false);
 
     const isActive = (path: string) => location.pathname === path;
-
-    // Minimalist mode: Hide global nav on dashboard/home
-    if (location.pathname === '/') return null;
 
     return (
         <>
@@ -62,6 +59,26 @@ export default function Navigation() {
                                     <rect x="6" y="14" width="12" height="8" rx="1" />
                                 </svg>
                                 Print
+                            </Link>
+                            <Link
+                                to="/word-clips"
+                                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${isActive('/word-clips')
+                                    ? 'bg-primary/10 text-primary border border-primary/20'
+                                    : 'text-gray-400 hover:text-white hover:bg-white/5 border border-transparent'
+                                    }`}
+                            >
+                                <Film className="w-4 h-4" />
+                                Word Clips
+                            </Link>
+                            <Link
+                                to="/diagnostics"
+                                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${isActive('/diagnostics')
+                                    ? 'bg-primary/10 text-primary border border-primary/20'
+                                    : 'text-gray-400 hover:text-white hover:bg-white/5 border border-transparent'
+                                    }`}
+                            >
+                                <Activity className="w-4 h-4" />
+                                Diagnostics
                             </Link>
                         </div>
                     </div>

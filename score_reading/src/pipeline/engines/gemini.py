@@ -29,6 +29,7 @@ from src.pipeline.script_reference import (
     summarize_script_reference,
     wait_for_script_reference,
 )
+from src.advice.playbook import build_playbook_runtime_hints
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +417,11 @@ class GeminiEngine:
             else:
                 ensure_script_reference_async(script_text)
 
+        playbook_hints = build_playbook_runtime_hints(
+            script_text=script_text if is_reference_mode else "",
+            max_items=6,
+        )
+
         # 2) Build optional alignment skeleton
         base_alignment = None
         if is_reference_mode:
@@ -452,6 +458,9 @@ Reference script:
 Reference hints (optional):
 {ref_summary}
 
+Classic pronunciation playbook (optional; use only when evidence matches):
+{playbook_hints}
+
 Tasks:
 1) Compare student audio against the reference script.
 2) Score each spoken word (0-100) and identify error type.
@@ -464,6 +473,9 @@ Short feedback rules (MANDATORY):
 - Structure: factual praise (tone/rhythm/fluency) + one standout strength + one core issue with one actionable fix.
 - feedback.specific_suggestions must contain exactly 1 item.
 - feedback.practice_tips can contain at most 1 item.
+- top_errors should include 1-3 concrete items when evidence exists.
+- For each top_errors[i].improvement: use Chinese, one sentence only, under 28 Chinese characters.
+- Improvement must be direct and executable (slow read + sentence read); no stories or mnemonics.
 
 Output JSON only:
 {{
@@ -508,6 +520,9 @@ Short feedback rules (MANDATORY):
 - Include one factual praise and one core issue with one actionable fix.
 - feedback.specific_suggestions must contain exactly 1 item.
 - feedback.practice_tips can contain at most 1 item.
+- top_errors should include 1-3 concrete items when evidence exists.
+- For each top_errors[i].improvement: use Chinese, one sentence only, under 28 Chinese characters.
+- Improvement must be direct and executable (slow read + sentence read); no stories or mnemonics.
 
 Output JSON only:
 {
@@ -533,6 +548,11 @@ Output JSON only:
   }
 }
 """
+
+        prompt = (
+            f"{prompt}\n\nClassic pronunciation playbook (optional; use only when evidence matches):\n"
+            f"{playbook_hints}\n"
+        )
 
         # 4) Encode audio and execute with key rotation
         with open(wav_path, "rb") as f:

@@ -1,8 +1,12 @@
+import { Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Navigation from './components/Navigation';
-import Dashboard from './pages/Dashboard';
-import HistoryPage from './pages/History';
-import ReportBuilder from './pages/ReportBuilder';
+
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const HistoryPage = lazy(() => import('./pages/History'));
+const ReportBuilder = lazy(() => import('./pages/ReportBuilder'));
+const WordClipStudio = lazy(() => import('./pages/WordClipStudio'));
+const DiagnosticsPage = lazy(() => import('./pages/Diagnostics'));
 
 function App() {
   return (
@@ -10,11 +14,20 @@ function App() {
       <div className="bg-background min-h-screen text-text font-body selection:bg-primary selection:text-background">
         <Navigation />
 
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/history" element={<HistoryPage />} />
-          <Route path="/report-builder" element={<ReportBuilder />} />
-        </Routes>
+        <Suspense fallback={(
+          <div className="mx-auto max-w-7xl px-4 py-16 text-center text-sm text-gray-400">
+            Loading...
+          </div>
+        )}
+        >
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/history" element={<HistoryPage />} />
+            <Route path="/report-builder" element={<ReportBuilder />} />
+            <Route path="/word-clips" element={<WordClipStudio />} />
+            <Route path="/diagnostics" element={<DiagnosticsPage />} />
+          </Routes>
+        </Suspense>
 
         {/* Simple Footer */}
         <footer className="border-t border-white/10 py-12 bg-black/40 mt-auto">

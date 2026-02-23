@@ -31,31 +31,32 @@ if %errorlevel% neq 0 (
 
 :: 检查 .env 文件
 if not exist .env (
-    if exist .env.example (
-        copy /Y .env.example .env >nul
-    ) else (
-        echo OPENAI_API_KEY= > .env
-        echo GEMINI_API_KEY= >> .env
-        echo GEMINI_API_BASE= >> .env
-        echo AZURE_API_KEY= >> .env
-    )
-    echo [提示] 已创建 .env（默认空 key，可稍后编辑）
+    echo [提示] 未找到 .env 文件，正在创建...
+    echo # API Keys Configuration > .env
+    echo OPENAI_API_KEY=your-openai-key-here >> .env
+    echo GEMINI_API_KEY=your-gemini-key-here >> .env
+    echo AZURE_API_KEY=your-azure-key-here >> .env
+    echo.
+    echo [重要] 请编辑 .env 文件，填入所需引擎的 API Key（可以只填一个或多个）！
+    echo.
+    notepad .env
+    pause
 )
 
 echo.
 echo [1/3] 正在构建镜像（首次运行需要 5-10 分钟）...
-docker compose build
+docker-compose build
 
 echo.
 echo [2/3] 正在启动服务...
-docker compose up -d
+docker-compose up -d
 
 echo.
 echo [3/3] 等待服务就绪...
 timeout /t 10 /nobreak >nul
 
 :: 检查服务状态
-docker compose ps
+docker-compose ps
 
 echo.
 echo ╔══════════════════════════════════════════════════════════════╗

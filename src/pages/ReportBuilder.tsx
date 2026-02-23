@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Printer, GripVertical, Check, X, Plus, Eye, Camera, Download } from 'lucide-react';
 import JSZip from 'jszip';
+import { API_HOST } from '../config/api';
 
 // 可用模块定义
 interface ModuleConfig {
@@ -41,6 +42,10 @@ interface ReportData {
             word: string;
             tag: string;
             score: number;
+            stress?: number;
+            expected_stress?: number;
+            start?: number;
+            end?: number;
             pause?: {
                 type: 'good' | 'optional' | 'bad' | 'missed';
                 duration: number;
@@ -66,9 +71,15 @@ interface ReportData {
             filler_words: string[];
         };
         completeness?: {
-            expected_words: number;
-            spoken_words: number;
-            missing_count: number;
+            coverage?: number;
+            missing_stats?: {
+                total?: number;
+                keywords?: number;
+                function_words?: number;
+            };
+            expected_words?: number;
+            spoken_words?: number;
+            missing_count?: number;
         };
         intonation_analysis?: {
             best_sentence?: {
@@ -109,6 +120,31 @@ interface ReportData {
     };
 }
 
+type IntonationWordView = { word: string; is_stressed: boolean; stress_correct: boolean };
+type IntonationSentenceView = { sentence: string; words: IntonationWordView[]; stress_accuracy: number; tip: string };
+type IntonationAnalysisView = { best_sentence?: IntonationSentenceView; problem_sentences: IntonationSentenceView[] };
+type WritableFileLike = { write(data: Blob): Promise<void>; close(): Promise<void> };
+type SaveFileHandleLike = { createWritable(): Promise<WritableFileLike> };
+type DirectoryHandleLike = { getFileHandle(name: string, options: { create: boolean }): Promise<SaveFileHandleLike> };
+type WindowWithFsAccess = Window & {
+    showSaveFilePicker?: (options?: unknown) => Promise<SaveFileHandleLike>;
+    showDirectoryPicker?: (options?: unknown) => Promise<DirectoryHandleLike>;
+};
+
+const getErrorMessage = (value: unknown, fallback: string): string => {
+    if (value instanceof Error && value.message) return value.message;
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (value && typeof value === 'object' && 'message' in value) {
+        const message = String((value as { message?: unknown }).message || '').trim();
+        if (message) return message;
+    }
+    return fallback;
+};
+
+const formatActionError = (action: string, value: unknown, fallback: string): string => {
+    return `${action} failed: ${getErrorMessage(value, fallback)}`;
+};
+
 function formatScoreCompact(value: number, digits = 1): string {
     const n = Number(value);
     if (!Number.isFinite(n)) return '--';
@@ -122,8 +158,8 @@ function isLowConfidenceTimeline(words: ReportData['alignment']['words']): boole
     if (!Array.isArray(words) || words.length < 7) return false;
     const gaps: number[] = [];
     for (let i = 0; i < words.length - 1; i += 1) {
-        const left = Number((words[i] as any)?.end);
-        const right = Number((words[i + 1] as any)?.start);
+        const left = Number(words[i]?.end);
+        const right = Number(words[i + 1]?.start);
         if (!Number.isFinite(left) || !Number.isFinite(right)) continue;
         gaps.push(Math.max(0, right - left));
     }
@@ -139,7 +175,117 @@ function isLowConfidenceTimeline(words: ReportData['alignment']['words']): boole
     return false;
 }
 
+function inferExpectedStress(wordText: string): boolean {
+    const token = String(wordText || '').toLowerCase().replace(/[^a-z']/g, '');
+    if (!token) return false;
+    const functionWords = new Set([
+        'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by',
+        'is', 'are', 'am', 'was', 'were', 'be', 'been', 'being',
+        'and', 'or', 'but', 'so', 'if', 'as', 'than', 'that', 'this', 'these', 'those',
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+        'my', 'your', 'his', 'its', 'our', 'their',
+        'do', 'does', 'did', 'can', 'could', 'will', 'would', 'shall', 'should',
+        'have', 'has', 'had', 'not', 'no', 'yes', 'oh', 'too',
+    ]);
+    return !functionWords.has(token);
+}
+
+function quantile(values: number[], q: number): number {
+    if (!Array.isArray(values) || values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const pos = Math.max(0, Math.min(sorted.length - 1, Math.round((sorted.length - 1) * q)));
+    return sorted[pos];
+}
+
+function splitIntonationSentences(words: ReportData['alignment']['words']): ReportData['alignment']['words'][] {
+    const chunks: ReportData['alignment']['words'][] = [];
+    let current: ReportData['alignment']['words'] = [];
+    words.forEach((w, idx) => {
+        current.push(w);
+        const pauseDuration = Number(w.pause?.duration || 0);
+        const shouldCut = pauseDuration >= 0.38 || current.length >= 16 || idx === words.length - 1;
+        if (shouldCut) {
+            if (current.length >= 4) chunks.push(current);
+            current = [];
+        }
+    });
+    if (!chunks.length && words.length) chunks.push(words);
+    return chunks;
+}
+
+function deriveIntonationFallback(words: ReportData['alignment']['words']): IntonationAnalysisView | null {
+    if (!Array.isArray(words) || words.length < 4) return null;
+
+    const sentenceChunks = splitIntonationSentences(words);
+    if (!sentenceChunks.length) return null;
+
+    const evaluated = sentenceChunks.map((chunk) => {
+        const stressValues = chunk.map((w) => {
+            const stress = Number(w.stress ?? 0);
+            const score = Number(w.score ?? 0);
+            return stress > 0.01 ? Math.max(0, Math.min(1, stress)) : Math.max(0, Math.min(1, score / 100));
+        });
+        const cutoff = Math.max(0.56, Math.min(0.82, quantile(stressValues, 0.68)));
+
+        let stressTargets = 0;
+        let stressCorrect = 0;
+        const issueWords: string[] = [];
+        const tokenViews: IntonationWordView[] = chunk.map((w, idx) => {
+            const expected = Number.isFinite(Number(w.expected_stress))
+                ? Number(w.expected_stress) >= 0.62
+                : inferExpectedStress(w.word);
+            const tag = String(w.tag || '').toLowerCase();
+            const blocked = tag === 'missing' || tag === 'poor';
+            const actual = (stressValues[idx] || 0) >= cutoff;
+            if (expected) {
+                stressTargets += 1;
+                const ok = actual && !blocked;
+                if (ok) stressCorrect += 1;
+                if (!ok) issueWords.push(w.word);
+                return { word: w.word, is_stressed: true, stress_correct: ok };
+            }
+            const overStress = actual && !blocked;
+            if (overStress) issueWords.push(w.word);
+            return { word: w.word, is_stressed: false, stress_correct: !overStress };
+        });
+
+        const accuracy = stressTargets > 0 ? Math.round((stressCorrect / stressTargets) * 100) : 0;
+        return {
+            sentence: chunk.map((w) => w.word).join(' '),
+            words: tokenViews,
+            stress_accuracy: accuracy,
+            issueWords: [...new Set(issueWords)].slice(0, 3),
+        };
+    });
+
+    const sorted = [...evaluated].sort((a, b) => b.stress_accuracy - a.stress_accuracy);
+    const best = sorted[0];
+    const worst = [...evaluated].sort((a, b) => a.stress_accuracy - b.stress_accuracy)[0];
+    if (!best || !worst) return null;
+
+    const bestSentence: IntonationSentenceView = {
+        sentence: best.sentence,
+        words: best.words,
+        stress_accuracy: best.stress_accuracy,
+        tip: '重音分布自然，继续保持这个节奏。',
+    };
+
+    const issueText = worst.issueWords.length ? `重点改进：${worst.issueWords.join(' / ')}` : '重点改进：加强重音对比。';
+    const worstSentence: IntonationSentenceView = {
+        sentence: worst.sentence,
+        words: worst.words,
+        stress_accuracy: worst.stress_accuracy,
+        tip: `${issueText}。做法：重读词稍微拉长，功能词轻读短读。`,
+    };
+
+    return {
+        best_sentence: bestSentence,
+        problem_sentences: [worstSentence],
+    };
+}
+
 export default function ReportBuilder() {
+    const REQUEST_TIMEOUT_MS = 15000;
     const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
     const [reportData, setReportData] = useState<ReportData | null>(null);
     const [reports, setReports] = useState<Array<{ id: string; student_name: string; score: number }>>([]);
@@ -152,8 +298,35 @@ export default function ReportBuilder() {
     // 批量生成相关状态
     const [selectedReportIds, setSelectedReportIds] = useState<Set<string>>(new Set());
     const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, name: '' });
+    const [actionNotice, setActionNotice] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
 
     const reportRef = useRef<HTMLDivElement>(null);
+    const win = window as WindowWithFsAccess;
+    const fetchWithTimeout = async (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+        timeoutMs: number = REQUEST_TIMEOUT_MS
+    ): Promise<Response> => {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            return await fetch(input, {
+                ...(init || {}),
+                signal: controller.signal,
+            });
+        } catch (err: unknown) {
+            const errorName = err && typeof err === 'object' && 'name' in err
+                ? String((err as { name?: unknown }).name || '')
+                : '';
+            if (errorName === 'AbortError') {
+                throw new Error('Request timeout');
+            }
+            throw err;
+        } finally {
+            window.clearTimeout(timer);
+        }
+    };
+
     const lowConfidenceTimeline = useMemo(() => {
         if (!reportData) return false;
         const profile = reportData.engine_raw?.pause_profile;
@@ -174,21 +347,77 @@ export default function ReportBuilder() {
         });
     }, [reportData, lowConfidenceTimeline]);
 
+    const completenessDisplayScore = useMemo(() => {
+        const coverage = Number(reportData?.analysis?.completeness?.coverage);
+        if (Number.isFinite(coverage)) {
+            return coverage;
+        }
+        return Number(reportData?.scores?.completeness_100 || 0);
+    }, [reportData]);
+
     useEffect(() => {
-        fetch('http://localhost:8000/api/reports')
-            .then(res => res.json())
-            .then(data => setReports(data))
-            .catch(console.error);
+        let cancelled = false;
+        const loadReports = async () => {
+            try {
+                const res = await fetchWithTimeout(`${API_HOST}/api/reports`);
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const data = await res.json();
+                if (cancelled) return;
+                const rows = Array.isArray(data) ? data : (Array.isArray(data?.items) ? data.items : []);
+                setReports(rows as Array<{ id: string; student_name: string; score: number }>);
+            } catch (err) {
+                if (cancelled) return;
+                console.error('Failed to load report list:', err);
+                setActionNotice({
+                    type: 'error',
+                    message: formatActionError('Load report list', err, 'Unknown error'),
+                });
+            }
+        };
+        void loadReports();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
-        if (selectedReportId) {
-            fetch(`http://localhost:8000/api/reports/${selectedReportId}/data`)
-                .then(res => res.json())
-                .then(data => setReportData(data))
-                .catch(console.error);
+        if (!selectedReportId) {
+            setReportData(null);
+            return;
         }
+        let cancelled = false;
+        const loadReportData = async () => {
+            try {
+                const res = await fetchWithTimeout(`${API_HOST}/api/reports/${selectedReportId}/data`);
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const data = await res.json();
+                if (cancelled) return;
+                setReportData(data as ReportData);
+            } catch (err) {
+                if (cancelled) return;
+                console.error(`Failed to load report data for ${selectedReportId}:`, err);
+                setReportData(null);
+                setActionNotice({
+                    type: 'error',
+                    message: formatActionError('Load selected report', err, 'Unknown error'),
+                });
+            }
+        };
+        void loadReportData();
+        return () => {
+            cancelled = true;
+        };
     }, [selectedReportId]);
+
+    useEffect(() => {
+        if (!actionNotice) return;
+        const timer = window.setTimeout(() => setActionNotice(null), 5000);
+        return () => window.clearTimeout(timer);
+    }, [actionNotice]);
 
     const handleDragStart = (moduleId: string) => setDraggedModule(moduleId);
     const handleDragOver = (e: React.DragEvent) => e.preventDefault();
@@ -209,12 +438,11 @@ export default function ReportBuilder() {
     // 截图功能 - 使用另存为对话框
     const handleCapture = async () => {
         if (!reportRef.current || !reportData) return;
+        setActionNotice(null);
         setIsCapturing(true);
 
         try {
             const { toPng, toBlob } = await import('html-to-image');
-
-            // html-to-image 对现代 CSS 支持更好
             const dataUrl = await toPng(reportRef.current, {
                 backgroundColor: '#ffffff',
                 cacheBust: true,
@@ -223,8 +451,7 @@ export default function ReportBuilder() {
 
             const fileName = `${reportData.meta.student_name || reportData.meta.student_id}_report.png`;
 
-            // 尝试使用 File System Access API
-            if ('showSaveFilePicker' in window) {
+            if (typeof win.showSaveFilePicker === 'function') {
                 try {
                     const blob = await toBlob(reportRef.current, {
                         backgroundColor: '#ffffff',
@@ -232,10 +459,10 @@ export default function ReportBuilder() {
                     });
 
                     if (blob) {
-                        const handle = await (window as any).showSaveFilePicker({
+                        const handle = await win.showSaveFilePicker({
                             suggestedName: fileName,
                             types: [{
-                                description: 'PNG 图片',
+                                description: 'PNG Image',
                                 accept: { 'image/png': ['.png'] },
                             }],
                         });
@@ -245,56 +472,57 @@ export default function ReportBuilder() {
                         await writable.close();
                         return;
                     }
-                } catch (e: any) {
-                    if (e.name === 'AbortError') return;
+                } catch (e: unknown) {
+                    const errorName = e && typeof e === 'object' && 'name' in e
+                        ? String((e as { name?: unknown }).name || '')
+                        : '';
+                    if (errorName === 'AbortError') return;
                 }
             }
 
-            // 回退下载
             const link = document.createElement('a');
             link.download = fileName;
             link.href = dataUrl;
             link.click();
         } catch (err) {
-            console.error('截图失败:', err);
-            alert(`截图失败: ${err instanceof Error ? err.message : '未知错误'}`);
+            console.error('Capture failed:', err);
+            setActionNotice({ type: 'error', message: formatActionError('Capture', err, 'Unknown error') });
         } finally {
             setIsCapturing(false);
         }
     };
 
-    // 批量生成图片
+    // Batch-generate report images.
     const handleBatchGenerate = async () => {
         if (selectedReportIds.size === 0) {
-            alert('请先选择要生成的报告');
+            setActionNotice({ type: 'info', message: 'Please select reports first.' });
             return;
         }
 
+        setActionNotice(null);
         setIsCapturing(true);
         const ids = Array.from(selectedReportIds);
         setBatchProgress({ current: 0, total: ids.length, name: '' });
         let successCount = 0;
-        let errorList: string[] = [];
+        const errorList: string[] = [];
 
-        let dirHandle: any = null;
+        let dirHandle: DirectoryHandleLike | null = null;
         const zip = new JSZip();
 
         try {
-            console.log('检查 showDirectoryPicker 支持情况...', 'showDirectoryPicker' in window);
-            if ('showDirectoryPicker' in window) {
+            if (typeof win.showDirectoryPicker === 'function') {
                 try {
-                    dirHandle = await (window as any).showDirectoryPicker({
-                        mode: 'readwrite'
-                    });
-                } catch (e: any) {
-                    if (e.name === 'AbortError') {
+                    dirHandle = await win.showDirectoryPicker({ mode: 'readwrite' });
+                } catch (e: unknown) {
+                    const errorName = e && typeof e === 'object' && 'name' in e
+                        ? String((e as { name?: unknown }).name || '')
+                        : '';
+                    if (errorName === 'AbortError') {
                         setIsCapturing(false);
                         return;
                     }
-                    console.warn('无法获取目录权限，将回退到 ZIP 打包模式');
+                    console.warn('Directory permission unavailable, fallback to ZIP mode.');
                 }
-            } else {
-                console.warn('当前浏览器不支持 Directory Picker API，将使用 ZIP 打包模式');
             }
 
             const { toBlob } = await import('html-to-image');
@@ -306,13 +534,12 @@ export default function ReportBuilder() {
                 setBatchProgress({ current: i + 1, total: ids.length, name: studentName });
 
                 try {
-                    const res = await fetch(`http://localhost:8000/api/reports/${id}/data`);
+                    const res = await fetchWithTimeout(`${API_HOST}/api/reports/${id}/data`);
                     if (!res.ok) throw new Error(`HTTP ${res.status}`);
                     const data = await res.json();
                     setReportData(data);
 
-                    // 等待渲染
-                    await new Promise<void>(resolve => {
+                    await new Promise<void>((resolve) => {
                         requestAnimationFrame(() => {
                             requestAnimationFrame(() => {
                                 setTimeout(resolve, 600);
@@ -322,37 +549,30 @@ export default function ReportBuilder() {
 
                     if (reportRef.current) {
                         const fileName = `${data.meta?.student_name || data.meta?.student_id || studentName}_report.png`;
+                        const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
+                        if (!blob) throw new Error('Failed to render image blob');
 
                         if (dirHandle) {
-                            // 直接写入文件夹
-                            const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
-                            if (blob) {
-                                const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
-                                const writable = await fileHandle.createWritable();
-                                await writable.write(blob);
-                                await writable.close();
-                                successCount++;
-                            }
+                            const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+                            const writable = await fileHandle.createWritable();
+                            await writable.write(blob);
+                            await writable.close();
+                            successCount++;
                         } else {
-                            // 添加到 ZIP
-                            const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
-                            if (blob) {
-                                zip.file(fileName, blob);
-                                successCount++;
-                            }
+                            zip.file(fileName, blob);
+                            successCount++;
                         }
 
-                        await new Promise(resolve => setTimeout(resolve, 200));
+                        await new Promise((resolve) => setTimeout(resolve, 200));
                     }
                 } catch (err) {
-                    console.error(`生成 ${studentName} 报告失败:`, err);
+                    console.error(`Generate report for ${studentName} failed:`, err);
                     errorList.push(studentName);
                 }
             }
 
-            // 如果使用的是 ZIP 模式，最后触发一次下载
             if (!dirHandle && successCount > 0) {
-                setBatchProgress(prev => ({ ...prev, name: '正在打包 ZIP...' }));
+                setBatchProgress((prev) => ({ ...prev, name: 'Packing ZIP...' }));
                 const content = await zip.generateAsync({ type: 'blob' });
                 const link = document.createElement('a');
                 link.href = URL.createObjectURL(content);
@@ -361,20 +581,24 @@ export default function ReportBuilder() {
             }
 
             if (errorList.length === 0) {
-                alert(`✅ 已成功生成 ${successCount} 份报告！${dirHandle ? '文件已存入指定目录。' : '正在下载压缩包。'}`);
+                setActionNotice({
+                    type: 'success',
+                    message: `Generated ${successCount} report image(s).${dirHandle ? ' Saved to selected folder.' : ' ZIP download started.'}`,
+                });
             } else {
-                alert(`⚠️ 完成！成功 ${successCount} 份，失败 ${errorList.length} 份\n失败: ${errorList.join(', ')}`);
+                setActionNotice({
+                    type: 'info',
+                    message: `Done with partial failures: success ${successCount}, failed ${errorList.length}. Failed: ${errorList.join(', ')}`,
+                });
             }
         } catch (err) {
-            console.error('批量生成失败:', err);
-            alert(`批量生成失败: ${err instanceof Error ? err.message : '未知错误'}`);
+            console.error('Batch generation failed:', err);
+            setActionNotice({ type: 'error', message: formatActionError('Batch generation', err, 'Unknown error') });
         } finally {
             setIsCapturing(false);
             setBatchProgress({ current: 0, total: 0, name: '' });
         }
     };
-
-    // 全选/取消全选
     const toggleSelectAll = () => {
         if (selectedReportIds.size === reports.length) {
             setSelectedReportIds(new Set());
@@ -464,6 +688,17 @@ export default function ReportBuilder() {
                 <div className="flex-1">
                     {/* 工具栏 */}
                     <div className="flex flex-col gap-4 mb-6 print:hidden">
+                        {actionNotice && (
+                            <div className={`rounded-xl border px-3 py-2 text-sm ${
+                                actionNotice.type === 'success'
+                                    ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-200'
+                                    : actionNotice.type === 'info'
+                                        ? 'border-cyan-400/30 bg-cyan-500/10 text-cyan-200'
+                                        : 'border-red-400/30 bg-red-500/10 text-red-200'
+                            }`}>
+                                {actionNotice.message}
+                            </div>
+                        )}
                         <div className="flex items-center justify-between">
                             <div className="flex items-center gap-4">
                                 <h1 className="text-2xl font-bold text-white flex items-center gap-3">
@@ -591,7 +826,7 @@ export default function ReportBuilder() {
                         ref={reportRef}
                         onDragOver={handleDragOver}
                         onDrop={handleDrop}
-                        className={`bg-white rounded-lg shadow-2xl mx-auto print:shadow-none print:rounded-none
+                        className={`report-print-root bg-white rounded-lg shadow-2xl mx-auto print:shadow-none print:rounded-none
                             ${draggedModule ? 'ring-2 ring-primary ring-dashed' : ''}`}
                         style={{ width: '210mm', minHeight: '297mm', padding: '12mm' }}
                     >
@@ -604,7 +839,7 @@ export default function ReportBuilder() {
                         ) : (
                             <div className="text-gray-800 space-y-4">
                                 {/* 报告头部 */}
-                                <div className="text-center pb-3 border-b-2 border-gray-200">
+                                <div className="report-header text-center pb-3 border-b-2 border-gray-200">
                                     <h1 className="text-xl font-bold text-gray-900">英语朗读评测报告</h1>
                                     <div className="flex justify-center gap-8 mt-1 text-sm text-gray-600">
                                         <span>学生: <strong>{reportData.meta.student_name || reportData.meta.student_id}</strong></span>
@@ -614,7 +849,10 @@ export default function ReportBuilder() {
 
                                 {/* 模块渲染 */}
                                 {selectedModules.map(moduleId => (
-                                    <div key={moduleId} className="relative group print:break-inside-avoid">
+                                    <div
+                                        key={moduleId}
+                                        className={`relative group print:break-inside-avoid module-block module-${moduleId}`}
+                                    >
                                         <button
                                             onClick={() => removeModule(moduleId)}
                                             className="absolute -right-2 -top-2 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity print:hidden z-10"
@@ -649,7 +887,7 @@ export default function ReportBuilder() {
                                                             { label: '发音', score: reportData.scores.pronunciation_100, color: '#3B82F6' },
                                                             { label: '语调', score: reportData.scores.intonation_100, color: '#22C55E' },
                                                             { label: '流利度', score: reportData.scores.fluency_100, color: '#F59E0B' },
-                                                            { label: '完整度', score: reportData.scores.completeness_100, color: '#A855F7' },
+                                                            { label: '完整度', score: completenessDisplayScore, color: '#A855F7' },
                                                         ].map(item => (
                                                             <div key={item.label} className="p-2 border rounded text-center" style={{ borderColor: item.color + '40' }}>
                                                                 <div className="text-lg font-bold" style={{ color: item.color }}>{Math.round(item.score)}</div>
@@ -854,7 +1092,13 @@ export default function ReportBuilder() {
 
                                         {/* 韵律分析 - 弹跳球可视化 */}
                                         {moduleId === 'intonation_analysis' && (() => {
-                                            const intonation = reportData.analysis.intonation_analysis;
+                                            const intonationRaw = reportData.analysis.intonation_analysis;
+                                            const hasStructuredIntonation = Boolean(
+                                                intonationRaw?.best_sentence || (intonationRaw?.problem_sentences && intonationRaw.problem_sentences.length > 0),
+                                            );
+                                            const intonation: IntonationAnalysisView | null = hasStructuredIntonation
+                                                ? (intonationRaw || null)
+                                                : deriveIntonationFallback(displayWords);
                                             const intonationScore = reportData.scores.intonation_100;
 
                                             // 渲染弹跳球句子
@@ -929,7 +1173,7 @@ export default function ReportBuilder() {
                                                             ))}
                                                         </div>
                                                     ) : (
-                                                        <div className="text-gray-500 text-sm">语调数据分析中...</div>
+                                                        <div className="text-gray-500 text-sm">暂无可分析的语调数据（请检查音频清晰度或重新识别）。</div>
                                                     )}
                                                 </div>
                                             );
@@ -989,7 +1233,7 @@ export default function ReportBuilder() {
                                     </div>
                                 )}
 
-                                <div className="text-center text-xs text-gray-400 pt-3 border-t border-gray-200">
+                                <div className="report-footer text-center text-xs text-gray-400 pt-3 border-t border-gray-200">
                                     Generated by SpeechMaster © 2026
                                 </div>
                             </div>
@@ -1000,9 +1244,167 @@ export default function ReportBuilder() {
 
             <style>{`
                 @media print {
-                    body { background: white !important; }
+                    @page { size: A4; margin: 8mm; }
+                    html, body { width: 210mm; }
+                    body {
+                        background: white !important;
+                        -webkit-print-color-adjust: exact;
+                        print-color-adjust: exact;
+                        font-size: 10.5pt;
+                        line-height: 1.4;
+                    }
                     .print\\:hidden { display: none !important; }
-                    @page { size: A4; margin: 0; }
+
+                    /* Print canvas and section rhythm */
+                    .report-print-root {
+                        width: auto !important;
+                        min-height: auto !important;
+                        padding: 0 !important;
+                        margin: 0 !important;
+                        box-shadow: none !important;
+                        border-radius: 0 !important;
+                    }
+                    .report-print-root .space-y-4 > :not([hidden]) ~ :not([hidden]) {
+                        margin-top: 3mm !important;
+                    }
+                    .report-header {
+                        break-after: avoid-page;
+                        page-break-after: avoid;
+                        margin-bottom: 3mm !important;
+                        padding-bottom: 2.5mm !important;
+                    }
+                    .report-footer {
+                        margin-top: 3mm !important;
+                        break-inside: avoid;
+                        page-break-inside: avoid;
+                    }
+
+                    /* Module baseline */
+                    .module-block {
+                        break-inside: avoid;
+                        page-break-inside: avoid;
+                        break-after: auto;
+                        page-break-after: auto;
+                        margin-bottom: 3mm !important;
+                    }
+                    .module-block > div {
+                        border-radius: 2mm !important;
+                        border-color: #CBD5E1 !important;
+                        box-shadow: none !important;
+                        padding: 2.6mm !important;
+                    }
+                    .module-block h3 {
+                        font-size: 11pt !important;
+                        line-height: 1.35 !important;
+                        margin-bottom: 2mm !important;
+                        break-after: avoid-page;
+                        page-break-after: avoid;
+                    }
+                    .module-block .text-sm {
+                        font-size: 9pt !important;
+                        line-height: 1.4 !important;
+                    }
+                    .module-block .text-xs {
+                        font-size: 8pt !important;
+                        line-height: 1.35 !important;
+                    }
+
+                    /* Keep compact modules together */
+                    .module-score_overview,
+                    .module-pronunciation_diagnosis,
+                    .module-ai_feedback,
+                    .module-completeness,
+                    .module-hesitation {
+                        break-inside: avoid;
+                        page-break-inside: avoid;
+                    }
+
+                    /* Allow long modules to flow to next page when needed */
+                    .module-text_highlight,
+                    .module-fluency_analysis,
+                    .module-intonation_analysis {
+                        break-inside: auto !important;
+                        page-break-inside: auto !important;
+                    }
+
+                    /* Score overview: compact ring + score grid */
+                    .module-score_overview .relative.w-20.h-20 {
+                        width: 16mm !important;
+                        height: 16mm !important;
+                    }
+                    .module-score_overview .grid.grid-cols-2 {
+                        gap: 2mm !important;
+                    }
+
+                    /* Text highlight: denser line height for paper */
+                    .module-text_highlight .leading-loose {
+                        line-height: 1.65 !important;
+                    }
+
+                    /* Pronunciation diagnostics chips wrap neatly */
+                    .module-pronunciation_diagnosis .flex.flex-wrap.gap-2 {
+                        gap: 1.5mm !important;
+                    }
+
+                    /* AI feedback: reduce ink-heavy backgrounds */
+                    .module-ai_feedback .bg-purple-50 {
+                        background: #F8FAFC !important;
+                    }
+
+                    /* Fluency: better density and stable sub-block paging */
+                    .module-fluency_analysis .flex.items-center.justify-between.mb-4,
+                    .module-intonation_analysis .flex.items-center.justify-between.mb-4 {
+                        display: block !important;
+                        margin-bottom: 2mm !important;
+                    }
+                    .module-fluency_analysis .flex.gap-4.text-xs.text-gray-600,
+                    .module-intonation_analysis .flex.gap-4.text-xs.text-gray-600 {
+                        display: grid !important;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        column-gap: 2.2mm !important;
+                        row-gap: 1mm !important;
+                        margin-top: 1.3mm !important;
+                    }
+                    .module-fluency_analysis .grid.grid-cols-4 {
+                        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+                        gap: 2mm !important;
+                    }
+                    .module-fluency_analysis .grid.grid-cols-3 {
+                        gap: 1.8mm !important;
+                    }
+                    .module-fluency_analysis .bg-gray-50.rounded-lg {
+                        padding: 2.2mm !important;
+                        font-size: 8.8pt !important;
+                        line-height: 1.55 !important;
+                    }
+                    .module-fluency_analysis .leading-loose {
+                        line-height: 1.65 !important;
+                    }
+                    .module-fluency_analysis .bg-gray-50,
+                    .module-fluency_analysis .grid.grid-cols-3,
+                    .module-fluency_analysis .grid.grid-cols-4,
+                    .module-fluency_analysis .mt-3 {
+                        break-inside: avoid;
+                        page-break-inside: avoid;
+                    }
+
+                    /* Intonation: keep each sentence card intact */
+                    .module-intonation_analysis .space-y-4 > div {
+                        padding: 2.3mm !important;
+                        break-inside: avoid;
+                        page-break-inside: avoid;
+                    }
+
+                    /* Completeness and hesitation blocks: tighter spacing */
+                    .module-completeness .rounded-lg,
+                    .module-hesitation .rounded-lg {
+                        padding-top: 2.2mm !important;
+                        padding-bottom: 2.2mm !important;
+                    }
+                    p, li {
+                        orphans: 3;
+                        widows: 3;
+                    }
                 }
             `}</style>
         </div>
