@@ -17,6 +17,7 @@ torch>=2.0.0
 torchaudio>=2.0.0
 transformers>=4.30.0,<4.40
 openai-whisper
+faster-whisper
 
 # === Data & Utils ===
 numpy

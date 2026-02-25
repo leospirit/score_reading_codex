@@ -1,9 +1,9 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Printer, GripVertical, Check, X, Plus, Eye, Camera, Download } from 'lucide-react';
 import JSZip from 'jszip';
 import { API_HOST } from '../config/api';
 
-// 可用模块定义
+// 鍙敤妯″潡瀹氫箟
 interface ModuleConfig {
     id: string;
     name: string;
@@ -14,17 +14,18 @@ interface ModuleConfig {
 
 const AVAILABLE_MODULES: ModuleConfig[] = [
     { id: 'score_overview', name: '总分概览', icon: '📊', description: '圆环图 + 四维分数', isDefault: true },
-    { id: 'text_highlight', name: '朗读对照', icon: '📖', description: '带颜色标注的朗读文本', isDefault: true },
-    { id: 'pronunciation_diagnosis', name: '核心发音诊断', icon: '🎯', description: '弱读单词及错误详情', isDefault: true },
-    { id: 'ai_feedback', name: '综合反馈', icon: '👩‍🏫', description: '基于事实的鼓励与建议', isDefault: true },
+    { id: 'text_highlight', name: '朗读对照', icon: '📉', description: '带颜色标注的朗读文本', isDefault: true },
+    { id: 'pronunciation_diagnosis', name: '发音诊断', icon: '🎯', description: '弱读词及音素问题', isDefault: true },
+    { id: 'ai_feedback', name: '综合反馈', icon: '👩‍🏫', description: '基于事实的表扬与建议', isDefault: true },
     { id: 'fluency_analysis', name: '流利度分析', icon: '〰️', description: '停顿/语速/迟疑', isDefault: false },
-    { id: 'intonation_analysis', name: '韵律分析', icon: '🗣️', description: '重音与节奏可视化', isDefault: false },
-    { id: 'completeness', name: '完整度分析', icon: '📝', description: '漏读词统计', isDefault: false },
-    { id: 'hesitation', name: '迟疑分析', icon: '⚡', description: '填充词检测', isDefault: false },
+    { id: 'intonation_analysis', name: '语调分析', icon: '🗣️', description: '重音与节奏可视化', isDefault: false },
+    { id: 'completeness', name: '完整度分析', icon: '📝', description: '漏词统计', isDefault: false },
+    { id: 'hesitation', name: '迟疑分析', icon: '⏱️', description: '填充词与长停顿', isDefault: false },
 ];
 
-// 基于实际 JSON 结构的接口定义
+// 鍩轰簬瀹為檯 JSON 缁撴瀯鐨勬帴鍙ｅ畾涔?
 interface ReportData {
+    script_text?: string;
     meta: {
         student_id: string;
         student_name: string;
@@ -51,11 +52,17 @@ interface ReportData {
                 duration: number;
             };
         }>;
+        phonemes?: Array<{
+            phoneme?: string;
+            score?: number;
+            in_word?: string;
+        }>;
     };
     analysis: {
         weak_words: string[];
         weak_phonemes: string[];
         missing_words: string[];
+        missing_indices?: number[];
         mistakes: Array<{
             type: string;
             target: string;
@@ -97,6 +104,12 @@ interface ReportData {
         };
     };
     engine_raw: {
+        source?: string;
+        annotation_source?: string;
+        feedback_source_tag?: string;
+        detected_transcript?: string;
+        gemini_detected_transcript?: string;
+        gemini_missing_indices?: number[];
         pause_count?: number;
         total_pause_duration?: number;
         wpm?: number;
@@ -111,7 +124,7 @@ interface ReportData {
             hesitation_score?: number;
             final_fluency_score?: number;
         };
-        integrated_feedback: {
+        integrated_feedback?: {
             overall_comment: string;
             specific_suggestions: string[];
             practice_tips: string[];
@@ -154,6 +167,106 @@ function formatScoreCompact(value: number, digits = 1): string {
     return rounded.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
 }
 
+type GradeThresholds = {
+    cMin: number;
+    bMin: number;
+    aMin: number;
+    aPlusMin: number;
+};
+
+const DEFAULT_GRADE_THRESHOLDS: GradeThresholds = {
+    // Default: 0-74 C, 75-84 B, 85-94 A, 95-100 A+
+    cMin: 0,
+    bMin: 75,
+    aMin: 85,
+    aPlusMin: 95,
+};
+const SCORE_VIEW_MODE_STORAGE_KEY = 'score_reading.score_view_mode';
+const GRADE_THRESHOLDS_STORAGE_KEY = 'score_reading.grade_thresholds';
+
+function readScoreViewModeFromStorage(): 'score' | 'grade' {
+    if (typeof window === 'undefined') return 'score';
+    try {
+        return window.localStorage.getItem(SCORE_VIEW_MODE_STORAGE_KEY) === 'grade' ? 'grade' : 'score';
+    } catch {
+        return 'score';
+    }
+}
+
+function readGradeThresholdsFromStorage(): GradeThresholds {
+    if (typeof window === 'undefined') return DEFAULT_GRADE_THRESHOLDS;
+    try {
+        const raw = window.localStorage.getItem(GRADE_THRESHOLDS_STORAGE_KEY);
+        if (!raw) return DEFAULT_GRADE_THRESHOLDS;
+        const parsed = JSON.parse(raw) as Partial<GradeThresholds>;
+        const normalized = normalizeGradeThresholds(parsed);
+        return isLegacyDefaultThresholds(normalized) ? DEFAULT_GRADE_THRESHOLDS : normalized;
+    } catch {
+        return DEFAULT_GRADE_THRESHOLDS;
+    }
+}
+
+function parseReportDisplayPayload(raw: unknown): { mode: 'score' | 'grade'; thresholds: GradeThresholds } {
+    if (!raw || typeof raw !== 'object') {
+        return {
+            mode: readScoreViewModeFromStorage(),
+            thresholds: readGradeThresholdsFromStorage(),
+        };
+    }
+    const source = raw as {
+        score_view_mode?: unknown;
+        scoreViewMode?: unknown;
+        grade_thresholds?: unknown;
+        gradeThresholds?: unknown;
+    };
+    const mode: 'score' | 'grade' = String(source.score_view_mode ?? source.scoreViewMode ?? '').trim().toLowerCase() === 'grade'
+        ? 'grade'
+        : 'score';
+    const thresholdRaw = (source.grade_thresholds ?? source.gradeThresholds ?? {}) as {
+        c_min?: unknown;
+        b_min?: unknown;
+        a_min?: unknown;
+        a_plus_min?: unknown;
+        cMin?: unknown;
+        bMin?: unknown;
+        aMin?: unknown;
+        aPlusMin?: unknown;
+    };
+    const thresholds = normalizeGradeThresholds({
+        cMin: Number(thresholdRaw.c_min ?? thresholdRaw.cMin),
+        bMin: Number(thresholdRaw.b_min ?? thresholdRaw.bMin),
+        aMin: Number(thresholdRaw.a_min ?? thresholdRaw.aMin),
+        aPlusMin: Number(thresholdRaw.a_plus_min ?? thresholdRaw.aPlusMin),
+    });
+    return { mode, thresholds: isLegacyDefaultThresholds(thresholds) ? DEFAULT_GRADE_THRESHOLDS : thresholds };
+}
+
+function clampInt(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function normalizeGradeThresholds(raw: Partial<GradeThresholds>): GradeThresholds {
+    const cMin = clampInt(Number(raw.cMin), 0, 97);
+    const bMin = clampInt(Number(raw.bMin), cMin + 1, 98);
+    const aMin = clampInt(Number(raw.aMin), bMin + 1, 99);
+    const aPlusMin = clampInt(Number(raw.aPlusMin), aMin + 1, 100);
+    return { cMin, bMin, aMin, aPlusMin };
+}
+
+function isLegacyDefaultThresholds(thresholds: GradeThresholds): boolean {
+    return thresholds.cMin === 61 && thresholds.bMin === 71 && thresholds.aMin === 81 && thresholds.aPlusMin === 86;
+}
+
+function getGradeInfo(score: number, thresholds: GradeThresholds): { label: string; color: string } {
+    const n = Number(score);
+    if (!Number.isFinite(n)) return { label: '--', color: '#6B7280' };
+    if (n >= thresholds.aPlusMin) return { label: 'A+', color: '#A855F7' };
+    if (n >= thresholds.aMin) return { label: 'A', color: '#22C55E' };
+    if (n >= thresholds.bMin) return { label: 'B', color: '#3B82F6' };
+    return { label: 'C', color: '#F59E0B' };
+}
+
 function isLowConfidenceTimeline(words: ReportData['alignment']['words']): boolean {
     if (!Array.isArray(words) || words.length < 7) return false;
     const gaps: number[] = [];
@@ -188,6 +301,76 @@ function inferExpectedStress(wordText: string): boolean {
         'have', 'has', 'had', 'not', 'no', 'yes', 'oh', 'too',
     ]);
     return !functionWords.has(token);
+}
+
+function normalizeDisplayWord(rawText: string): string {
+    const raw = String(rawText || '');
+    if (!raw) return '';
+    return raw
+        .replace(/([A-Za-z'])([,.;:!?]+)(?=[A-Za-z'])/g, '$1 ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function isMergedPunctuationToken(rawText: string): boolean {
+    const raw = String(rawText || '');
+    if (!raw) return false;
+    return /[A-Za-z'][,.;:!?]+[A-Za-z']/.test(raw);
+}
+
+function normalizeWordToken(rawText: string): string {
+    return String(rawText || '').toLowerCase().replace(/[^a-z']/g, '');
+}
+
+function buildScriptAnchoredWords(
+    scriptText: string,
+    words: ReportData['alignment']['words'],
+    missingIndices: number[] = []
+): ReportData['alignment']['words'] {
+    const scriptTokens = String(scriptText || '').match(/[A-Za-z']+/g) || [];
+    if (!scriptTokens.length) return words;
+    const missingSet = new Set<number>();
+    missingIndices.forEach((raw) => {
+        const idx = Number(raw);
+        if (Number.isInteger(idx) && idx >= 0 && idx < scriptTokens.length) {
+            missingSet.add(idx);
+        }
+    });
+
+    const normalizedWords = words.map((w) => normalizeWordToken(w.word));
+    const used = new Set<number>();
+    let cursor = 0;
+
+    return scriptTokens.map((token, sIdx) => {
+        const norm = normalizeWordToken(token);
+        let match = -1;
+        for (let j = cursor; j < normalizedWords.length; j += 1) {
+            if (used.has(j)) continue;
+            if (normalizedWords[j] === norm) {
+                match = j;
+                break;
+            }
+            if (j - cursor > 6) break;
+        }
+        if (match < 0 && sIdx < words.length && !used.has(sIdx)) {
+            match = sIdx;
+        }
+
+        if (match >= 0) {
+            used.add(match);
+            cursor = Math.max(cursor, match + 1);
+            const base = words[match];
+            if (missingSet.has(sIdx)) {
+                return { ...base, word: token, tag: 'missing', score: 0 };
+            }
+            return { ...base, word: token };
+        }
+
+        if (missingSet.has(sIdx)) {
+            return { word: token, tag: 'missing', score: 0 };
+        }
+        return { word: token, tag: 'ok', score: 100 };
+    });
 }
 
 function quantile(values: number[], q: number): number {
@@ -270,12 +453,14 @@ function deriveIntonationFallback(words: ReportData['alignment']['words']): Into
         tip: '重音分布自然，继续保持这个节奏。',
     };
 
-    const issueText = worst.issueWords.length ? `重点改进：${worst.issueWords.join(' / ')}` : '重点改进：加强重音对比。';
+    const issueText = worst.issueWords.length
+        ? `重点改进：${worst.issueWords.join(' / ')}`
+        : '重点改进：加强重音对比。';
     const worstSentence: IntonationSentenceView = {
         sentence: worst.sentence,
         words: worst.words,
         stress_accuracy: worst.stress_accuracy,
-        tip: `${issueText}。做法：重读词稍微拉长，功能词轻读短读。`,
+        tip: `${issueText} 做法：重读词稍微拉长，功能词轻读短读。`,
     };
 
     return {
@@ -294,8 +479,10 @@ export default function ReportBuilder() {
     );
     const [draggedModule, setDraggedModule] = useState<string | null>(null);
     const [isCapturing, setIsCapturing] = useState(false);
+    const [scoreViewMode, setScoreViewMode] = useState<'score' | 'grade'>(() => readScoreViewModeFromStorage());
+    const [gradeThresholds, setGradeThresholds] = useState<GradeThresholds>(() => readGradeThresholdsFromStorage());
 
-    // 批量生成相关状态
+    // 鎵归噺鐢熸垚鐩稿叧鐘舵€?
     const [selectedReportIds, setSelectedReportIds] = useState<Set<string>>(new Set());
     const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, name: '' });
     const [actionNotice, setActionNotice] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
@@ -347,12 +534,129 @@ export default function ReportBuilder() {
         });
     }, [reportData, lowConfidenceTimeline]);
 
-    const completenessDisplayScore = useMemo(() => {
-        const coverage = Number(reportData?.analysis?.completeness?.coverage);
-        if (Number.isFinite(coverage)) {
-            return coverage;
+    const syncScoreDisplaySettings = useCallback(async () => {
+        try {
+            const controller = new AbortController();
+            const timer = window.setTimeout(() => controller.abort(), 6000);
+            try {
+                const res = await fetch(`${API_HOST}/api/report-display`, { signal: controller.signal });
+                if (res.ok) {
+                    const data = await res.json();
+                    const parsed = parseReportDisplayPayload((data as { report_display?: unknown }).report_display);
+                    setScoreViewMode(parsed.mode);
+                    setGradeThresholds(parsed.thresholds);
+                    try {
+                        window.localStorage.setItem(SCORE_VIEW_MODE_STORAGE_KEY, parsed.mode);
+                        window.localStorage.setItem(GRADE_THRESHOLDS_STORAGE_KEY, JSON.stringify(parsed.thresholds));
+                    } catch {
+                        // Storage write is optional; backend config is the source of truth.
+                    }
+                    return;
+                }
+            } finally {
+                window.clearTimeout(timer);
+            }
+        } catch {
+            // Fallback to local storage if backend is temporarily unavailable.
         }
-        return Number(reportData?.scores?.completeness_100 || 0);
+        setScoreViewMode(readScoreViewModeFromStorage());
+        setGradeThresholds(readGradeThresholdsFromStorage());
+    }, []);
+
+    useEffect(() => {
+        void syncScoreDisplaySettings();
+        const handleStorage = (event: StorageEvent) => {
+            if (!event.key || event.key === SCORE_VIEW_MODE_STORAGE_KEY || event.key === GRADE_THRESHOLDS_STORAGE_KEY) {
+                void syncScoreDisplaySettings();
+            }
+        };
+        const handlePreferencesUpdated = () => {
+            void syncScoreDisplaySettings();
+        };
+        window.addEventListener('storage', handleStorage);
+        window.addEventListener('score-report-settings-updated', handlePreferencesUpdated);
+        return () => {
+            window.removeEventListener('storage', handleStorage);
+            window.removeEventListener('score-report-settings-updated', handlePreferencesUpdated);
+        };
+    }, [syncScoreDisplaySettings]);
+
+    useEffect(() => {
+        if (!selectedReportId) return;
+        void syncScoreDisplaySettings();
+    }, [selectedReportId, syncScoreDisplaySettings]);
+
+    const readingDisplayWords = useMemo(() => {
+        const scriptText = String(reportData?.script_text || '');
+        const missingIndices = Array.isArray(reportData?.analysis?.missing_indices) ? reportData.analysis.missing_indices : [];
+        return buildScriptAnchoredWords(scriptText, displayWords, missingIndices);
+    }, [reportData, displayWords]);
+
+    const completenessDisplayScore = useMemo(() => {
+        const score = Number(reportData?.scores?.completeness_100);
+        if (Number.isFinite(score)) {
+            return score;
+        }
+        const coverage = Number(reportData?.analysis?.completeness?.coverage);
+        return Number.isFinite(coverage) ? coverage : 0;
+    }, [reportData]);
+
+    const completenessScriptMap = useMemo(() => {
+        const scriptText = String(reportData?.script_text || '');
+        const missingIndices = Array.isArray(reportData?.analysis?.missing_indices) ? reportData.analysis.missing_indices : [];
+        if (!scriptText.trim()) return [] as Array<{ word: string; missing: boolean }>;
+
+        const scriptTokens = scriptText.match(/[A-Za-z']+/g) || [];
+
+        const missingIndexSet = new Set<number>();
+        missingIndices.forEach((raw) => {
+            const idx = Number(raw);
+            if (Number.isInteger(idx) && idx >= 0 && idx < scriptTokens.length) {
+                missingIndexSet.add(idx);
+            }
+        });
+
+        return scriptTokens.map((word, idx) => ({ word, missing: missingIndexSet.has(idx) }));
+    }, [reportData]);
+
+    const feedbackSourceTag = useMemo(() => {
+        const rawTag = String(reportData?.engine_raw?.feedback_source_tag || '').trim().toLowerCase();
+        if (rawTag === 'ge' || rawTag === 'az') return rawTag;
+        const source = String(reportData?.engine_raw?.source || '').toLowerCase();
+        const annotationSource = String(reportData?.engine_raw?.annotation_source || '').toLowerCase();
+        if (source.includes('gemini')) return 'ge';
+        if (source.includes('azure')) return annotationSource === 'gemini' ? 'ge' : 'az';
+        return '';
+    }, [reportData]);
+
+    const isAzureSource = useMemo(() => {
+        const source = String(reportData?.engine_raw?.source || '').toLowerCase();
+        return source.includes('azure');
+    }, [reportData]);
+
+    const lowFactorWordSet = useMemo(() => {
+        const set = new Set<string>();
+        const phonemes = reportData?.alignment?.phonemes;
+        if (Array.isArray(phonemes)) {
+            phonemes.forEach((ph) => {
+                if (!ph || typeof ph !== 'object') return;
+                const score = Number(ph.score ?? 100);
+                if (!Number.isFinite(score) || score >= 50) return;
+                const token = normalizeWordToken(String(ph.in_word || ''));
+                if (token) set.add(token);
+            });
+        }
+        const mistakes = reportData?.analysis?.mistakes;
+        if (!Array.isArray(mistakes)) return set;
+        mistakes.forEach((item) => {
+            if (!item || typeof item !== 'object') return;
+            const type = String((item as { type?: unknown }).type || '').toLowerCase();
+            const score = Number((item as { score?: unknown }).score);
+            if (type !== 'accuracy' || !Number.isFinite(score) || score >= 50) return;
+            const token = normalizeWordToken(String((item as { word?: unknown }).word || (item as { target?: unknown }).target || ''));
+            if (token) set.add(token);
+        });
+        return set;
     }, [reportData]);
 
     useEffect(() => {
@@ -435,7 +739,7 @@ export default function ReportBuilder() {
     const resetToDefault = () => setSelectedModules(AVAILABLE_MODULES.filter(m => m.isDefault).map(m => m.id));
     const handlePrint = useCallback(() => window.print(), []);
 
-    // 截图功能 - 使用另存为对话框
+    // 鎴浘鍔熻兘 - 浣跨敤鍙﹀瓨涓哄璇濇
     const handleCapture = async () => {
         if (!reportRef.current || !reportData) return;
         setActionNotice(null);
@@ -607,7 +911,7 @@ export default function ReportBuilder() {
         }
     };
 
-    // 切换单个选择
+    // 鍒囨崲鍗曚釜閫夋嫨
     const toggleReportSelection = (id: string) => {
         const newSet = new Set(selectedReportIds);
         if (newSet.has(id)) {
@@ -616,6 +920,19 @@ export default function ReportBuilder() {
             newSet.add(id);
         }
         setSelectedReportIds(newSet);
+    };
+
+    const getDisplayTag = (word: ReportData['alignment']['words'][number]): string => {
+        const tag = String(word?.tag || '').toLowerCase();
+        const score = Number(word?.score ?? 100);
+        const token = normalizeWordToken(String(word?.word || ''));
+        if (isAzureSource && tag === 'ok' && Number.isFinite(score) && score < 50) {
+            return 'weak';
+        }
+        if (isAzureSource && tag === 'ok' && token && lowFactorWordSet.has(token)) {
+            return 'weak';
+        }
+        return tag;
     };
 
     const getTagColor = (tag: string) => {
@@ -627,21 +944,14 @@ export default function ReportBuilder() {
         }
     };
 
-    const getLevelLabel = (score: number) => {
-        if (score >= 90) return { label: 'Native Like', color: '#A855F7' };
-        if (score >= 80) return { label: 'Advanced', color: '#22C55E' };
-        if (score >= 60) return { label: 'High-Intermediate', color: '#3B82F6' };
-        return { label: 'Beginner', color: '#EF4444' };
-    };
-
     return (
         <div className="min-h-screen bg-[#0a0a0a] pt-20">
             <div className="max-w-7xl mx-auto px-4 py-8 flex gap-6">
-                {/* 左侧模块选择器 */}
+                {/* 宸︿晶妯″潡閫夋嫨鍣?*/}
                 <div className="w-72 shrink-0 print:hidden">
                     <div className="bg-[#1e1e24] border border-white/10 rounded-2xl p-5 sticky top-24">
                         <h2 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
-                            <span className="text-2xl">📦</span> 可用模块
+                            <span className="text-2xl">🧩</span> 可用模块
                         </h2>
                         <p className="text-xs text-gray-500 mb-4">点击 + 或拖拽添加模块</p>
 
@@ -684,9 +994,9 @@ export default function ReportBuilder() {
                     </div>
                 </div>
 
-                {/* 右侧报告预览 */}
+                {/* 鍙充晶鎶ュ憡棰勮 */}
                 <div className="flex-1">
-                    {/* 工具栏 */}
+                    {/* 宸ュ叿鏍?*/}
                     <div className="flex flex-col gap-4 mb-6 print:hidden">
                         {actionNotice && (
                             <div className={`rounded-xl border px-3 py-2 text-sm ${
@@ -702,7 +1012,7 @@ export default function ReportBuilder() {
                         <div className="flex items-center justify-between">
                             <div className="flex items-center gap-4">
                                 <h1 className="text-2xl font-bold text-white flex items-center gap-3">
-                                    <span className="text-3xl">📋</span> 报告生成器
+                                    <span className="text-3xl">🧾</span> 报告生成器
                                 </h1>
                                 <select
                                     value={selectedReportId || ''}
@@ -738,10 +1048,10 @@ export default function ReportBuilder() {
                             </div>
                         </div>
 
-                        {/* 批量操作区 */}
+                        {/* 鎵归噺鎿嶄綔鍖?*/}
                         <div className="bg-[#1e1e24] border border-white/10 rounded-xl p-4">
                             <div className="flex items-center gap-4">
-                                {/* 下拉选择器 */}
+                                {/* 涓嬫媺閫夋嫨鍣?*/}
                                 <div className="relative flex-1">
                                     <div className="flex items-center gap-2">
                                         <button
@@ -757,7 +1067,7 @@ export default function ReportBuilder() {
                                         <span className="text-sm text-gray-500">已选 {selectedReportIds.size}/{reports.length}</span>
                                     </div>
 
-                                    {/* 勾选列表 */}
+                                    {/* 鍕鹃€夊垪琛?*/}
                                     <div className="mt-3 max-h-32 overflow-y-auto scrollbar-thin scrollbar-track-gray-800 scrollbar-thumb-gray-600">
                                         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2">
                                             {reports.map(r => (
@@ -783,7 +1093,7 @@ export default function ReportBuilder() {
                                     </div>
                                 </div>
 
-                                {/* 批量生成按钮 */}
+                                {/* 鎵归噺鐢熸垚鎸夐挳 */}
                                 <button
                                     onClick={handleBatchGenerate}
                                     disabled={selectedReportIds.size === 0 || isCapturing}
@@ -803,7 +1113,7 @@ export default function ReportBuilder() {
                                 </button>
                             </div>
 
-                            {/* 进度条 */}
+                            {/* 杩涘害鏉?*/}
                             {batchProgress.total > 0 && (
                                 <div className="mt-3">
                                     <div className="flex justify-between text-xs text-gray-400 mb-1">
@@ -821,7 +1131,7 @@ export default function ReportBuilder() {
                         </div>
                     </div>
 
-                    {/* A4 预览区 */}
+                    {/* A4 棰勮鍖?*/}
                     <div
                         ref={reportRef}
                         onDragOver={handleDragOver}
@@ -838,7 +1148,7 @@ export default function ReportBuilder() {
                             </div>
                         ) : (
                             <div className="text-gray-800 space-y-4">
-                                {/* 报告头部 */}
+                                {/* 鎶ュ憡澶撮儴 */}
                                 <div className="report-header text-center pb-3 border-b-2 border-gray-200">
                                     <h1 className="text-xl font-bold text-gray-900">英语朗读评测报告</h1>
                                     <div className="flex justify-center gap-8 mt-1 text-sm text-gray-600">
@@ -847,7 +1157,7 @@ export default function ReportBuilder() {
                                     </div>
                                 </div>
 
-                                {/* 模块渲染 */}
+                                {/* 妯″潡娓叉煋 */}
                                 {selectedModules.map(moduleId => (
                                     <div
                                         key={moduleId}
@@ -860,16 +1170,18 @@ export default function ReportBuilder() {
                                             <X className="w-3 h-3" />
                                         </button>
 
-                                        {/* 总分概览 */}
+                                        {/* 鎬诲垎姒傝 */}
                                         {moduleId === 'score_overview' && (
                                             <div className="border border-gray-200 rounded-lg p-4">
-                                                <h3 className="text-base font-bold mb-3">📊 总分概览</h3>
+                                                <div className="flex items-center justify-between mb-3">
+                                                    <h3 className="text-base font-bold">📊 总分概览</h3>
+                                                </div>
                                                 <div className="flex items-center gap-6">
                                                     <div className="relative w-20 h-20">
                                                         <svg className="w-full h-full transform -rotate-90">
                                                             <circle cx="40" cy="40" r="35" stroke="#E5E7EB" strokeWidth="6" fill="none" />
                                                             <circle cx="40" cy="40" r="35"
-                                                                stroke={getLevelLabel(reportData.scores.overall_100).color}
+                                                                stroke={getGradeInfo(reportData.scores.overall_100, gradeThresholds).color}
                                                                 strokeWidth="6" fill="none"
                                                                 strokeDasharray={2 * Math.PI * 35}
                                                                 strokeDashoffset={2 * Math.PI * 35 * (1 - reportData.scores.overall_100 / 100)}
@@ -877,8 +1189,13 @@ export default function ReportBuilder() {
                                                             />
                                                         </svg>
                                                         <div className="absolute inset-0 flex items-center justify-center">
-                                                            <span className="text-xl font-bold" style={{ color: getLevelLabel(reportData.scores.overall_100).color }}>
-                                                                {Math.round(reportData.scores.overall_100)}
+                                                            <span
+                                                                className={`${scoreViewMode === 'grade' ? 'text-lg' : 'text-xl'} font-bold`}
+                                                                style={{ color: getGradeInfo(reportData.scores.overall_100, gradeThresholds).color }}
+                                                            >
+                                                                {scoreViewMode === 'grade'
+                                                                    ? getGradeInfo(reportData.scores.overall_100, gradeThresholds).label
+                                                                    : Math.round(reportData.scores.overall_100)}
                                                             </span>
                                                         </div>
                                                     </div>
@@ -886,11 +1203,16 @@ export default function ReportBuilder() {
                                                         {[
                                                             { label: '发音', score: reportData.scores.pronunciation_100, color: '#3B82F6' },
                                                             { label: '语调', score: reportData.scores.intonation_100, color: '#22C55E' },
-                                                            { label: '流利度', score: reportData.scores.fluency_100, color: '#F59E0B' },
-                                                            { label: '完整度', score: completenessDisplayScore, color: '#A855F7' },
+                                                            { label: 'Fluency', score: reportData.scores.fluency_100, color: '#F59E0B' },
+                                                            { label: 'Completeness', score: completenessDisplayScore, color: '#A855F7' },
                                                         ].map(item => (
                                                             <div key={item.label} className="p-2 border rounded text-center" style={{ borderColor: item.color + '40' }}>
-                                                                <div className="text-lg font-bold" style={{ color: item.color }}>{Math.round(item.score)}</div>
+                                                                <div
+                                                                    className="text-lg font-bold"
+                                                                    style={{ color: scoreViewMode === 'grade' ? getGradeInfo(item.score, gradeThresholds).color : item.color }}
+                                                                >
+                                                                    {scoreViewMode === 'grade' ? getGradeInfo(item.score, gradeThresholds).label : Math.round(item.score)}
+                                                                </div>
                                                                 <div className="text-xs text-gray-500">{item.label}</div>
                                                             </div>
                                                         ))}
@@ -899,14 +1221,18 @@ export default function ReportBuilder() {
                                             </div>
                                         )}
 
-                                        {/* 朗读对照 */}
+                                        {/* 鏈楄瀵圭収 */}
                                         {moduleId === 'text_highlight' && (
                                             <div className="border border-gray-200 rounded-lg p-4">
-                                                <h3 className="text-base font-bold mb-2">📖 朗读对照</h3>
+                                                <h3 className="text-base font-bold mb-2">📉 朗读对照</h3>
                                                 <div className="flex flex-wrap gap-1 leading-loose text-sm">
-                                                    {displayWords.map((word, idx) => (
-                                                        <span key={idx} style={{ color: getTagColor(word.tag) }} className="font-medium">
-                                                            {word.word}
+                                                    {readingDisplayWords.map((word, idx) => (
+                                                        <span
+                                                            key={idx}
+                                                            style={{ color: isMergedPunctuationToken(word.word) ? '#1F2937' : getTagColor(getDisplayTag(word)) }}
+                                                            className="font-medium"
+                                                        >
+                                                            {normalizeDisplayWord(word.word)}
                                                         </span>
                                                     ))}
                                                 </div>
@@ -918,7 +1244,7 @@ export default function ReportBuilder() {
                                             </div>
                                         )}
 
-                                        {/* 核心发音诊断 */}
+                                        {/* 鏍稿績鍙戦煶璇婃柇 */}
                                         {moduleId === 'pronunciation_diagnosis' && (
                                             <div className="border border-gray-200 rounded-lg p-4">
                                                 <h3 className="text-base font-bold mb-2">🎯 核心发音诊断</h3>
@@ -946,15 +1272,22 @@ export default function ReportBuilder() {
                                                         )}
                                                     </div>
                                                 ) : (
-                                                    <div className="text-green-600 text-sm">✓ 发音整体良好！</div>
+                                                    <div className="text-green-600 text-sm">发音整体良好。</div>
                                                 )}
                                             </div>
                                         )}
 
-                                        {/* 综合反馈 */}
+                                        {/* 缁煎悎鍙嶉 */}
                                         {moduleId === 'ai_feedback' && reportData.engine_raw?.integrated_feedback && (
                                             <div className="border border-gray-200 rounded-lg p-4">
-                                                <h3 className="text-base font-bold mb-2">👩‍🏫 综合反馈</h3>
+                                                <h3 className="text-base font-bold mb-2 flex items-center gap-2">
+                                                    <span>👩‍🏫 综合反馈</span>
+                                                    {feedbackSourceTag && (
+                                                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded border border-gray-300 text-gray-600 uppercase">
+                                                            {feedbackSourceTag}
+                                                        </span>
+                                                    )}
+                                                </h3>
                                                 <div className="text-sm text-gray-700 mb-2">
                                                     {reportData.engine_raw.integrated_feedback.overall_comment}
                                                 </div>
@@ -973,9 +1306,9 @@ export default function ReportBuilder() {
                                             </div>
                                         )}
 
-                                        {/* 流利度分析 */}
+                                        {/* 娴佸埄搴﹀垎鏋?*/}
                                         {moduleId === 'fluency_analysis' && (() => {
-                                            // 计算停顿统计
+                                            // 璁＄畻鍋滈】缁熻
                                             const pauseWords = displayWords.filter(w => w.pause);
                                             const badPauses = pauseWords.filter(w => w.pause?.type === 'bad');
                                             const goodPauses = pauseWords.filter(w => w.pause?.type === 'good');
@@ -987,24 +1320,19 @@ export default function ReportBuilder() {
                                             const paceSub = Number(fluencyComponents.pace_score);
                                             const hesitationSub = Number(fluencyComponents.hesitation_score);
 
-                                            // 停顿符号渲染
+                                            // 鍋滈】绗﹀彿娓叉煋
                                             const renderPauseMarker = (pause: { type: string; duration: number }) => {
-                                                if (pause.type === 'good') {
-                                                    return <span className="mx-1 text-green-500 text-lg">●</span>;
-                                                } else if (pause.type === 'optional') {
-                                                    return <span className="mx-1 text-gray-400 text-sm">●</span>;
-                                                } else if (pause.type === 'bad') {
-                                                    return <span className="mx-1 text-red-500 font-bold">‖</span>;
-                                                } else if (pause.type === 'missed') {
-                                                    if (lowConfidenceTimeline) return null;
-                                                    return <span className="mx-1 text-red-400 text-xs">▲</span>;
-                                                }
-                                                return null;
+                                                if (pause.type !== 'bad') return null;
+                                                return (
+                                                    <span className="mx-1 inline-flex items-center rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] font-semibold text-red-700">
+                                                        Long Pause
+                                                    </span>
+                                                );
                                             };
 
                                             return (
                                                 <div className="border border-gray-200 rounded-lg p-4">
-                                                    {/* 头部：分数 + 图例 */}
+                                                    {/* 澶撮儴锛氬垎鏁?+ 鍥句緥 */}
                                                     <div className="flex items-center justify-between mb-4">
                                                         <h3 className="text-base font-bold flex items-center gap-2">
                                                             〰️ 流利度分析
@@ -1012,22 +1340,11 @@ export default function ReportBuilder() {
                                                         </h3>
                                                         <div className="flex gap-4 text-xs text-gray-600">
                                                             <span className="flex items-center gap-1">
-                                                                <span className="text-green-500 text-lg">●</span> 合理停顿
+                                                                <span className="inline-flex items-center rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] font-semibold text-red-700">Long Pause</span>
+                                                                <span>停顿过长</span>
                                                             </span>
-                                                            <span className="flex items-center gap-1">
-                                                                <span className="text-gray-400">●</span> 可选停顿
-                                                            </span>
-                                                            <span className="flex items-center gap-1">
-                                                                <span className="text-red-500 font-bold">‖</span> 不当卡顿
-                                                            </span>
-                                                            {!lowConfidenceTimeline && (
-                                                                <span className="flex items-center gap-1" title="Missing break">
-                                                                    <span className="inline-flex items-center justify-center h-4 min-w-4 px-1 rounded border border-red-200 bg-red-50 text-[10px] font-bold text-red-500">MB</span>
-                                                                </span>
-                                                            )}
                                                         </div>
                                                     </div>
-
                                                     {lowConfidenceTimeline && (
                                                         <div className="mb-3 text-xs text-slate-500">
                                                             时间轴置信度较低，已隐藏 Missing break 标记。
@@ -1049,17 +1366,17 @@ export default function ReportBuilder() {
                                                         </div>
                                                     </div>
 
-                                                    {/* 朗读文本 + 停顿标记 */}
+                                                    {/* 鏈楄鏂囨湰 + 鍋滈】鏍囪 */}
                                                     <div className="bg-gray-50 rounded-lg p-4 mb-4 leading-loose text-base">
                                                         {displayWords.map((word, idx) => (
                                                             <span key={idx}>
-                                                                <span className="text-gray-800">{word.word} </span>
+                                                                <span className="text-gray-800">{normalizeDisplayWord(word.word)} </span>
                                                                 {word.pause && renderPauseMarker(word.pause)}
                                                             </span>
                                                         ))}
                                                     </div>
 
-                                                    {/* 数据统计条 */}
+                                                    {/* 鏁版嵁缁熻鏉?*/}
                                                     <div className="grid grid-cols-4 gap-3 text-center">
                                                         <div className="bg-blue-50 rounded-lg py-2">
                                                             <div className="text-lg font-bold text-blue-600">{Math.round(wpm)}</div>
@@ -1071,7 +1388,7 @@ export default function ReportBuilder() {
                                                         </div>
                                                         <div className="bg-red-50 rounded-lg py-2">
                                                             <div className="text-lg font-bold text-red-600">{badPauses.length}</div>
-                                                            <div className="text-xs text-gray-500">不当卡顿</div>
+                                                            <div className="text-xs text-gray-500">不当停顿</div>
                                                         </div>
                                                         <div className="bg-purple-50 rounded-lg py-2">
                                                             <div className="text-lg font-bold text-purple-600">{formatScoreCompact(totalPauseDuration)}s</div>
@@ -1079,10 +1396,10 @@ export default function ReportBuilder() {
                                                         </div>
                                                     </div>
 
-                                                    {/* 问题词提示 */}
+                                                    {/* 闂璇嶆彁绀?*/}
                                                     {badPauses.length > 0 && (
                                                         <div className="mt-3 p-2 bg-red-50 rounded-lg text-sm text-red-700">
-                                                            ⚠️ 卡顿位置: {badPauses.slice(0, 5).map(w => `"${w.word}"`).join('、')}
+                                                            卡顿位置: {badPauses.slice(0, 5).map(w => `"${normalizeDisplayWord(w.word)}"`).join('、')}
                                                             {badPauses.length > 5 && ` 等${badPauses.length}处`}
                                                         </div>
                                                     )}
@@ -1090,7 +1407,7 @@ export default function ReportBuilder() {
                                             );
                                         })()}
 
-                                        {/* 韵律分析 - 弹跳球可视化 */}
+                                        {/* 闊靛緥鍒嗘瀽 - 寮硅烦鐞冨彲瑙嗗寲 */}
                                         {moduleId === 'intonation_analysis' && (() => {
                                             const intonationRaw = reportData.analysis.intonation_analysis;
                                             const hasStructuredIntonation = Boolean(
@@ -1101,12 +1418,12 @@ export default function ReportBuilder() {
                                                 : deriveIntonationFallback(displayWords);
                                             const intonationScore = reportData.scores.intonation_100;
 
-                                            // 渲染弹跳球句子
+                                            // 娓叉煋寮硅烦鐞冨彞瀛?
                                             const renderBouncingBalls = (words: Array<{ word: string; is_stressed: boolean; stress_correct: boolean }>) => (
                                                 <div className="flex flex-wrap items-end gap-1 py-2">
                                                     {words.map((w, i) => (
                                                         <div key={i} className="flex flex-col items-center">
-                                                            {/* 球 */}
+                                                            {/* 鐞?*/}
                                                             <div
                                                                 className={`rounded-full transition-all ${w.is_stressed
                                                                     ? w.stress_correct
@@ -1118,7 +1435,7 @@ export default function ReportBuilder() {
                                                                     transform: w.is_stressed ? 'translateY(-8px)' : 'translateY(0)',
                                                                 }}
                                                             />
-                                                            {/* 单词 */}
+                                                            {/* 鍗曡瘝 */}
                                                             <span className={`text-sm ${w.is_stressed
                                                                 ? w.stress_correct ? 'font-bold text-green-700' : 'font-bold text-red-600'
                                                                 : 'text-gray-600'
@@ -1132,35 +1449,34 @@ export default function ReportBuilder() {
 
                                             return (
                                                 <div className="border border-gray-200 rounded-lg p-4">
-                                                    {/* 头部 */}
+                                                    {/* 澶撮儴 */}
                                                     <div className="flex items-center justify-between mb-4">
                                                         <h3 className="text-base font-bold flex items-center gap-2">
-                                                            🗣️ 韵律分析
+                                                            🗣️ 语调分析
                                                             <span className="text-2xl font-bold text-purple-500">{formatScoreCompact(intonationScore)}%</span>
                                                         </h3>
                                                         <div className="flex gap-4 text-xs text-gray-600">
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-3 h-3 rounded-full bg-green-500"></span> 重读正确
+                                                                <span className="w-3 h-3 rounded-full bg-green-500"></span> Correct stress
                                                             </span>
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-3 h-3 rounded-full bg-red-500"></span> 重读错误
+                                                                <span className="w-3 h-3 rounded-full bg-red-500"></span> Incorrect stress
                                                             </span>
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-2 h-2 rounded-full bg-gray-400"></span> 非重读
+                                                                <span className="w-2 h-2 rounded-full bg-gray-400"></span> Unstressed
                                                             </span>
                                                         </div>
                                                     </div>
-
                                                     {intonation?.best_sentence ? (
                                                         <div className="space-y-4">
-                                                            {/* 最佳句子 */}
+                                                            {/* 鏈€浣冲彞瀛?*/}
                                                             <div className="bg-green-50 rounded-lg p-3">
-                                                                <div className="text-xs text-green-600 font-medium mb-2">✨ 最佳句子 (重读准确率 {intonation.best_sentence.stress_accuracy.toFixed(0)}%)</div>
+                                                                <div className="text-xs text-green-600 font-medium mb-2">✅ 最佳句子（重读准确率 {intonation.best_sentence.stress_accuracy.toFixed(0)}%）</div>
                                                                 {renderBouncingBalls(intonation.best_sentence.words)}
                                                                 <div className="text-xs text-gray-500 mt-2">{intonation.best_sentence.tip}</div>
                                                             </div>
 
-                                                            {/* 需改进句子 */}
+                                                            {/* 闇€鏀硅繘鍙ュ瓙 */}
                                                             {intonation.problem_sentences?.slice(0, 2).map((ps, idx) => (
                                                                 <div key={idx} className="bg-yellow-50 rounded-lg p-3">
                                                                     <div className="flex items-center justify-between mb-2">
@@ -1173,13 +1489,13 @@ export default function ReportBuilder() {
                                                             ))}
                                                         </div>
                                                     ) : (
-                                                        <div className="text-gray-500 text-sm">暂无可分析的语调数据（请检查音频清晰度或重新识别）。</div>
+                                                        <div className="text-gray-500 text-sm">暂无可分析的语调数据（请检查音频清晰度后重试）。</div>
                                                     )}
                                                 </div>
                                             );
                                         })()}
 
-                                        {/* 完整度分析 */}
+                                        {/* 瀹屾暣搴﹀垎鏋?*/}
                                         {moduleId === 'completeness' && (
                                             <div className="border border-gray-200 rounded-lg p-4">
                                                 <h3 className="text-base font-bold mb-2">📝 完整度分析</h3>
@@ -1193,17 +1509,32 @@ export default function ReportBuilder() {
                                                                 </span>
                                                             ))}
                                                         </div>
+                                                        {completenessScriptMap.length > 0 && (
+                                                            <div className="mt-3 p-3 bg-gray-50 rounded-lg">
+                                                                <div className="text-xs text-gray-500 mb-1">漏词位置（脚本文本）</div>
+                                                                <div className="flex flex-wrap gap-1 leading-relaxed">
+                                                                    {completenessScriptMap.map((item, idx) => (
+                                                                        <span
+                                                                            key={idx}
+                                                                            className={item.missing ? 'bg-red-100 text-red-700 px-1 rounded font-semibold' : 'text-gray-700'}
+                                                                        >
+                                                                            {item.word}
+                                                                        </span>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 ) : (
-                                                    <div className="text-green-600 text-sm">✓ 朗读完整，无漏读词汇</div>
+                                                    <div className="text-green-600 text-sm">✅ 朗读完整，无漏读词汇</div>
                                                 )}
                                             </div>
                                         )}
 
-                                        {/* 迟疑分析 */}
+                                        {/* 杩熺枒鍒嗘瀽 */}
                                         {moduleId === 'hesitation' && (
                                             <div className="border border-gray-200 rounded-lg p-4">
-                                                <h3 className="text-base font-bold mb-2">⚡ 迟疑分析</h3>
+                                                <h3 className="text-base font-bold mb-2">⏱️ 迟疑分析</h3>
                                                 {reportData.analysis.hesitations ? (
                                                     <div className="grid grid-cols-3 gap-2 text-center">
                                                         <div className="p-2 bg-gray-50 rounded">
@@ -1220,7 +1551,7 @@ export default function ReportBuilder() {
                                                         </div>
                                                     </div>
                                                 ) : (
-                                                    <div className="text-green-600 text-sm">✓ 流利朗读，无明显迟疑</div>
+                                                    <div className="text-green-600 text-sm">✅ 流利朗读，无明显迟疑</div>
                                                 )}
                                             </div>
                                         )}
@@ -1410,3 +1741,6 @@ export default function ReportBuilder() {
         </div>
     );
 }
+
+
+

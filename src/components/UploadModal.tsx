@@ -62,7 +62,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
     const STUCK_WAIT_MS = 5 * 60 * 1000;
     const DELETE_REQUEST_TIMEOUT_MS = 15000;
     const UPLOAD_REQUEST_TIMEOUT_MS = 60000;
-    const JOB_POLL_REQUEST_TIMEOUT_MS = 15000;
+    const JOB_POLL_REQUEST_TIMEOUT_MS = 25000;
     const [maxUploadSizeMB, setMaxUploadSizeMB] = useState(30);
     const maxUploadSizeBytes = maxUploadSizeMB * 1024 * 1024;
     const ALLOWED_AUDIO_EXTENSIONS = new Set([
@@ -83,7 +83,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
     const [queue, setQueue] = useState<QueueItem[]>([]);
     const [text, setText] = useState(() => localStorage.getItem("reference_text") || "");
     const [preheatText, setPreheatText] = useState(() => localStorage.getItem("reference_preheat_text") || "");
-    const [engineMode, setEngineMode] = useState<'auto' | 'pro'>('auto');
+    const [engineMode, setEngineMode] = useState<'auto' | 'pro'>('pro');
     const [isEditingPreheat, setIsEditingPreheat] = useState(false);
     const [isPreheating, setIsPreheating] = useState(false);
     const [preheatLastUpdated, setPreheatLastUpdated] = useState("");
@@ -776,7 +776,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
             let transientFailureCount = 0;
             const MAX_TRANSIENT_FAILURES = 30; // ~60s with 2s interval
             const isTransientMessage = (message: string) =>
-                /failed to fetch|networkerror|bad gateway|temporarily unavailable|unexpected token|transient:/i.test(message);
+                /failed to fetch|networkerror|bad gateway|temporarily unavailable|unexpected token|transient:|timeout|timed out|abort|aborted/i.test(message);
 
             const poll = async () => {
                 try {
@@ -791,7 +791,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                             return;
                         }
                         const detail = statusData?.detail || statusRes.statusText || '';
-                        const isTransientHttp = [502, 503, 504].includes(statusRes.status);
+                        const isTransientHttp = [408, 429, 502, 503, 504].includes(statusRes.status);
                         if (isTransientHttp) {
                             throw new Error(`TRANSIENT:${statusRes.status}:${detail}`);
                         }
@@ -824,9 +824,14 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                         setQueue(prev => {
                             const copy = [...prev];
                             if (copy[index]) {
+                                const nextStatus = jobData.status;
+                                const wasProcessing = copy[index].status === 'processing';
                                 copy[index] = {
                                     ...copy[index],
-                                    status: jobData.status, // "queued" or "processing"
+                                    status: nextStatus, // "queued" or "processing"
+                                    startedAt: (nextStatus === 'processing' && !wasProcessing)
+                                        ? Date.now()
+                                        : copy[index].startedAt,
                                     error: undefined,
                                 };
                             }
@@ -908,7 +913,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
 
         setStats({ completed: 0, total: pendingIndices.length });
 
-        const CONCURRENCY_LIMIT = 4;
+        const CONCURRENCY_LIMIT = 2;
         let activeCount = 0;
         let nextPendingRefIndex = 0; // index in the pendingIndices array
         let completedCount = 0;
@@ -1189,12 +1194,12 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
     const failedCount = queue.filter(item => item.status === 'error').length;
     const activeCount = queue.filter(item => item.status === 'queued' || item.status === 'processing').length;
     const longWaitingCount = queue.filter(item => {
-        const isActive = item.status === 'queued' || item.status === 'processing';
-        return isActive && typeof item.startedAt === 'number' && (tickNow - item.startedAt) >= LONG_WAIT_MS;
+        const isProcessing = item.status === 'processing';
+        return isProcessing && typeof item.startedAt === 'number' && (tickNow - item.startedAt) >= LONG_WAIT_MS;
     }).length;
     const stuckCount = queue.filter(item => {
-        const isActive = item.status === 'queued' || item.status === 'processing';
-        return isActive && typeof item.startedAt === 'number' && (tickNow - item.startedAt) >= STUCK_WAIT_MS;
+        const isProcessing = item.status === 'processing';
+        return isProcessing && typeof item.startedAt === 'number' && (tickNow - item.startedAt) >= STUCK_WAIT_MS;
     }).length;
     const retryableFailedCount = queue.filter(item => item.status === 'error' && item.file instanceof File).length;
     const failedKeywordOptions: Array<{ key: FailedKeywordFilter; label: string }> = [
@@ -1304,16 +1309,18 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
     if (!isOpen) return null;
 
     return (
-        <div className={`fixed inset-0 z-[100] flex ${isMobile ? 'items-stretch justify-stretch p-0' : 'items-center justify-center p-4'} bg-black/80 backdrop-blur-sm animate-fade-in`}>
-            <div className={`bg-[#0A0A0B] border border-white/10 ${isMobile ? 'rounded-none border-x-0 border-y-0 h-[100dvh] w-full p-4' : 'rounded-2xl w-full max-w-[min(96vw,1200px)] p-6 max-h-[92vh]'} shadow-2xl relative overflow-hidden flex flex-col`}>
-                <div className="absolute top-0 right-0 w-64 h-64 bg-primary/10 rounded-full blur-[100px] -z-10"></div>
+        <div className={`fixed inset-0 z-[100] flex ${isMobile ? 'items-stretch justify-stretch p-0' : 'items-center justify-center p-4'} bg-slate-950/82 backdrop-blur-md animate-fade-in`}>
+            <div className={`bg-gradient-to-b from-[#0b1326] via-[#0a0f1f] to-[#070b16] border border-cyan-300/20 ${isMobile ? 'rounded-none border-x-0 border-y-0 h-[100dvh] w-full p-4' : 'rounded-2xl w-full max-w-[min(96vw,1200px)] p-6 max-h-[92vh]'} shadow-[0_30px_80px_rgba(2,8,23,0.75)] relative overflow-hidden flex flex-col`}>
+                <div className="pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-r from-cyan-400/12 via-blue-400/14 to-emerald-400/10" />
+                <div className="pointer-events-none absolute -top-24 -left-16 h-64 w-64 rounded-full bg-cyan-400/16 blur-[90px]" />
+                <div className="pointer-events-none absolute top-8 right-0 h-72 w-72 rounded-full bg-primary/14 blur-[110px]" />
 
                 {/* Header */}
                 <div className={`flex ${isMobile ? 'flex-col items-start gap-3' : 'justify-between items-center'} mb-6 shrink-0`}>
                     <div className={`flex ${isMobile ? 'flex-col items-start gap-2' : 'items-center gap-4'}`}>
-                        <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                        <h2 className="text-xl font-extrabold text-cyan-50 flex items-center gap-2 tracking-tight">
                             <Upload className="w-5 h-5 text-primary" />
-                            Batch Upload
+                            Upload Workspace
                         </h2>
                         {isGlobalLoading && (
                             <div className="text-xs font-bold text-primary bg-primary/10 px-3 py-1 rounded-full animate-pulse border border-primary/20">
@@ -1421,7 +1428,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                 {longWaitingCount > 0 && (
                     <div className={`mb-3 shrink-0 rounded-xl border border-amber-300/30 bg-amber-500/10 px-3 py-2 ${isMobile ? 'space-y-2' : 'flex items-center justify-between gap-3'}`}>
                         <div className="text-xs text-amber-100">
-                            {longWaitingCount} active item(s) have been running for over 2 minutes.
+                            {longWaitingCount} processing item(s) have been running for over 2 minutes.
                             {stuckCount > 0 ? ` ${stuckCount} item(s) are over 5 minutes and may be stuck.` : ''}
                             {lastStuckRefreshAt ? ` Last re-check: ${new Date(lastStuckRefreshAt).toLocaleTimeString()}.` : ''}
                         </div>
@@ -1511,47 +1518,51 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
 
                 <div className={`flex-1 overflow-y-auto min-h-0 space-y-6 ${isMobile ? 'pr-0' : 'pr-2'}`}>
                     {/* Step 1: Engine Mode Selection (Moved to Top) */}
-                    <div className="shrink-0 space-y-2">
+                    <div className="shrink-0 space-y-2 rounded-2xl border border-cyan-300/20 bg-slate-900/45 p-3">
                         <div className="flex items-center gap-2">
                             <span className="bg-primary text-background text-xs font-bold px-2 py-0.5 rounded">STEP 1</span>
                             <label className="text-sm font-bold text-gray-300">Select Engine Mode</label>
                         </div>
-                        <div className={`${isMobile ? 'grid grid-cols-1 gap-3' : 'flex gap-4'}`}>
+                        <div className={`${isMobile ? 'grid grid-cols-1 gap-2.5' : 'grid grid-cols-2 gap-3'}`}>
                             <button
                                 onClick={() => setEngineMode('auto')}
-                                className={`flex-1 p-4 rounded-xl border transition-all duration-300 text-left group
-                                    ${engineMode === 'auto' ? 'bg-primary/10 border-primary shadow-lg shadow-primary/5' : 'bg-white/5 border-white/10 hover:border-white/20'}`}
+                                className={`px-3 py-2.5 rounded-xl border transition-all duration-300 text-left group
+                                    ${engineMode === 'auto' ? 'bg-cyan-400/12 border-cyan-300/55 shadow-lg shadow-cyan-400/10' : 'bg-slate-900/55 border-white/12 hover:border-cyan-300/35'}`}
                             >
-                                <div className="flex items-center justify-between mb-2">
-                                    <div className={`p-2 rounded-lg ${engineMode === 'auto' ? 'bg-primary text-black' : 'bg-white/5 text-gray-400'}`}>
-                                        <Zap className="w-5 h-5" />
+                                <div className="flex items-center gap-2.5">
+                                    <div className={`p-1.5 rounded-md ${engineMode === 'auto' ? 'bg-primary text-black' : 'bg-white/5 text-gray-400'}`}>
+                                        <Zap className="w-4 h-4" />
                                     </div>
-                                    {engineMode === 'auto' && <div className="w-2 h-2 bg-primary rounded-full animate-pulse"></div>}
+                                    <div className="min-w-0">
+                                        <h4 className="font-bold text-cyan-50 leading-tight">Free Talk Mode</h4>
+                                        <p className="text-[11px] text-slate-300 mt-0.5 leading-tight">No script. Auto transcription + fluency/pronunciation.</p>
+                                    </div>
+                                    {engineMode === 'auto' && <div className="ml-auto w-2 h-2 bg-primary rounded-full animate-pulse"></div>}
                                 </div>
-                                <h4 className="font-bold text-white">Free Talk Mode</h4>
-                                <p className="text-xs text-gray-500 mt-1">No script required. AI transcribes speech and evaluates fluency and pronunciation.</p>
                             </button>
 
                             <button
                                 onClick={() => setEngineMode('pro')}
-                                className={`flex-1 p-4 rounded-xl border transition-all duration-300 text-left group
-                                    ${engineMode === 'pro' ? 'bg-purple-500/10 border-purple-500 shadow-lg shadow-purple-500/5' : 'bg-white/5 border-white/10 hover:border-white/20'}`}
+                                className={`px-3 py-2.5 rounded-xl border transition-all duration-300 text-left group
+                                    ${engineMode === 'pro' ? 'bg-violet-400/12 border-violet-300/55 shadow-lg shadow-violet-400/10' : 'bg-slate-900/55 border-white/12 hover:border-violet-300/35'}`}
                             >
-                                <div className="flex items-center justify-between mb-2">
-                                    <div className={`p-2 rounded-lg ${engineMode === 'pro' ? 'bg-purple-500 text-white' : 'bg-white/5 text-gray-400'}`}>
-                                        <Code className="w-5 h-5" />
+                                <div className="flex items-center gap-2.5">
+                                    <div className={`p-1.5 rounded-md ${engineMode === 'pro' ? 'bg-purple-500 text-white' : 'bg-white/5 text-gray-400'}`}>
+                                        <Code className="w-4 h-4" />
                                     </div>
-                                    {engineMode === 'pro' && <div className="w-2 h-2 bg-purple-500 rounded-full animate-pulse"></div>}
+                                    <div className="min-w-0">
+                                        <h4 className="font-bold text-violet-100 leading-tight">Reference Mode</h4>
+                                        <p className="text-[11px] text-slate-300 mt-0.5 leading-tight">With script. Word-level alignment and correction.</p>
+                                    </div>
+                                    {engineMode === 'pro' && <div className="ml-auto w-2 h-2 bg-purple-500 rounded-full animate-pulse"></div>}
                                 </div>
-                                <h4 className="font-bold text-white">Reference Mode</h4>
-                                <p className="text-xs text-gray-500 mt-1">Script required. AI provides word-level correction for recitation and reading tasks.</p>
                             </button>
                         </div>
                     </div>
 
                     {/* Step 2: Reference Text (Conditional) */}
                     {engineMode === 'pro' && (
-                        <div className="shrink-0 space-y-2 animate-fade-in-up">
+                        <div className="shrink-0 space-y-3 rounded-2xl border border-amber-300/20 bg-slate-900/45 p-4 animate-fade-in-up">
                             <div className="flex items-center gap-2">
                                 <span className="bg-primary text-background text-xs font-bold px-2 py-0.5 rounded">STEP 2</span>
                                 <label className="text-sm font-bold text-gray-300">Set Reference Text</label>
@@ -1575,7 +1586,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                             <textarea
                                 value={text}
                                 onChange={(e) => setText(e.target.value)}
-                                className="w-full border rounded-xl p-4 text-gray-300 h-32 resize-none placeholder-gray-500 transition-all font-mono text-sm leading-relaxed bg-white/5 border-white/10 focus:outline-none focus:border-primary/50 focus:ring-1 focus:ring-primary/50"
+                                className="w-full border rounded-xl p-4 text-slate-100 h-32 resize-none placeholder-slate-400 transition-all font-mono text-sm leading-relaxed bg-[#0a1325]/80 border-cyan-300/25 focus:outline-none focus:border-cyan-300/55 focus:ring-1 focus:ring-cyan-300/45"
                                 placeholder="Paste script here. Example: Climate change is a long-term shift..."
                             />
                             {preheatStatus.type !== 'idle' && (
@@ -1594,7 +1605,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                         </div>
                     )}
                     {/* Step 3: Upload Area */}
-                    <div className="space-y-2 shrink-0">
+                    <div className="space-y-3 shrink-0 rounded-2xl border border-primary/25 bg-slate-900/45 p-4">
                         <div className="flex items-center gap-2">
                             <span className="text-xs font-bold px-2 py-0.5 rounded transition-colors bg-primary text-background">
                                 STEP {engineMode === 'pro' ? '3' : '2'}
@@ -1603,8 +1614,8 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                         </div>
 
                         <div
-                            className={`border-2 border-dashed rounded-xl p-8 text-center transition-all duration-300 cursor-pointer flex flex-col items-center justify-center gap-4 relative overflow-hidden
-                                ${queue.length > 0 ? 'border-primary/30 bg-primary/5 py-4' : 'border-white/10 hover:border-primary/50 hover:bg-white/5 py-8'}`}
+                            className={`border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300 cursor-pointer flex flex-col items-center justify-center gap-4 relative overflow-hidden
+                                ${queue.length > 0 ? 'border-primary/45 bg-gradient-to-br from-primary/12 via-cyan-400/8 to-transparent py-4' : 'border-cyan-300/28 bg-gradient-to-br from-cyan-400/8 via-primary/10 to-transparent hover:border-cyan-300/55 hover:bg-cyan-400/10 py-8'}`}
                             onDragOver={(e) => {
                                 e.preventDefault();
                                 e.stopPropagation();
@@ -1623,14 +1634,14 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                                 multiple
                                 className="hidden"
                             />
-                            <div className="p-4 bg-white/5 rounded-full ring-1 ring-white/10 shadow-lg">
-                                <Upload className="w-8 h-8 text-gray-400" />
+                            <div className="p-4 bg-cyan-400/12 rounded-full ring-1 ring-cyan-300/35 shadow-lg shadow-cyan-500/10">
+                                <Upload className="w-8 h-8 text-cyan-200" />
                             </div>
                             <div className="space-y-1">
-                                <p className="text-lg font-medium text-white">
-                                    Drop files here to <span className="text-primary font-bold">Auto-Start</span>
+                                <p className="text-lg font-semibold text-cyan-50 tracking-tight">
+                                    Drop files to <span className="text-primary font-extrabold">Auto-Start</span>
                                 </p>
-                                <p className="text-sm text-gray-500">
+                                <p className="text-sm text-slate-300">
                                     {engineMode === 'pro'
                                         ? `WAV/MP3, max ${maxUploadSizeMB}MB each`
                                         : `Auto-dictation enabled, max ${maxUploadSizeMB}MB each`}
@@ -1647,7 +1658,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
 
                     {/* File List */}
                     {queue.length > 0 && (
-                        <div className="space-y-3">
+                        <div className="space-y-3 rounded-2xl border border-white/12 bg-slate-900/45 p-4">
                             <div className="flex items-center justify-between gap-3 px-1">
                                 <label className="block text-xs font-bold text-gray-400 uppercase tracking-wider">
                                     Batch Results ({visibleQueueRows.length})
@@ -1727,11 +1738,11 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
                                             key={idx}
                                             onClick={() => isDone && openReport(item.resultUrl)}
                                             className={`group relative border rounded-xl p-4 flex items-center justify-between transition-all duration-300
-                                                ${isDone ? 'bg-white/5 border-white/10 hover:bg-white/10 hover:border-primary/50 cursor-pointer shadow-lg hover:shadow-primary/5' :
-                                                    isProcessing ? 'bg-primary/5 border-primary/20 cursor-wait' :
-                                                        isQueued ? 'bg-white/5 border-white/5 border-dashed cursor-wait opacity-80' :
-                                                            isError ? 'bg-red-500/5 border-red-500/20 cursor-default' :
-                                                                'bg-white/5 border-white/5 cursor-default opacity-60'}`}
+                                                ${isDone ? 'bg-slate-900/65 border-cyan-300/25 hover:bg-slate-900/85 hover:border-cyan-300/55 cursor-pointer shadow-lg shadow-cyan-900/20' :
+                                                    isProcessing ? 'bg-primary/8 border-primary/30 cursor-wait' :
+                                                        isQueued ? 'bg-slate-900/55 border-white/10 border-dashed cursor-wait opacity-80' :
+                                                            isError ? 'bg-red-500/8 border-red-400/35 cursor-default' :
+                                                                'bg-slate-900/55 border-white/10 cursor-default opacity-60'}`}
                                         >
                                             <div className="flex items-center gap-4 overflow-hidden relative z-10">
                                                 {/* Status Icon / Spinner */}
@@ -1752,7 +1763,7 @@ export default function UploadModal({ isOpen, onClose }: UploadModalProps) {
 
                                                 <div className="min-w-0">
                                                     <div className="flex items-center gap-2">
-                                                        <p className={`text-sm font-bold truncate transition-colors ${isDone ? 'text-white' : 'text-gray-400'}`}>
+                                                        <p className={`text-sm font-bold truncate transition-colors ${isDone ? 'text-cyan-50' : 'text-gray-300'}`}>
                                                             {item.file.name.replace(/\.[^/.]+$/, "")}
                                                         </p>
                                                         {isDone && <span className="bg-green-500/10 text-green-500 text-[10px] font-black px-1.5 py-0.5 rounded border border-green-500/20">READY</span>}

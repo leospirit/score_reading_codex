@@ -30,6 +30,20 @@ interface ConfigState {
     azure: AzureConfig;
 }
 
+type ScoreViewMode = 'score' | 'grade';
+
+type GradeThresholds = {
+    cMin: number;
+    bMin: number;
+    aMin: number;
+    aPlusMin: number;
+};
+
+type ReportDisplaySettings = {
+    scoreViewMode: ScoreViewMode;
+    gradeThresholds: GradeThresholds;
+};
+
 interface ConfirmDialogState {
     title: string;
     message: string;
@@ -39,6 +53,107 @@ interface ConfirmDialogState {
 
 interface ErrorWithStatus extends Error {
     status?: number;
+}
+
+const DEFAULT_GRADE_THRESHOLDS: GradeThresholds = {
+    cMin: 0,
+    bMin: 75,
+    aMin: 85,
+    aPlusMin: 95,
+};
+const SCORE_VIEW_MODE_STORAGE_KEY = 'score_reading.score_view_mode';
+const GRADE_THRESHOLDS_STORAGE_KEY = 'score_reading.grade_thresholds';
+
+function clampInt(value: number, min: number, max: number): number {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function normalizeGradeThresholds(raw: Partial<GradeThresholds>): GradeThresholds {
+    const cMin = clampInt(Number(raw.cMin), 0, 97);
+    const bMin = clampInt(Number(raw.bMin), cMin + 1, 98);
+    const aMin = clampInt(Number(raw.aMin), bMin + 1, 99);
+    const aPlusMin = clampInt(Number(raw.aPlusMin), aMin + 1, 100);
+    return { cMin, bMin, aMin, aPlusMin };
+}
+
+function isLegacyDefaultThresholds(thresholds: GradeThresholds): boolean {
+    return thresholds.cMin === 61 && thresholds.bMin === 71 && thresholds.aMin === 81 && thresholds.aPlusMin === 86;
+}
+
+function readReportDisplaySettings(): ReportDisplaySettings {
+    if (typeof window === 'undefined') {
+        return {
+            scoreViewMode: 'score',
+            gradeThresholds: DEFAULT_GRADE_THRESHOLDS,
+        };
+    }
+    try {
+        const modeRaw = window.localStorage.getItem(SCORE_VIEW_MODE_STORAGE_KEY);
+        const scoreViewMode: ScoreViewMode = modeRaw === 'grade' ? 'grade' : 'score';
+        const thresholdRaw = window.localStorage.getItem(GRADE_THRESHOLDS_STORAGE_KEY);
+        const parsed = thresholdRaw
+            ? normalizeGradeThresholds(JSON.parse(thresholdRaw) as Partial<GradeThresholds>)
+            : DEFAULT_GRADE_THRESHOLDS;
+        const gradeThresholds = isLegacyDefaultThresholds(parsed) ? DEFAULT_GRADE_THRESHOLDS : parsed;
+        return { scoreViewMode, gradeThresholds };
+    } catch {
+        return {
+            scoreViewMode: 'score',
+            gradeThresholds: DEFAULT_GRADE_THRESHOLDS,
+        };
+    }
+}
+
+function persistReportDisplaySettings(settings: ReportDisplaySettings): void {
+    if (typeof window === 'undefined') return;
+    const normalized = {
+        scoreViewMode: settings.scoreViewMode === 'grade' ? 'grade' : 'score',
+        gradeThresholds: normalizeGradeThresholds(settings.gradeThresholds),
+    };
+    window.localStorage.setItem(SCORE_VIEW_MODE_STORAGE_KEY, normalized.scoreViewMode);
+    window.localStorage.setItem(GRADE_THRESHOLDS_STORAGE_KEY, JSON.stringify(normalized.gradeThresholds));
+    window.dispatchEvent(new Event('score-report-settings-updated'));
+}
+
+function parseReportDisplayPayload(raw: unknown): ReportDisplaySettings {
+    if (!raw || typeof raw !== 'object') {
+        return {
+            scoreViewMode: 'score',
+            gradeThresholds: DEFAULT_GRADE_THRESHOLDS,
+        };
+    }
+    const source = raw as {
+        score_view_mode?: unknown;
+        scoreViewMode?: unknown;
+        grade_thresholds?: unknown;
+        gradeThresholds?: unknown;
+    };
+    const scoreViewMode: ScoreViewMode = String(source.score_view_mode ?? source.scoreViewMode ?? '')
+        .trim()
+        .toLowerCase() === 'grade'
+        ? 'grade'
+        : 'score';
+    const thresholdRaw = (source.grade_thresholds ?? source.gradeThresholds ?? {}) as {
+        c_min?: unknown;
+        b_min?: unknown;
+        a_min?: unknown;
+        a_plus_min?: unknown;
+        cMin?: unknown;
+        bMin?: unknown;
+        aMin?: unknown;
+        aPlusMin?: unknown;
+    };
+    const gradeThresholds = normalizeGradeThresholds({
+        cMin: Number(thresholdRaw.c_min ?? thresholdRaw.cMin),
+        bMin: Number(thresholdRaw.b_min ?? thresholdRaw.bMin),
+        aMin: Number(thresholdRaw.a_min ?? thresholdRaw.aMin),
+        aPlusMin: Number(thresholdRaw.a_plus_min ?? thresholdRaw.aPlusMin),
+    });
+    return {
+        scoreViewMode,
+        gradeThresholds: isLegacyDefaultThresholds(gradeThresholds) ? DEFAULT_GRADE_THRESHOLDS : gradeThresholds,
+    };
 }
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
@@ -72,6 +187,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
         },
     });
     const [initialConfig, setInitialConfig] = useState<ConfigState | null>(null);
+    const [reportDisplay, setReportDisplay] = useState<ReportDisplaySettings>(() => readReportDisplaySettings());
+    const [initialReportDisplay, setInitialReportDisplay] = useState<ReportDisplaySettings>(() => readReportDisplaySettings());
     const [playbookText, setPlaybookText] = useState('');
     const [playbookIdea, setPlaybookIdea] = useState('');
     const [playbookAiRefine, setPlaybookAiRefine] = useState(true);
@@ -90,7 +207,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     const { isMobile } = useViewportProfile();
 
     const isBusy = loading || switchingPath || playbookSaving;
-    const hasConfigChanges = React.useMemo(() => {
+    const hasServerConfigChanges = React.useMemo(() => {
         if (!initialConfig) return true;
         const trim = (v: string) => String(v || '').trim();
         const baseChanged =
@@ -106,7 +223,16 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
             || trim(config.azure.api_key).length > 0;
         return baseChanged || keyChanged;
     }, [config, initialConfig]);
-    const canSwitchTechPath = !switchingPath && !loading && !hasConfigChanges;
+    const hasUiPreferenceChanges = React.useMemo(() => {
+        const modeChanged = reportDisplay.scoreViewMode !== initialReportDisplay.scoreViewMode;
+        const thresholdsChanged = ['cMin', 'bMin', 'aMin', 'aPlusMin'].some((key) => {
+            const k = key as keyof GradeThresholds;
+            return reportDisplay.gradeThresholds[k] !== initialReportDisplay.gradeThresholds[k];
+        });
+        return modeChanged || thresholdsChanged;
+    }, [reportDisplay, initialReportDisplay]);
+    const hasConfigChanges = hasServerConfigChanges || hasUiPreferenceChanges;
+    const canSwitchTechPath = !switchingPath && !loading && !hasServerConfigChanges;
     const nextTechPathLabel = config.gemini.alignment_source === 'gop'
         ? 'Gemini + Whisper skeleton'
         : 'Gemini + GOP skeleton';
@@ -116,6 +242,9 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
             setSaveStatus({ type: 'idle', message: '' });
             void fetchConfigRef.current();
             void fetchPlaybookRef.current();
+            const displaySettings = readReportDisplaySettings();
+            setReportDisplay(displaySettings);
+            setInitialReportDisplay(displaySettings);
         }
     }, [isOpen]);
 
@@ -190,6 +319,10 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
             };
             setConfig(nextConfig);
             setInitialConfig(nextConfig);
+            const nextReportDisplay = parseReportDisplayPayload((data as { report_display?: unknown }).report_display);
+            setReportDisplay(nextReportDisplay);
+            setInitialReportDisplay(nextReportDisplay);
+            persistReportDisplaySettings(nextReportDisplay);
         } catch (error) {
             console.error('Failed to fetch config', error);
         } finally {
@@ -208,52 +341,91 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
         setLoading(true);
         setSaveStatus({ type: 'idle', message: '' });
         try {
-            const payload = {
-                llm: {
-                    provider: config.provider,
-                    base_url: config.base_url,
-                    model: config.model,
-                    api_key: config.api_key || undefined,
-                },
-                gemini: {
-                    api_key: config.gemini.api_key || undefined,
-                    model: config.gemini.model,
-                    alignment_source: config.gemini.alignment_source,
-                },
-                azure: {
-                    api_key: config.azure.api_key || undefined,
-                    region: config.azure.region,
-                },
-            };
+            if (hasServerConfigChanges) {
+                const payload = {
+                    llm: {
+                        provider: config.provider,
+                        base_url: config.base_url,
+                        model: config.model,
+                        api_key: config.api_key || undefined,
+                    },
+                    gemini: {
+                        api_key: config.gemini.api_key || undefined,
+                        model: config.gemini.model,
+                        alignment_source: config.gemini.alignment_source,
+                    },
+                    azure: {
+                        api_key: config.azure.api_key || undefined,
+                        region: config.azure.region,
+                    },
+                };
 
-            const res = await fetch(`${API_HOST}/api/config`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-
-            if (!res.ok) {
-                let detail = '';
-                try {
-                    const contentType = res.headers.get('content-type') || '';
-                    if (contentType.includes('application/json')) {
-                        const data = await res.json();
-                        detail = String(data?.detail || '').trim();
-                    } else {
-                        detail = String(await res.text()).trim();
-                    }
-                } catch {
-                    detail = '';
-                }
-                setSaveStatus({
-                    type: 'error',
-                    message: detail ? `Failed to save configuration: ${detail}` : 'Failed to save configuration.',
+                const res = await fetch(`${API_HOST}/api/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
                 });
-                return;
+
+                if (!res.ok) {
+                    let detail = '';
+                    try {
+                        const contentType = res.headers.get('content-type') || '';
+                        if (contentType.includes('application/json')) {
+                            const data = await res.json();
+                            detail = String(data?.detail || '').trim();
+                        } else {
+                            detail = String(await res.text()).trim();
+                        }
+                    } catch {
+                        detail = '';
+                    }
+                    setSaveStatus({
+                        type: 'error',
+                        message: detail ? `Failed to save configuration: ${detail}` : 'Failed to save configuration.',
+                    });
+                    return;
+                }
+
+                await fetchConfig();
             }
 
-            setSaveStatus({ type: 'success', message: 'Configuration saved.' });
-            await fetchConfig();
+            if (hasUiPreferenceChanges) {
+                const nextDisplaySettings: ReportDisplaySettings = {
+                    scoreViewMode: reportDisplay.scoreViewMode,
+                    gradeThresholds: normalizeGradeThresholds(reportDisplay.gradeThresholds),
+                };
+                const reportDisplayPayload = {
+                    score_view_mode: nextDisplaySettings.scoreViewMode,
+                    grade_thresholds: {
+                        c_min: nextDisplaySettings.gradeThresholds.cMin,
+                        b_min: nextDisplaySettings.gradeThresholds.bMin,
+                        a_min: nextDisplaySettings.gradeThresholds.aMin,
+                        a_plus_min: nextDisplaySettings.gradeThresholds.aPlusMin,
+                    },
+                };
+                const rdRes = await fetch(`${API_HOST}/api/report-display`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(reportDisplayPayload),
+                });
+                if (!rdRes.ok) {
+                    let detail = '';
+                    try {
+                        detail = String(await rdRes.text()).trim();
+                    } catch {
+                        detail = '';
+                    }
+                    setSaveStatus({
+                        type: 'error',
+                        message: detail ? `Failed to save report display settings: ${detail}` : 'Failed to save report display settings.',
+                    });
+                    return;
+                }
+                persistReportDisplaySettings(nextDisplaySettings);
+                setReportDisplay(nextDisplaySettings);
+                setInitialReportDisplay(nextDisplaySettings);
+            }
+            setSaveStatus({ type: 'success', message: 'Settings saved.' });
             if (closeAfterSave) {
                 onClose();
             }
@@ -292,7 +464,19 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
             gemini: { ...initialConfig.gemini, api_key: '' },
             azure: { ...initialConfig.azure, api_key: '' },
         });
+        setReportDisplay(initialReportDisplay);
         setSaveStatus({ type: 'idle', message: '' });
+    };
+
+    const updateGradeThreshold = (key: keyof GradeThresholds, value: string) => {
+        const parsed = Number(value);
+        setReportDisplay((prev) => ({
+            ...prev,
+            gradeThresholds: normalizeGradeThresholds({
+                ...prev.gradeThresholds,
+                [key]: Number.isFinite(parsed) ? parsed : prev.gradeThresholds[key],
+            }),
+        }));
     };
 
     useEffect(() => {
@@ -648,7 +832,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                             >
                                 {switchingPath ? 'Switching...' : `Switch to ${nextTechPathLabel}`}
                             </button>
-                            {!canSwitchTechPath && !switchingPath && hasConfigChanges && (
+                            {!canSwitchTechPath && !switchingPath && hasServerConfigChanges && (
                                 <p className="text-[11px] text-amber-300">
                                     Save or reset current edits first, then switch tech path.
                                 </p>
@@ -767,6 +951,94 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                             <p className="text-[10px] text-gray-500 mt-1">
                                 Upload queue uses fixed 4 parallel workers to keep throughput stable.
                             </p>
+                        </div>
+                    </div>
+
+                    <hr className="border-white/5" />
+
+                    <div className="space-y-4">
+                        <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-wider">Speaking Report (Display)</h3>
+                        <p className="text-xs text-gray-400">
+                            Control how the score overview is shown in Speaking Report and print cards. Print follows this setting only.
+                        </p>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                                <label className="block text-xs font-medium text-gray-400 mb-1">Default Display</label>
+                                <select
+                                    value={reportDisplay.scoreViewMode}
+                                    onChange={e => setReportDisplay({
+                                        ...reportDisplay,
+                                        scoreViewMode: e.target.value === 'grade' ? 'grade' : 'score',
+                                    })}
+                                    className="w-full bg-black/20 border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                >
+                                    <option value="score">Score (e.g. 88)</option>
+                                    <option value="grade">Grade (e.g. A+)</option>
+                                </select>
+                            </div>
+                            <div className="rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-[11px] text-gray-300 leading-5">
+                                Current range: {reportDisplay.gradeThresholds.cMin}-{reportDisplay.gradeThresholds.bMin - 1} C / {reportDisplay.gradeThresholds.bMin}-{reportDisplay.gradeThresholds.aMin - 1} B / {reportDisplay.gradeThresholds.aMin}-{reportDisplay.gradeThresholds.aPlusMin - 1} A / {reportDisplay.gradeThresholds.aPlusMin}-100 A+
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                            <label className="text-xs text-gray-400">
+                                C min
+                                <input
+                                    type="number"
+                                    min={0}
+                                    max={98}
+                                    value={reportDisplay.gradeThresholds.cMin}
+                                    onChange={e => updateGradeThreshold('cMin', e.target.value)}
+                                    className="mt-1 w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                />
+                            </label>
+                            <label className="text-xs text-gray-400">
+                                B min
+                                <input
+                                    type="number"
+                                    min={1}
+                                    max={99}
+                                    value={reportDisplay.gradeThresholds.bMin}
+                                    onChange={e => updateGradeThreshold('bMin', e.target.value)}
+                                    className="mt-1 w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                />
+                            </label>
+                            <label className="text-xs text-gray-400">
+                                A min
+                                <input
+                                    type="number"
+                                    min={2}
+                                    max={100}
+                                    value={reportDisplay.gradeThresholds.aMin}
+                                    onChange={e => updateGradeThreshold('aMin', e.target.value)}
+                                    className="mt-1 w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                />
+                            </label>
+                            <label className="text-xs text-gray-400">
+                                A+ min
+                                <input
+                                    type="number"
+                                    min={3}
+                                    max={100}
+                                    value={reportDisplay.gradeThresholds.aPlusMin}
+                                    onChange={e => updateGradeThreshold('aPlusMin', e.target.value)}
+                                    className="mt-1 w-full bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                                />
+                            </label>
+                        </div>
+
+                        <div className="flex justify-end">
+                            <button
+                                type="button"
+                                onClick={() => setReportDisplay({
+                                    ...reportDisplay,
+                                    gradeThresholds: DEFAULT_GRADE_THRESHOLDS,
+                                })}
+                                className="px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs transition-colors"
+                            >
+                                Reset Grade Defaults
+                            </button>
                         </div>
                     </div>
                 </div>

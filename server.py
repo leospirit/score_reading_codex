@@ -93,6 +93,16 @@ class ConfigUpdate(BaseModel):
     azure: Optional[AzureConfig] = None
     gemini: Optional[GeminiConfig] = None
 
+class GradeThresholdConfig(BaseModel):
+    c_min: Optional[int] = None
+    b_min: Optional[int] = None
+    a_min: Optional[int] = None
+    a_plus_min: Optional[int] = None
+
+class ReportDisplayConfig(BaseModel):
+    score_view_mode: Optional[str] = None
+    grade_thresholds: Optional[GradeThresholdConfig] = None
+
 class ScriptReferenceRequest(BaseModel):
     text: str
     wait: bool = False
@@ -616,7 +626,7 @@ async def worker():
                     logger.info(f"Job {job_id} completed")
                     
             except Exception as e:
-                logger.error(f"Job {job_id} failed: {e}")
+                logger.exception("Job %s failed", job_id)
                 if job_id in JOBS:
                     JOBS[job_id].status = JobStatus.FAILED
                     JOBS[job_id].error = str(e)
@@ -707,6 +717,48 @@ async def startup_event():
     for i in range(num_workers):
         asyncio.create_task(worker())
 
+DEFAULT_GRADE_THRESHOLDS = {
+    "c_min": 61,
+    "b_min": 71,
+    "a_min": 81,
+    "a_plus_min": 86,
+}
+
+def _clamp_int(value: Any, min_v: int, max_v: int) -> int:
+    try:
+        n = int(round(float(value)))
+    except Exception:
+        return min_v
+    return max(min_v, min(max_v, n))
+
+def _normalize_grade_thresholds(raw: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    src = raw or {}
+    c_min = _clamp_int(src.get("c_min", DEFAULT_GRADE_THRESHOLDS["c_min"]), 1, 97)
+    b_min = _clamp_int(src.get("b_min", DEFAULT_GRADE_THRESHOLDS["b_min"]), c_min + 1, 98)
+    a_min = _clamp_int(src.get("a_min", DEFAULT_GRADE_THRESHOLDS["a_min"]), b_min + 1, 99)
+    a_plus_min = _clamp_int(src.get("a_plus_min", DEFAULT_GRADE_THRESHOLDS["a_plus_min"]), a_min + 1, 100)
+    return {
+        "c_min": c_min,
+        "b_min": b_min,
+        "a_min": a_min,
+        "a_plus_min": a_plus_min,
+    }
+
+def _normalize_score_view_mode(raw: Any) -> str:
+    return "grade" if str(raw or "").strip().lower() == "grade" else "score"
+
+def _get_report_display_config() -> Dict[str, Any]:
+    report_conf = config.get("report", {}) or {}
+    display_conf = {}
+    if isinstance(report_conf, dict):
+        display_conf = report_conf.get("display", {}) or {}
+    mode = _normalize_score_view_mode(display_conf.get("score_view_mode"))
+    thresholds = _normalize_grade_thresholds(display_conf.get("grade_thresholds"))
+    return {
+        "score_view_mode": mode,
+        "grade_thresholds": thresholds,
+    }
+
 @app.get("/api/config")
 def get_config():
     """Get current config (masking API key)"""
@@ -747,7 +799,44 @@ def get_config():
         "upload": {
             "max_mb": float(UPLOAD_MAX_MB),
         },
+        "report_display": _get_report_display_config(),
     }
+
+@app.get("/api/report-display")
+def get_report_display():
+    """Get report score/grade display preferences (shared across UI pages)."""
+    load_config()
+    return {"status": "ok", "report_display": _get_report_display_config()}
+
+@app.post("/api/report-display")
+def update_report_display(data: ReportDisplayConfig):
+    payload = data.dict(exclude_unset=True)
+    if not payload:
+        return {"status": "ok", "message": "No changes detected", "report_display": _get_report_display_config()}
+
+    current = _get_report_display_config()
+    next_mode = current.get("score_view_mode", "score")
+    next_thresholds = current.get("grade_thresholds", DEFAULT_GRADE_THRESHOLDS)
+
+    if "score_view_mode" in payload:
+        next_mode = _normalize_score_view_mode(payload.get("score_view_mode"))
+    if "grade_thresholds" in payload and isinstance(payload.get("grade_thresholds"), dict):
+        next_thresholds = _normalize_grade_thresholds(payload.get("grade_thresholds"))
+
+    updates = {
+        "report": {
+            "display": {
+                "score_view_mode": next_mode,
+                "grade_thresholds": next_thresholds,
+            }
+        }
+    }
+    try:
+        config.save_user_config(updates)
+        return {"status": "ok", "message": "Report display updated", "report_display": _get_report_display_config()}
+    except Exception as e:
+        logger.error(f"Failed to save report display config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/config", dependencies=[Depends(require_admin_token_if_configured)])
 def update_config(data: ConfigUpdate):

@@ -380,27 +380,31 @@ export default function WordClipStudio() {
                 return sourceType.includes('youglish');
             });
             const hasYouGlish = youglishItems.length > 0;
-            const canUseFallback = !hasYouGlish && allowFallbackPlayer && allItems.length > 0;
-            const items = hasYouGlish ? youglishItems : canUseFallback ? allItems : [];
+            const hasFallbackItems = !hasYouGlish && allItems.length > 0;
+            // Keep the player practical: when YouGlish is unavailable, still show fallback clips.
+            const items = hasYouGlish ? youglishItems : hasFallbackItems ? allItems : [];
             setOnlineClips(items);
             setOnlineIndex(0);
             setOnlineSource(
                 hasYouGlish
                     ? 'youglish'
-                    : canUseFallback
+                    : hasFallbackItems
                         ? String(data?.source || 'fallback_youtube')
                         : String(data?.source || ''),
             );
             if (hasYouGlish) {
                 setYgNeedsVerify(false);
                 setYgStatus(`Loaded ${items.length} YouGlish clip(s) in player.`);
-            } else if (canUseFallback) {
+            } else if (hasFallbackItems) {
                 setYgNeedsVerify(true);
                 const fallbackSource = String(data?.source || 'fallback_youtube');
                 const warningText = String(data?.warning || '').trim();
                 const reason = warningText ? ` ${warningText}` : '';
+                if (!allowFallbackPlayer) {
+                    setAllowFallbackPlayer(true);
+                }
                 setYgStatus(
-                    `Loaded ${items.length} fallback clip(s) from ${fallbackSource}.${reason}`,
+                    `YouGlish clips unavailable. Loaded ${items.length} fallback clip(s) from ${fallbackSource}.${reason}`,
                 );
             } else {
                 setYgNeedsVerify(true);
@@ -409,7 +413,7 @@ export default function WordClipStudio() {
                 const warningText = String(data?.warning || '').trim();
                 const reason = warningText ? ` ${warningText}` : '';
                 setYgStatus(
-                    `No YouGlish clips available. API returned ${fallbackSource} (${fallbackCount} item(s)); in YouGlish-only mode player stays empty.${reason}`,
+                    `No clips available for "${q}". API returned ${fallbackSource} (${fallbackCount} item(s)).${reason}`,
                 );
             }
         } catch (err) {
