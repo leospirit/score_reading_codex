@@ -103,6 +103,17 @@ class ReportDisplayConfig(BaseModel):
     score_view_mode: Optional[str] = None
     grade_thresholds: Optional[GradeThresholdConfig] = None
 
+class FeedbackOverrideRequest(BaseModel):
+    integrated_feedback_text: str
+    updated_by: Optional[str] = None
+
+class TeacherPhraseCreateRequest(BaseModel):
+    text: str
+    category: Optional[str] = None
+
+class TeacherPhraseUseRequest(BaseModel):
+    phrase_id: str
+
 class ScriptReferenceRequest(BaseModel):
     text: str
     wait: bool = False
@@ -165,6 +176,9 @@ WORD_CLIP_JOBS: Dict[str, Dict[str, Any]] = {}
 WORD_CLIP_LOCK = threading.Lock()
 WORD_CLIP_WORKER_SEMAPHORE = threading.Semaphore(1)
 WORD_CLIP_PO_TOKEN_PATH = Path("data/yt_po_tokens.json")
+TEACHER_PHRASE_BANK_PATH = Path("data/teacher_phrase_bank.json")
+TEACHER_PHRASE_BANK_LOCK = threading.Lock()
+TEACHER_PHRASE_CATEGORIES = {"praise", "issue", "advice", "encourage"}
 PRON_FOCUS_CACHE_LOCK = threading.Lock()
 PRON_FOCUS_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 PRON_FOCUS_CACHE_TTL_SECONDS = 45.0
@@ -334,6 +348,123 @@ def _write_json_atomic(path: Path, payload: Any) -> None:
                 tmp_path.unlink()
             except Exception:
                 pass
+
+
+def _as_non_negative_int(raw: Any, default: int = 0) -> int:
+    try:
+        value = int(float(raw))
+    except Exception:
+        value = int(default)
+    return value if value >= 0 else int(default)
+
+
+def _normalize_teacher_phrase_category(raw: Any) -> str:
+    category = str(raw or "").strip().lower()
+    return category if category in TEACHER_PHRASE_CATEGORIES else "praise"
+
+
+def _normalize_teacher_phrase_text(raw: Any) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    return text
+
+
+def _default_teacher_phrase_items(now_ts: int) -> list[Dict[str, Any]]:
+    defaults = [
+        {"category": "praise", "text": "这次朗读语气自然，整体节奏比较稳定。"},
+        {"category": "praise", "text": "你对课文内容很熟悉，句子衔接比较流畅。"},
+        {"category": "issue", "text": "关键问题是个别词尾收音不够清楚。"},
+        {"category": "advice", "text": "建议：目标词先慢读3遍，再放回原句连读3遍。"},
+        {"category": "encourage", "text": "继续保持这个状态，下次会更稳。"},
+    ]
+    out: list[Dict[str, Any]] = []
+    for idx, row in enumerate(defaults, start=1):
+        category = _normalize_teacher_phrase_category(row.get("category"))
+        out.append(
+            {
+                "id": f"default_{category}_{idx:02d}",
+                "text": str(row.get("text") or "").strip(),
+                "category": category,
+                "use_count": 0,
+                "created_at": now_ts,
+                "updated_at": now_ts,
+                "last_used_at": 0,
+                "builtin": True,
+            }
+        )
+    return out
+
+
+def _normalize_teacher_phrase_item(raw: Any, now_ts: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    text = _normalize_teacher_phrase_text(raw.get("text"))
+    if not text:
+        return None
+    phrase_id = str(raw.get("id") or "").strip() or f"ph_{uuid.uuid4().hex[:12]}"
+    created_at = _as_non_negative_int(raw.get("created_at"), now_ts)
+    updated_at = _as_non_negative_int(raw.get("updated_at"), created_at)
+    return {
+        "id": phrase_id[:64],
+        "text": text[:220],
+        "category": _normalize_teacher_phrase_category(raw.get("category")),
+        "use_count": _as_non_negative_int(raw.get("use_count"), 0),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "last_used_at": _as_non_negative_int(raw.get("last_used_at"), 0),
+        "builtin": bool(raw.get("builtin", False)),
+    }
+
+
+def _read_teacher_phrase_bank_unlocked() -> Dict[str, Any]:
+    now_ts = int(time.time())
+    raw: Dict[str, Any] = {}
+    if TEACHER_PHRASE_BANK_PATH.exists():
+        try:
+            parsed = json.loads(TEACHER_PHRASE_BANK_PATH.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                raw = parsed
+        except Exception:
+            raw = {}
+
+    normalized_items: list[Dict[str, Any]] = []
+    seen_texts: set[str] = set()
+    items_raw = raw.get("items") if isinstance(raw, dict) else None
+    if isinstance(items_raw, list):
+        for row in items_raw:
+            item = _normalize_teacher_phrase_item(row, now_ts)
+            if not item:
+                continue
+            key = item["text"].lower()
+            if key in seen_texts:
+                continue
+            seen_texts.add(key)
+            normalized_items.append(item)
+
+    if not normalized_items:
+        normalized_items = _default_teacher_phrase_items(now_ts)
+
+    bank = {
+        "version": 1,
+        "updated_at": _as_non_negative_int(raw.get("updated_at"), now_ts),
+        "items": normalized_items,
+    }
+
+    if (not TEACHER_PHRASE_BANK_PATH.exists()) or raw != bank:
+        _write_json_atomic(TEACHER_PHRASE_BANK_PATH, bank)
+
+    return bank
+
+
+def _sorted_teacher_phrase_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda row: (
+            -_as_non_negative_int(row.get("use_count"), 0),
+            -_as_non_negative_int(row.get("last_used_at"), 0),
+            -_as_non_negative_int(row.get("updated_at"), 0),
+            str(row.get("text", "")).lower(),
+        ),
+    )
 
 def save_jobs():
     """Persist jobs to disk"""
@@ -1403,19 +1534,27 @@ async def list_reports(
     }
 
 
+def _validate_submission_id(submission_id: str) -> None:
+    if ".." in submission_id or "/" in submission_id or "\\" in submission_id:
+        raise HTTPException(status_code=400, detail="Invalid submission ID")
+
+
+def _find_report_json_path(submission_id: str) -> Optional[Path]:
+    for path in REPORTS_DIR.glob(f"**/{submission_id}.json"):
+        if path.exists():
+            return path
+    return None
+
+
 @app.get("/api/reports/{submission_id}/data")
 async def get_report_data(submission_id: str):
     """
     获取报告的完整 JSON 数据，用于报告生成器
     """
-    if ".." in submission_id or "/" in submission_id or "\\" in submission_id:
-        raise HTTPException(status_code=400, detail="Invalid submission ID")
+    _validate_submission_id(submission_id)
     
     # 查找 JSON 文件
-    json_path = None
-    for path in REPORTS_DIR.glob(f"**/{submission_id}.json"):
-        json_path = path
-        break
+    json_path = _find_report_json_path(submission_id)
     
     if not json_path or not json_path.exists():
         raise HTTPException(status_code=404, detail="Report data not found")
@@ -1530,6 +1669,172 @@ async def get_report_data(submission_id: str):
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read report: {e}")
+
+
+@app.post("/api/reports/{submission_id}/feedback-override")
+async def update_report_feedback_override(submission_id: str, payload: FeedbackOverrideRequest):
+    _validate_submission_id(submission_id)
+    json_path = _find_report_json_path(submission_id)
+    if not json_path or not json_path.exists():
+        raise HTTPException(status_code=404, detail="Report data not found")
+
+    text = str(payload.integrated_feedback_text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="integrated_feedback_text is required")
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="integrated_feedback_text too long (max 4000 chars)")
+
+    updated_by = str(payload.updated_by or "").strip()
+    override: Dict[str, Any] = {
+        "integrated_feedback_text": text,
+        "updated_at": int(time.time()),
+    }
+    if updated_by:
+        override["updated_by"] = updated_by[:60]
+
+    try:
+        current = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            current = {}
+        current["feedback_override"] = override
+        _write_json_atomic(json_path, current)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update feedback override: {e}")
+
+    return {
+        "status": "ok",
+        "submission_id": submission_id,
+        "feedback_override": override,
+    }
+
+
+@app.delete("/api/reports/{submission_id}/feedback-override")
+async def clear_report_feedback_override(submission_id: str):
+    _validate_submission_id(submission_id)
+    json_path = _find_report_json_path(submission_id)
+    if not json_path or not json_path.exists():
+        raise HTTPException(status_code=404, detail="Report data not found")
+
+    try:
+        current = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(current, dict):
+            current = {}
+        had_override = bool(current.get("feedback_override"))
+        current.pop("feedback_override", None)
+        _write_json_atomic(json_path, current)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear feedback override: {e}")
+
+    return {
+        "status": "ok",
+        "submission_id": submission_id,
+        "cleared": had_override,
+    }
+
+
+@app.get("/api/teacher-phrases")
+def get_teacher_phrases():
+    try:
+        with TEACHER_PHRASE_BANK_LOCK:
+            bank = _read_teacher_phrase_bank_unlocked()
+            items = _sorted_teacher_phrase_items(list(bank.get("items") or []))
+        return {
+            "status": "ok",
+            "updated_at": _as_non_negative_int(bank.get("updated_at"), 0),
+            "items": items,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to read teacher phrase bank: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read teacher phrase bank")
+
+
+@app.post("/api/teacher-phrases")
+def add_teacher_phrase(payload: TeacherPhraseCreateRequest):
+    text = _normalize_teacher_phrase_text(payload.text)
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > 220:
+        raise HTTPException(status_code=400, detail="text too long (max 220 chars)")
+    category = _normalize_teacher_phrase_category(payload.category)
+    now_ts = int(time.time())
+
+    try:
+        with TEACHER_PHRASE_BANK_LOCK:
+            bank = _read_teacher_phrase_bank_unlocked()
+            items = list(bank.get("items") or [])
+            text_key = text.lower()
+            for idx, row in enumerate(items):
+                existing = _normalize_teacher_phrase_item(row, now_ts)
+                if not existing:
+                    continue
+                if existing["text"].lower() == text_key:
+                    if existing.get("category") != category:
+                        existing["category"] = category
+                        existing["updated_at"] = now_ts
+                        items[idx] = existing
+                        bank["items"] = items
+                        bank["updated_at"] = now_ts
+                        _write_json_atomic(TEACHER_PHRASE_BANK_PATH, bank)
+                    return {"status": "ok", "created": False, "item": existing}
+
+            new_item: Dict[str, Any] = {
+                "id": f"ph_{uuid.uuid4().hex[:12]}",
+                "text": text,
+                "category": category,
+                "use_count": 0,
+                "created_at": now_ts,
+                "updated_at": now_ts,
+                "last_used_at": 0,
+                "builtin": False,
+            }
+            items.append(new_item)
+            bank["items"] = items
+            bank["updated_at"] = now_ts
+            _write_json_atomic(TEACHER_PHRASE_BANK_PATH, bank)
+            return {"status": "ok", "created": True, "item": new_item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to add teacher phrase: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add teacher phrase")
+
+
+@app.post("/api/teacher-phrases/use")
+def mark_teacher_phrase_used(payload: TeacherPhraseUseRequest):
+    phrase_id = str(payload.phrase_id or "").strip()
+    if not phrase_id:
+        raise HTTPException(status_code=400, detail="phrase_id is required")
+    now_ts = int(time.time())
+
+    try:
+        with TEACHER_PHRASE_BANK_LOCK:
+            bank = _read_teacher_phrase_bank_unlocked()
+            items = list(bank.get("items") or [])
+            for idx, row in enumerate(items):
+                item = _normalize_teacher_phrase_item(row, now_ts)
+                if not item or item.get("id") != phrase_id:
+                    continue
+                item["use_count"] = _as_non_negative_int(item.get("use_count"), 0) + 1
+                item["last_used_at"] = now_ts
+                item["updated_at"] = now_ts
+                items[idx] = item
+                bank["items"] = items
+                bank["updated_at"] = now_ts
+                _write_json_atomic(TEACHER_PHRASE_BANK_PATH, bank)
+                return {"status": "ok", "item": item}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to mark teacher phrase usage: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update teacher phrase usage")
+
+    raise HTTPException(status_code=404, detail="phrase_id not found")
 
 
 _WORD_TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")

@@ -131,7 +131,30 @@ interface ReportData {
             fun_challenge: string;
         };
     };
+    feedback_override?: {
+        integrated_feedback_text?: string;
+        updated_at?: number;
+        updated_by?: string;
+    };
 }
+
+type FeedbackPhraseCategory = 'praise' | 'issue' | 'advice' | 'encourage';
+type TeacherPhraseItem = {
+    id: string;
+    text: string;
+    category: FeedbackPhraseCategory;
+    use_count?: number;
+    created_at?: number;
+    updated_at?: number;
+    last_used_at?: number;
+    builtin?: boolean;
+};
+type AiFeedbackSuggestion = {
+    id: string;
+    category: FeedbackPhraseCategory;
+    label: string;
+    text: string;
+};
 
 type IntonationWordView = { word: string; is_stressed: boolean; stress_correct: boolean };
 type IntonationSentenceView = { sentence: string; words: IntonationWordView[]; stress_accuracy: number; tip: string };
@@ -167,6 +190,23 @@ function formatScoreCompact(value: number, digits = 1): string {
     return rounded.toFixed(digits).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
 }
 
+function buildIntegratedFeedbackText(integrated: ReportData['engine_raw']['integrated_feedback'] | undefined): string {
+    if (!integrated) return '';
+    const lines: string[] = [];
+    const overall = String(integrated.overall_comment || '').trim();
+    if (overall) lines.push(overall);
+
+    const suggestion = Array.isArray(integrated.specific_suggestions) && integrated.specific_suggestions.length > 0
+        ? String(integrated.specific_suggestions[0] || '').trim()
+        : '';
+    if (suggestion) {
+        const normalized = /^建议[:：]/.test(suggestion) ? suggestion : `建议：${suggestion}`;
+        lines.push(normalized);
+    }
+
+    return lines.join('\n\n').trim();
+}
+
 type GradeThresholds = {
     cMin: number;
     bMin: number;
@@ -183,6 +223,63 @@ const DEFAULT_GRADE_THRESHOLDS: GradeThresholds = {
 };
 const SCORE_VIEW_MODE_STORAGE_KEY = 'score_reading.score_view_mode';
 const GRADE_THRESHOLDS_STORAGE_KEY = 'score_reading.grade_thresholds';
+const FEEDBACK_PHRASE_CATEGORY_LABEL: Record<FeedbackPhraseCategory, string> = {
+    praise: '表扬',
+    issue: '问题',
+    advice: '建议',
+    encourage: '鼓励',
+};
+const FEEDBACK_PHRASE_CHIP_CLASS: Record<FeedbackPhraseCategory, string> = {
+    praise: 'border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100',
+    issue: 'border-rose-300 text-rose-700 bg-rose-50 hover:bg-rose-100',
+    advice: 'border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100',
+    encourage: 'border-sky-300 text-sky-700 bg-sky-50 hover:bg-sky-100',
+};
+
+function normalizeFeedbackPhraseCategory(raw: unknown): FeedbackPhraseCategory {
+    const value = String(raw || '').trim().toLowerCase();
+    if (value === 'issue' || value === 'advice' || value === 'encourage' || value === 'praise') return value;
+    return 'praise';
+}
+
+function parseTeacherPhraseItem(raw: unknown): TeacherPhraseItem | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const source = raw as {
+        id?: unknown;
+        text?: unknown;
+        category?: unknown;
+        use_count?: unknown;
+        created_at?: unknown;
+        updated_at?: unknown;
+        last_used_at?: unknown;
+        builtin?: unknown;
+    };
+    const id = String(source.id || '').trim();
+    const text = String(source.text || '').trim();
+    if (!id || !text) return null;
+    return {
+        id,
+        text,
+        category: normalizeFeedbackPhraseCategory(source.category),
+        use_count: Number(source.use_count ?? 0),
+        created_at: Number(source.created_at ?? 0),
+        updated_at: Number(source.updated_at ?? 0),
+        last_used_at: Number(source.last_used_at ?? 0),
+        builtin: Boolean(source.builtin),
+    };
+}
+
+function sortTeacherPhraseItems(items: TeacherPhraseItem[]): TeacherPhraseItem[] {
+    return [...items].sort((a, b) => {
+        const useDiff = Number(b.use_count || 0) - Number(a.use_count || 0);
+        if (useDiff !== 0) return useDiff;
+        const recentDiff = Number(b.last_used_at || 0) - Number(a.last_used_at || 0);
+        if (recentDiff !== 0) return recentDiff;
+        const updateDiff = Number(b.updated_at || 0) - Number(a.updated_at || 0);
+        if (updateDiff !== 0) return updateDiff;
+        return a.text.localeCompare(b.text);
+    });
+}
 
 function readScoreViewModeFromStorage(): 'score' | 'grade' {
     if (typeof window === 'undefined') return 'score';
@@ -486,10 +583,19 @@ export default function ReportBuilder() {
     const [selectedReportIds, setSelectedReportIds] = useState<Set<string>>(new Set());
     const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, name: '' });
     const [actionNotice, setActionNotice] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+    const [isEditingFeedback, setIsEditingFeedback] = useState(false);
+    const [feedbackDraft, setFeedbackDraft] = useState('');
+    const [isSavingFeedback, setIsSavingFeedback] = useState(false);
+    const [teacherPhrases, setTeacherPhrases] = useState<TeacherPhraseItem[]>([]);
+    const [isLoadingTeacherPhrases, setIsLoadingTeacherPhrases] = useState(false);
+    const [isAddingTeacherPhrase, setIsAddingTeacherPhrase] = useState(false);
+    const [newTeacherPhraseText, setNewTeacherPhraseText] = useState('');
+    const [newTeacherPhraseCategory, setNewTeacherPhraseCategory] = useState<FeedbackPhraseCategory>('praise');
 
     const reportRef = useRef<HTMLDivElement>(null);
+    const feedbackEditorRef = useRef<HTMLTextAreaElement>(null);
     const win = window as WindowWithFsAccess;
-    const fetchWithTimeout = async (
+    const fetchWithTimeout = useCallback(async (
         input: RequestInfo | URL,
         init?: RequestInit,
         timeoutMs: number = REQUEST_TIMEOUT_MS
@@ -512,7 +618,7 @@ export default function ReportBuilder() {
         } finally {
             window.clearTimeout(timer);
         }
-    };
+    }, [REQUEST_TIMEOUT_MS]);
 
     const lowConfidenceTimeline = useMemo(() => {
         if (!reportData) return false;
@@ -629,6 +735,62 @@ export default function ReportBuilder() {
         return '';
     }, [reportData]);
 
+    const baseIntegratedFeedbackText = useMemo(
+        () => buildIntegratedFeedbackText(reportData?.engine_raw?.integrated_feedback),
+        [reportData],
+    );
+
+    const activeIntegratedFeedbackText = useMemo(() => {
+        const overrideText = String(reportData?.feedback_override?.integrated_feedback_text || '').trim();
+        return overrideText || baseIntegratedFeedbackText;
+    }, [reportData, baseIntegratedFeedbackText]);
+
+    const hasFeedbackOverride = useMemo(
+        () => String(reportData?.feedback_override?.integrated_feedback_text || '').trim().length > 0,
+        [reportData],
+    );
+
+    const feedbackOverrideUpdatedAt = useMemo(() => {
+        const ts = Number(reportData?.feedback_override?.updated_at || 0);
+        return Number.isFinite(ts) && ts > 0 ? ts : 0;
+    }, [reportData]);
+
+    const aiFeedbackSuggestions = useMemo<AiFeedbackSuggestion[]>(() => {
+        const focusWordRaw = reportData?.analysis?.weak_words?.[0];
+        const focusWord = String(focusWordRaw || '').trim();
+        const coreWord = focusWord || '目标单词';
+        return [
+            {
+                id: 'ai_praise_fact',
+                category: 'praise' as const,
+                label: '事实表扬',
+                text: '这次朗读语气自然，整体节奏比较稳定。',
+            },
+            {
+                id: 'ai_issue_focus',
+                category: 'issue' as const,
+                label: '关键问题',
+                text: `最核心需要改进的是“${coreWord}”。`,
+            },
+            {
+                id: 'ai_advice_drill',
+                category: 'advice' as const,
+                label: '针对性建议',
+                text: `建议：把“${coreWord}”慢读3遍，再放回原句连读3遍，每次录音回听自检。`,
+            },
+        ];
+    }, [reportData]);
+
+    const teacherPhraseSuggestions = useMemo(() => {
+        const seen = new Set<string>(aiFeedbackSuggestions.map((row) => row.text.trim().toLowerCase()));
+        return teacherPhrases.filter((row) => {
+            const key = row.text.trim().toLowerCase();
+            if (!key || seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }, [aiFeedbackSuggestions, teacherPhrases]);
+
     const isAzureSource = useMemo(() => {
         const source = String(reportData?.engine_raw?.source || '').toLowerCase();
         return source.includes('azure');
@@ -659,6 +821,37 @@ export default function ReportBuilder() {
         return set;
     }, [reportData]);
 
+    const loadTeacherPhrases = useCallback(async (silent = true) => {
+        setIsLoadingTeacherPhrases(true);
+        try {
+            const res = await fetchWithTimeout(`${API_HOST}/api/teacher-phrases`, undefined, 10000);
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+                throw new Error(detail);
+            }
+            const itemsRaw = (payload as { items?: unknown }).items;
+            const items = Array.isArray(itemsRaw)
+                ? itemsRaw.map(parseTeacherPhraseItem).filter((row): row is TeacherPhraseItem => Boolean(row))
+                : [];
+            setTeacherPhrases(sortTeacherPhraseItems(items));
+        } catch (err) {
+            if (!silent) {
+                setActionNotice({
+                    type: 'error',
+                    message: formatActionError('Load teacher phrase bank', err, 'Unknown error'),
+                });
+            }
+            console.error('Failed to load teacher phrase bank:', err);
+        } finally {
+            setIsLoadingTeacherPhrases(false);
+        }
+    }, [fetchWithTimeout]);
+
+    useEffect(() => {
+        void loadTeacherPhrases(true);
+    }, [loadTeacherPhrases]);
+
     useEffect(() => {
         let cancelled = false;
         const loadReports = async () => {
@@ -684,7 +877,7 @@ export default function ReportBuilder() {
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [fetchWithTimeout]);
 
     useEffect(() => {
         if (!selectedReportId) {
@@ -715,7 +908,13 @@ export default function ReportBuilder() {
         return () => {
             cancelled = true;
         };
-    }, [selectedReportId]);
+    }, [selectedReportId, fetchWithTimeout]);
+
+    useEffect(() => {
+        setIsEditingFeedback(false);
+        setIsSavingFeedback(false);
+        setFeedbackDraft(activeIntegratedFeedbackText);
+    }, [selectedReportId, activeIntegratedFeedbackText]);
 
     useEffect(() => {
         if (!actionNotice) return;
@@ -738,6 +937,213 @@ export default function ReportBuilder() {
     };
     const resetToDefault = () => setSelectedModules(AVAILABLE_MODULES.filter(m => m.isDefault).map(m => m.id));
     const handlePrint = useCallback(() => window.print(), []);
+
+    const handleStartEditFeedback = () => {
+        setFeedbackDraft(activeIntegratedFeedbackText);
+        setIsEditingFeedback(true);
+        if (teacherPhrases.length === 0) {
+            void loadTeacherPhrases(true);
+        }
+        window.requestAnimationFrame(() => {
+            feedbackEditorRef.current?.focus();
+            const length = feedbackEditorRef.current?.value.length || 0;
+            feedbackEditorRef.current?.setSelectionRange(length, length);
+        });
+    };
+
+    const handleCancelEditFeedback = () => {
+        setFeedbackDraft(activeIntegratedFeedbackText);
+        setIsEditingFeedback(false);
+    };
+
+    const trackTeacherPhraseUsage = useCallback(async (phraseId: string) => {
+        const id = String(phraseId || '').trim();
+        if (!id) return;
+        try {
+            const res = await fetchWithTimeout(
+                `${API_HOST}/api/teacher-phrases/use`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phrase_id: id }),
+                },
+                8000,
+            );
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) return;
+            const parsed = parseTeacherPhraseItem((payload as { item?: unknown }).item);
+            if (!parsed) return;
+            setTeacherPhrases((prev) => {
+                const next = [...prev];
+                const idx = next.findIndex((row) => row.id === parsed.id);
+                if (idx >= 0) {
+                    next[idx] = parsed;
+                    return sortTeacherPhraseItems(next);
+                }
+                next.push(parsed);
+                return sortTeacherPhraseItems(next);
+            });
+        } catch (err) {
+            console.error('Failed to track teacher phrase usage:', err);
+        }
+    }, [fetchWithTimeout]);
+
+    const handleAddTeacherPhrase = useCallback(async () => {
+        const text = String(newTeacherPhraseText || '').trim();
+        if (!text) return;
+        if (text.length > 220) {
+            setActionNotice({ type: 'error', message: '常用语过长（最多 220 字）。' });
+            return;
+        }
+        setIsAddingTeacherPhrase(true);
+        setActionNotice(null);
+        try {
+            const res = await fetchWithTimeout(
+                `${API_HOST}/api/teacher-phrases`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        text,
+                        category: newTeacherPhraseCategory,
+                    }),
+                },
+                10000,
+            );
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+                throw new Error(detail);
+            }
+            const parsed = parseTeacherPhraseItem((payload as { item?: unknown }).item);
+            if (parsed) {
+                setTeacherPhrases((prev) => {
+                    const next = [...prev];
+                    const idx = next.findIndex((row) => row.id === parsed.id);
+                    if (idx >= 0) {
+                        next[idx] = parsed;
+                    } else {
+                        next.push(parsed);
+                    }
+                    return sortTeacherPhraseItems(next);
+                });
+            }
+            setNewTeacherPhraseText('');
+            setActionNotice({ type: 'success', message: '已加入教师常用语词库。' });
+        } catch (err) {
+            console.error('Failed to add teacher phrase:', err);
+            setActionNotice({
+                type: 'error',
+                message: formatActionError('Add teacher phrase', err, 'Unknown error'),
+            });
+        } finally {
+            setIsAddingTeacherPhrase(false);
+        }
+    }, [fetchWithTimeout, newTeacherPhraseCategory, newTeacherPhraseText]);
+
+    const insertFeedbackPhrase = (phrase: { id?: string; text: string } | string) => {
+        const text = typeof phrase === 'string' ? String(phrase || '').trim() : String(phrase?.text || '').trim();
+        const phraseId = typeof phrase === 'string' ? '' : String(phrase?.id || '').trim();
+        if (!text) return;
+        const textarea = feedbackEditorRef.current;
+        if (!textarea) {
+            setFeedbackDraft((prev) => `${String(prev || '').trim()}\n${text}`.trim());
+            if (phraseId) void trackTeacherPhraseUsage(phraseId);
+            return;
+        }
+        const start = Number.isFinite(textarea.selectionStart) ? textarea.selectionStart : textarea.value.length;
+        const end = Number.isFinite(textarea.selectionEnd) ? textarea.selectionEnd : start;
+        const current = textarea.value;
+        const prefix = current.slice(0, start);
+        const suffix = current.slice(end);
+        const needsBreak = prefix.length > 0 && !/\s$/.test(prefix);
+        const insertion = `${needsBreak ? '\n' : ''}${text}`;
+        const nextValue = `${prefix}${insertion}${suffix}`;
+        const caret = (prefix + insertion).length;
+        setFeedbackDraft(nextValue);
+        window.requestAnimationFrame(() => {
+            if (!feedbackEditorRef.current) return;
+            feedbackEditorRef.current.focus();
+            feedbackEditorRef.current.setSelectionRange(caret, caret);
+        });
+        if (phraseId) void trackTeacherPhraseUsage(phraseId);
+    };
+
+    const handleSaveFeedbackOverride = async () => {
+        if (!selectedReportId) return;
+        const text = String(feedbackDraft || '').trim();
+        if (!text) {
+            setActionNotice({ type: 'error', message: '反馈内容不能为空。' });
+            return;
+        }
+        setIsSavingFeedback(true);
+        setActionNotice(null);
+        try {
+            const res = await fetchWithTimeout(
+                `${API_HOST}/api/reports/${selectedReportId}/feedback-override`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ integrated_feedback_text: text }),
+                },
+                15000,
+            );
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+                throw new Error(detail);
+            }
+            const override = (payload as { feedback_override?: ReportData['feedback_override'] }).feedback_override || {
+                integrated_feedback_text: text,
+                updated_at: Math.floor(Date.now() / 1000),
+            };
+            setReportData((prev) => (prev ? { ...prev, feedback_override: override } : prev));
+            setIsEditingFeedback(false);
+            setActionNotice({ type: 'success', message: 'Integrated Feedback 已更新。' });
+        } catch (err) {
+            console.error('Failed to update feedback override:', err);
+            setActionNotice({
+                type: 'error',
+                message: formatActionError('Update feedback', err, 'Unknown error'),
+            });
+        } finally {
+            setIsSavingFeedback(false);
+        }
+    };
+
+    const handleClearFeedbackOverride = async () => {
+        if (!selectedReportId || !hasFeedbackOverride) {
+            setIsEditingFeedback(false);
+            setFeedbackDraft(baseIntegratedFeedbackText);
+            return;
+        }
+        setIsSavingFeedback(true);
+        setActionNotice(null);
+        try {
+            const res = await fetchWithTimeout(
+                `${API_HOST}/api/reports/${selectedReportId}/feedback-override`,
+                { method: 'DELETE' },
+                15000,
+            );
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+                throw new Error(detail);
+            }
+            setReportData((prev) => (prev ? { ...prev, feedback_override: undefined } : prev));
+            setFeedbackDraft(baseIntegratedFeedbackText);
+            setIsEditingFeedback(false);
+            setActionNotice({ type: 'success', message: '已恢复原始反馈。' });
+        } catch (err) {
+            console.error('Failed to clear feedback override:', err);
+            setActionNotice({
+                type: 'error',
+                message: formatActionError('Reset feedback', err, 'Unknown error'),
+            });
+        } finally {
+            setIsSavingFeedback(false);
+        }
+    };
 
     // 鎴浘鍔熻兘 - 浣跨敤鍙﹀瓨涓哄璇濇
     const handleCapture = async () => {
@@ -1280,27 +1686,158 @@ export default function ReportBuilder() {
                                         {/* 缁煎悎鍙嶉 */}
                                         {moduleId === 'ai_feedback' && reportData.engine_raw?.integrated_feedback && (
                                             <div className="border border-gray-200 rounded-lg p-4">
-                                                <h3 className="text-base font-bold mb-2 flex items-center gap-2">
-                                                    <span>👩‍🏫 综合反馈</span>
-                                                    {feedbackSourceTag && (
-                                                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded border border-gray-300 text-gray-600 uppercase">
-                                                            {feedbackSourceTag}
-                                                        </span>
-                                                    )}
-                                                </h3>
-                                                <div className="text-sm text-gray-700 mb-2">
-                                                    {reportData.engine_raw.integrated_feedback.overall_comment}
+                                                <div className="mb-2 flex flex-wrap items-start justify-between gap-2">
+                                                    <h3 className="text-base font-bold flex items-center gap-2">
+                                                        <span>👩‍🏫 综合反馈</span>
+                                                        {feedbackSourceTag && (
+                                                            <span className="text-[11px] font-semibold px-2 py-0.5 rounded border border-gray-300 text-gray-600 uppercase">
+                                                                {feedbackSourceTag}
+                                                            </span>
+                                                        )}
+                                                        {hasFeedbackOverride && (
+                                                            <span className="text-[11px] font-semibold px-2 py-0.5 rounded border border-emerald-200 text-emerald-700 bg-emerald-50">
+                                                                edited
+                                                            </span>
+                                                        )}
+                                                    </h3>
+                                                    <div className="flex flex-wrap items-center gap-2">
+                                                        {!isEditingFeedback ? (
+                                                            <button
+                                                                type="button"
+                                                                onClick={handleStartEditFeedback}
+                                                                className="px-2.5 py-1 rounded-md border border-gray-300 text-xs font-semibold text-gray-700 hover:bg-gray-50"
+                                                            >
+                                                                编辑
+                                                            </button>
+                                                        ) : (
+                                                            <>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={handleClearFeedbackOverride}
+                                                                    disabled={isSavingFeedback || !hasFeedbackOverride}
+                                                                    className="px-2.5 py-1 rounded-md border border-gray-300 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                                                >
+                                                                    恢复原始
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={handleCancelEditFeedback}
+                                                                    disabled={isSavingFeedback}
+                                                                    className="px-2.5 py-1 rounded-md border border-gray-300 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                                                >
+                                                                    取消
+                                                                </button>
+                                                                <button
+                                                                    type="button"
+                                                                    onClick={handleSaveFeedbackOverride}
+                                                                    disabled={isSavingFeedback || !feedbackDraft.trim()}
+                                                                    className="px-3 py-1 rounded-md bg-blue-600 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                                                                >
+                                                                    {isSavingFeedback ? '更新中...' : '完成更新'}
+                                                                </button>
+                                                            </>
+                                                        )}
+                                                    </div>
                                                 </div>
-                                                {reportData.engine_raw.integrated_feedback.specific_suggestions?.length > 0 && (
-                                                    <ul className="text-sm text-gray-600 space-y-1 mb-2">
-                                                        {reportData.engine_raw.integrated_feedback.specific_suggestions.slice(0, 2).map((s, i) => (
-                                                            <li key={i}>• {s}</li>
-                                                        ))}
-                                                    </ul>
+                                                {hasFeedbackOverride && feedbackOverrideUpdatedAt > 0 && (
+                                                    <div className="mb-2 text-[11px] text-emerald-700">
+                                                        已更新：{new Date(feedbackOverrideUpdatedAt * 1000).toLocaleString()}
+                                                    </div>
                                                 )}
-                                                {reportData.engine_raw.integrated_feedback.fun_challenge && (
-                                                    <div className="mt-2 p-2 bg-purple-50 rounded text-sm text-purple-700">
-                                                        {reportData.engine_raw.integrated_feedback.fun_challenge}
+                                                {!isEditingFeedback ? (
+                                                    <div className="text-sm text-gray-700 whitespace-pre-line">
+                                                        {activeIntegratedFeedbackText || '暂无反馈。'}
+                                                    </div>
+                                                ) : (
+                                                    <div className="space-y-2">
+                                                        <textarea
+                                                            ref={feedbackEditorRef}
+                                                            value={feedbackDraft}
+                                                            onChange={(e) => setFeedbackDraft(e.target.value)}
+                                                            className="w-full min-h-[130px] rounded-lg border border-gray-300 px-3 py-2 text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                                            placeholder="编辑综合反馈..."
+                                                        />
+                                                        <div className="text-[11px] text-gray-500">
+                                                            绿=表扬，红=问题，橙=建议，蓝=鼓励
+                                                        </div>
+                                                        <div className="space-y-2">
+                                                            <div className="text-xs font-semibold text-gray-700">AI预选建议</div>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {aiFeedbackSuggestions.map((item) => (
+                                                                    <button
+                                                                        key={`ai_${item.id}`}
+                                                                        type="button"
+                                                                        onClick={() => insertFeedbackPhrase(item)}
+                                                                        className={`px-2.5 py-1 rounded-full border text-xs font-medium ${FEEDBACK_PHRASE_CHIP_CLASS[item.category]}`}
+                                                                        title={item.text}
+                                                                    >
+                                                                        <span className="font-semibold mr-1">[{FEEDBACK_PHRASE_CATEGORY_LABEL[item.category]}]</span>
+                                                                        {item.label}
+                                                                    </button>
+                                                                ))}
+                                                            </div>
+                                                            <div className="text-[11px] text-gray-500">点击标签后会插入对应完整句子。</div>
+                                                        </div>
+                                                        <div className="space-y-2">
+                                                            <div className="text-xs font-semibold text-gray-700">教师词库建议</div>
+                                                            {teacherPhraseSuggestions.length > 0 ? (
+                                                                <div className="flex flex-wrap gap-2">
+                                                                    {teacherPhraseSuggestions.map((item) => (
+                                                                        <button
+                                                                            key={`bank_${item.id}`}
+                                                                            type="button"
+                                                                            onClick={() => insertFeedbackPhrase(item)}
+                                                                            className={`px-2.5 py-1 rounded-full border text-xs font-medium ${FEEDBACK_PHRASE_CHIP_CLASS[item.category]}`}
+                                                                            title={item.text}
+                                                                        >
+                                                                            <span className="font-semibold mr-1">[{FEEDBACK_PHRASE_CATEGORY_LABEL[item.category]}]</span>
+                                                                            {item.text}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            ) : (
+                                                                <div className="text-[11px] text-gray-500">词库暂无独立建议，可在下方新增。</div>
+                                                            )}
+                                                        </div>
+                                                        <div className="flex flex-wrap items-center gap-2">
+                                                            <select
+                                                                value={newTeacherPhraseCategory}
+                                                                onChange={(e) => setNewTeacherPhraseCategory(normalizeFeedbackPhraseCategory(e.target.value))}
+                                                                className="h-8 rounded-md border border-gray-300 px-2 text-xs text-gray-700 bg-white"
+                                                            >
+                                                                <option value="praise">表扬</option>
+                                                                <option value="issue">问题</option>
+                                                                <option value="advice">建议</option>
+                                                                <option value="encourage">鼓励</option>
+                                                            </select>
+                                                            <input
+                                                                type="text"
+                                                                value={newTeacherPhraseText}
+                                                                onChange={(e) => setNewTeacherPhraseText(e.target.value)}
+                                                                onKeyDown={(e) => {
+                                                                    if (e.key === 'Enter') {
+                                                                        e.preventDefault();
+                                                                        if (!isAddingTeacherPhrase) void handleAddTeacherPhrase();
+                                                                    }
+                                                                }}
+                                                                placeholder="新增常用语，回车或点“加入词库”"
+                                                                className="h-8 min-w-[260px] flex-1 rounded-md border border-gray-300 px-2 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                                                            />
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => void handleAddTeacherPhrase()}
+                                                                disabled={isAddingTeacherPhrase || !newTeacherPhraseText.trim()}
+                                                                className="h-8 px-3 rounded-md border border-gray-300 text-xs font-semibold text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                                                            >
+                                                                {isAddingTeacherPhrase ? '加入中...' : '加入词库'}
+                                                            </button>
+                                                            {isLoadingTeacherPhrases && (
+                                                                <span className="text-[11px] text-gray-500">词库加载中...</span>
+                                                            )}
+                                                        </div>
+                                                        <div className="text-xs text-gray-500">
+                                                            点击短语可插入到光标位置，然后点“完成更新”保存。
+                                                        </div>
                                                     </div>
                                                 )}
                                             </div>
