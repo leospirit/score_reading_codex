@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { LayoutDashboard, History, Settings, Upload, Film, Activity } from 'lucide-react';
+import { LayoutDashboard, History, Settings, Upload, Film, Activity, PanelsTopLeft } from 'lucide-react';
 import { useState } from 'react';
 import SettingsModal from './SettingsModal';
 import UploadModal from './UploadModal';
@@ -35,6 +35,16 @@ export default function Navigation() {
                             >
                                 <LayoutDashboard className="w-4 h-4" />
                                 Dashboard
+                            </Link>
+                            <Link
+                                to="/dashboard-pro"
+                                className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium transition-all ${isActive('/dashboard-pro')
+                                    ? 'bg-primary/10 text-primary border border-primary/20'
+                                    : 'text-gray-400 hover:text-white hover:bg-white/5 border border-transparent'
+                                    }`}
+                            >
+                                <PanelsTopLeft className="w-4 h-4" />
+                                Dashboard Pro
                             </Link>
                             <Link
                                 to="/history"

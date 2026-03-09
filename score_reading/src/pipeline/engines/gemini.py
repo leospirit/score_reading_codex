@@ -30,17 +30,26 @@ from src.pipeline.script_reference import (
     wait_for_script_reference,
 )
 from src.advice.playbook import build_playbook_runtime_hints
+from src.semantic_pronunciation import (
+    build_semantic_pronunciation_priors,
+    summarize_semantic_pronunciation_priors,
+)
 
 logger = logging.getLogger(__name__)
 
 # 闂傚倸鍊搁崐鎼佸磹閹间礁纾圭€瑰嫭鍣磋ぐ鎺戠倞妞ゆ帒顦伴弲顏堟偡濠婂啰效婵犫偓娓氣偓濮婅櫣绱掑Ο铏逛紘濠碘槅鍋勭€氼喗绔熼弴鐔虹瘈婵﹩鍘鹃崣鍡椻攽閻樼粯娑ф俊顐幖鍗遍柛婵勫劤濡垶鏌熼鍡楁噽妤旈梻浣告惈婢跺洭鍩€椤掍礁澧柛姘儔楠炴牜鍒掗崗澶婁壕鐎规洖娴傞崯鍥╃磽閸屾瑨鍏岄柛瀣崌瀹曟洟宕樺顔惧姺闂佽法鍠撴慨鎾嫅閻斿吋鐓忛柛顐ｇ箖閸嬵亪鏌涢敂璇插箰闁稿鎹囬弫鎰償閳ヨ尙鍑归梻浣虹帛缁诲啫煤閻旂厧绠栨俊銈呭暞閸犲棝鏌涢弴銊ュ妞わ负鍎甸幃妤€鈻撻崹顔界亪婵犫拃鍐弰妤犵偞鍨挎慨鈧柣姗嗗亝閺傗偓闂備焦鎮堕崕顕€寮插┑瀣剨闁割偁鍎查埛鎴犵磼鐎ｎ偄顕滄繝鈧幍顔剧＜閻庯綆鍋勯悘銉╂煃鐠囪尙孝闁宠鍨归埀顒婄秵閸嬧偓闁圭柉娅ｇ槐鎾存媴閸撴彃鍓卞銈嗗灦閻熲晛鐣烽弴銏犵疀闁绘鐗忛崢鐢告⒑閼姐倕鏋斿褎顨婂畷鏉课熷ú缁橆啍闂佺粯鍔栬ぐ鍐汲閻愮數纾奸柛灞剧☉缁椦囨煃瑜滈崜銊х礊閸℃稑纾婚柟鐑樺殾濞戙垹绀冮柕濞垮灪閺傗偓闂備胶绮崝鏍ь焽濞嗘挻鍊堕柨鏇炲€归崕鎴濐熆鐠鸿櫣鐏辩痪鎯у悑閵囧嫰寮撮悙鏉戞闂佽楠忛梽鍕箞?
 _whisper_engine = None
+_whisper_engine_lock = threading.Lock()
 
 def get_whisper_engine():
     global _whisper_engine
-    if _whisper_engine is None:
-        from src.pipeline.engines.whisper_engine import WhisperEngine
-        _whisper_engine = WhisperEngine()
+    if _whisper_engine is not None:
+        return _whisper_engine
+
+    with _whisper_engine_lock:
+        if _whisper_engine is None:
+            from src.pipeline.engines.whisper_engine import WhisperEngine
+            _whisper_engine = WhisperEngine()
     return _whisper_engine
 
 class GeminiRequestError(RuntimeError):
@@ -81,6 +90,7 @@ class GeminiEngine:
             
         # Default to Gemini 3 Flash Preview unless overridden in config.
         self.model_name = config.get("engines.gemini.model", "gemini-3-flash-preview")
+        self.api_base = str(config.get("engines.gemini.api_base") or os.getenv("GEMINI_API_BASE") or "").strip()
         self._ensure_request_semaphore()
         self._register_keys()
         
@@ -211,8 +221,19 @@ class GeminiEngine:
             if latency_ms > 0:
                 prev = float(state.get("avg_latency_ms", 1200.0))
                 state["avg_latency_ms"] = (prev * 0.85) + (latency_ms * 0.15)
+            reason_l = str(reason or "").lower()
+            is_timeout = (
+                "timed out" in reason_l
+                or "read timeout" in reason_l
+                or "connect timeout" in reason_l
+                or "network error" in reason_l
+            )
             # 429 should cool longer than transient 5xx.
-            if status_code == 429:
+            if is_timeout:
+                # Timeouts are commonly path/key quality issues in this deployment.
+                # Cool down longer so retries quickly move to other keys.
+                base_wait = min(60.0, 8.0 + 10.0 * state["failures"])
+            elif status_code == 429:
                 base_wait = min(5.0, 0.9 + 0.8 * state["failures"])
             elif status_code in {500, 502, 503, 504}:
                 base_wait = min(3.0, 0.5 + 0.45 * state["failures"])
@@ -298,7 +319,18 @@ class GeminiEngine:
         )
 
     def _request_gemini_rest(self, *, key: str, prompt: str, audio_b64: str) -> str:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        endpoint_candidates: list[str] = []
+        if self.api_base:
+            base = self.api_base.rstrip("/")
+            if base.endswith("/v1") or base.endswith("/v1beta"):
+                endpoint_candidates.append(f"{base}/models/{self.model_name}:generateContent")
+            else:
+                endpoint_candidates.append(f"{base}/v1beta/models/{self.model_name}:generateContent")
+                endpoint_candidates.append(f"{base}/v1/models/{self.model_name}:generateContent")
+        endpoint_candidates.append(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
+        )
+
         payload = {
             "contents": [
                 {
@@ -317,68 +349,83 @@ class GeminiEngine:
             "generationConfig": {"temperature": 0.0},
         }
 
-        try:
-            connect_timeout = float(config.get("engines.gemini.connect_timeout_sec", 6.0))
-            read_timeout = float(config.get("engines.gemini.read_timeout_sec", 28.0))
-            resp = requests.post(
-                endpoint,
-                params={"key": key},
-                json=payload,
-                timeout=(max(2.0, connect_timeout), max(6.0, read_timeout)),
-            )
-        except requests.RequestException as exc:
-            raise GeminiRequestError(
-                f"Gemini network error: {exc}",
+        connect_timeout = float(config.get("engines.gemini.connect_timeout_sec", 6.0))
+        read_timeout = float(config.get("engines.gemini.read_timeout_sec", 28.0))
+        timeout_cfg = (max(2.0, connect_timeout), max(6.0, read_timeout))
+        last_error: GeminiRequestError | None = None
+
+        for endpoint in endpoint_candidates:
+            is_proxy_endpoint = bool(self.api_base) and endpoint.startswith(self.api_base.rstrip("/"))
+
+            try:
+                resp = requests.post(
+                    endpoint,
+                    params={"key": key},
+                    json=payload,
+                    timeout=timeout_cfg,
+                )
+            except requests.RequestException as exc:
+                last_error = GeminiRequestError(
+                    f"Gemini network error: {exc}",
+                    retryable=True,
+                )
+                continue
+
+            raw_text = (resp.text or "").strip()
+            try:
+                data = resp.json()
+            except Exception:
+                data = None
+
+            if resp.status_code >= 400:
+                # Proxy endpoint may not support Gemini REST paths; try next candidate.
+                if is_proxy_endpoint and resp.status_code in {404, 405}:
+                    continue
+                message = self._extract_error_message(data) if data is not None else raw_text[:300]
+                invalid_key = self._is_invalid_key_message(message)
+                retryable = resp.status_code in {429, 500, 502, 503, 504}
+                if invalid_key:
+                    retryable = True
+                raise GeminiRequestError(
+                    f"Gemini HTTP {resp.status_code}: {message or raw_text[:300]}",
+                    status_code=resp.status_code,
+                    retryable=retryable,
+                    invalid_key=invalid_key,
+                )
+
+            if not isinstance(data, dict):
+                last_error = GeminiRequestError(
+                    "Gemini response is not JSON",
+                    retryable=True,
+                )
+                continue
+
+            for candidate in data.get("candidates") or []:
+                content = candidate.get("content") if isinstance(candidate, dict) else {}
+                parts = content.get("parts") if isinstance(content, dict) else []
+                for part in parts or []:
+                    text = part.get("text") if isinstance(part, dict) else None
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+
+            block_reason = ""
+            prompt_feedback = data.get("promptFeedback")
+            if isinstance(prompt_feedback, dict):
+                block_reason = str(prompt_feedback.get("blockReason") or "").strip()
+            if block_reason:
+                raise GeminiRequestError(
+                    f"Gemini blocked by safety policy: {block_reason}",
+                    retryable=False,
+                )
+
+            last_error = GeminiRequestError(
+                "Gemini returned empty candidate text",
                 retryable=True,
-            ) from exc
-
-        raw_text = (resp.text or "").strip()
-        try:
-            data = resp.json()
-        except Exception:
-            data = None
-
-        if resp.status_code >= 400:
-            message = self._extract_error_message(data) if data is not None else raw_text[:300]
-            invalid_key = self._is_invalid_key_message(message)
-            retryable = resp.status_code in {429, 500, 502, 503, 504}
-            if invalid_key:
-                retryable = True
-            raise GeminiRequestError(
-                f"Gemini HTTP {resp.status_code}: {message or raw_text[:300]}",
-                status_code=resp.status_code,
-                retryable=retryable,
-                invalid_key=invalid_key,
             )
 
-        if not isinstance(data, dict):
-            raise GeminiRequestError(
-                "Gemini response is not JSON",
-                retryable=True,
-            )
-
-        for candidate in data.get("candidates") or []:
-            content = candidate.get("content") if isinstance(candidate, dict) else {}
-            parts = content.get("parts") if isinstance(content, dict) else []
-            for part in parts or []:
-                text = part.get("text") if isinstance(part, dict) else None
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-
-        block_reason = ""
-        prompt_feedback = data.get("promptFeedback")
-        if isinstance(prompt_feedback, dict):
-            block_reason = str(prompt_feedback.get("blockReason") or "").strip()
-        if block_reason:
-            raise GeminiRequestError(
-                f"Gemini blocked by safety policy: {block_reason}",
-                retryable=False,
-            )
-
-        raise GeminiRequestError(
-            "Gemini returned empty candidate text",
-            retryable=True,
-        )
+        if last_error is not None:
+            raise last_error
+        raise GeminiRequestError("Gemini request failed with unknown error", retryable=True)
 
     def run(
         self,
@@ -421,6 +468,16 @@ class GeminiEngine:
             script_text=script_text if is_reference_mode else "",
             max_items=6,
         )
+        semantic_priors = (
+            (script_reference or {}).get("semantic_pronunciation_priors")
+            if isinstance(script_reference, dict)
+            else None
+        )
+        if not isinstance(semantic_priors, list) or not semantic_priors:
+            semantic_priors = build_semantic_pronunciation_priors(script_text if is_reference_mode else "")
+        semantic_prior_text = "\n".join(summarize_semantic_pronunciation_priors(semantic_priors[:6]))
+        if not semantic_prior_text:
+            semantic_prior_text = "None"
 
         # 2) Build optional alignment skeleton
         base_alignment = None
@@ -440,7 +497,10 @@ class GeminiEngine:
                 else:
                     whisper = get_whisper_engine()
                     whisper_words = whisper._transcribe(wav_path)
-                    base_alignment = whisper._create_alignment_from_transcript(whisper_words, script_text)
+                    # Build timing skeleton from Whisper word timestamps, then align to script.
+                    # NOTE: WhisperEngine exposes `_align_with_script`; `_create_alignment_from_transcript`
+                    # does not exist and would force Gemini-only fallback (synthetic timeline).
+                    base_alignment = whisper._align_with_script(whisper_words, script_text)
                     logger.info("Whisper skeleton ready: %d words", len(base_alignment.words))
             except Exception as e:
                 logger.warning("Hybrid alignment failed; continue with Gemini-only path: %s", e)
@@ -461,6 +521,9 @@ Reference hints (optional):
 Classic pronunciation playbook (optional; use only when evidence matches):
 {playbook_hints}
 
+Semantic pronunciation priors (obey when context matches):
+{semantic_prior_text}
+
 Tasks:
 1) Compare student audio against the reference script.
 2) Score each spoken word (0-100) and identify error type.
@@ -476,6 +539,7 @@ Short feedback rules (MANDATORY):
 - top_errors should include 1-3 concrete items when evidence exists.
 - For each top_errors[i].improvement: use Chinese, one sentence only, under 28 Chinese characters.
 - Improvement must be direct and executable (slow read + sentence read); no stories or mnemonics.
+- If semantic pronunciation priors are provided for an ambiguous word, obey them unless the local script context clearly contradicts them.
 
 Output JSON only:
 {{
@@ -553,6 +617,10 @@ Output JSON only:
             f"{prompt}\n\nClassic pronunciation playbook (optional; use only when evidence matches):\n"
             f"{playbook_hints}\n"
         )
+        prompt = (
+            f"{prompt}\nSemantic pronunciation priors (obey when context matches):\n"
+            f"{semantic_prior_text}\n"
+        )
 
         # 4) Encode audio and execute with key rotation
         with open(wav_path, "rb") as f:
@@ -560,7 +628,7 @@ Output JSON only:
 
         default_attempts = max(1, len(self.api_keys))
         max_attempts = int(config.get("engines.gemini.max_attempts", default_attempts))
-        max_attempts = max(2, max_attempts)
+        max_attempts = max(1, max_attempts)
         last_error: Optional[Exception] = None
         deadline_sec = float(config.get("engines.gemini.max_total_wait_sec", 60.0))
         deadline_at = time.time() + max(12.0, deadline_sec)
@@ -633,7 +701,17 @@ Output JSON only:
                 if base_alignment:
                     final_alignment = self._merge_fusion(base_alignment, gemini_alignment)
                     self._adaptive_calibration(final_alignment)
+                    self._lock_transcript_missing_words(
+                        script_text=script_text,
+                        detected_transcript=str(engine_raw.get("detected_transcript", "") or ""),
+                        alignment=final_alignment,
+                    )
                     return final_alignment, engine_raw
+                self._lock_transcript_missing_words(
+                    script_text=script_text,
+                    detected_transcript=str(engine_raw.get("detected_transcript", "") or ""),
+                    alignment=gemini_alignment,
+                )
                 return gemini_alignment, engine_raw
 
             except GeminiRequestError as e:
@@ -876,11 +954,11 @@ Output JSON only:
         completeness = _to_score(data.get("completeness_score"))
 
         if fluency >= max(accuracy, completeness):
-            highlight = f"\u6d41\u5229\u5ea6\uff08{fluency:.0f}\u5206\uff09"
+            highlight = "\u6d41\u5229\u5ea6"
         elif accuracy >= completeness:
-            highlight = f"\u53d1\u97f3\u51c6\u786e\u5ea6\uff08{accuracy:.0f}\u5206\uff09"
+            highlight = "\u53d1\u97f3\u51c6\u786e\u5ea6"
         else:
-            highlight = f"\u5b8c\u6574\u5ea6\uff08{completeness:.0f}\u5206\uff09"
+            highlight = "\u5b8c\u6574\u5ea6"
 
         focus_word = self._pick_focus_word(word_details)
         if focus_word:
@@ -1073,6 +1151,62 @@ Output JSON only:
                     continue
                 w.score = min(100.0, w.score + boost)
                 _retag(w)
+
+    def _compute_transcript_missing_indices(self, script_text: str, detected_transcript: str) -> set[int]:
+        from difflib import SequenceMatcher
+
+        def _tokenize(text: str) -> list[str]:
+            raw_tokens = re.findall(r"[A-Za-z0-9']+", str(text or ""))
+            tokens: list[str] = []
+            for token in raw_tokens:
+                normalized = re.sub(r"[^a-z0-9']+", "", token.lower()).strip("'")
+                if normalized:
+                    tokens.append(normalized)
+            return tokens
+
+        script_tokens = _tokenize(script_text)
+        detected_tokens = _tokenize(detected_transcript)
+        if len(script_tokens) < 6 or not detected_tokens:
+            return set()
+
+        # Guard rail: when transcript is very sparse, avoid forcing mass missing by text diff alone.
+        coverage = len(detected_tokens) / max(1, len(script_tokens))
+        if coverage < 0.70:
+            return set()
+
+        matcher = SequenceMatcher(None, script_tokens, detected_tokens)
+        missing_indices: set[int] = set()
+        for tag, i1, i2, _, _ in matcher.get_opcodes():
+            if tag == "delete":
+                missing_indices.update(range(i1, i2))
+        return missing_indices
+
+    def _lock_transcript_missing_words(
+        self,
+        *,
+        script_text: str,
+        detected_transcript: str,
+        alignment: Alignment,
+    ) -> None:
+        missing_indices = self._compute_transcript_missing_indices(script_text, detected_transcript)
+        if not missing_indices:
+            return
+
+        locked_count = 0
+        for idx in sorted(missing_indices):
+            if idx < 0 or idx >= len(alignment.words):
+                continue
+            word = alignment.words[idx]
+            if word.tag == WordTag.MISSING:
+                continue
+            word.tag = WordTag.MISSING
+            word.score = 0.0
+            if not getattr(word, "diagnosis", ""):
+                word.diagnosis = "Transcript evidence: omitted word."
+            locked_count += 1
+
+        if locked_count > 0:
+            logger.info("Transcript omission lock applied to %s word(s).", locked_count)
 
     def _merge_fusion(self, base_alignment: Alignment, gemini_alignment: Alignment) -> Alignment:
         """

@@ -6,6 +6,9 @@ for low latency. Local wav2vec2+whisper path is still available as a backup.
 """
 import logging
 import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,140 @@ class ProEngine:
             self.whisper = WhisperEngine()
         return self.whisper
 
+    @staticmethod
+    def _normalize_token(token: str) -> str:
+        norm = re.sub(r"[^a-z0-9']+", "", str(token or "").lower())
+        return norm.strip("'")
+
+    def _overlay_gemini_annotations(
+        self,
+        azure_alignment: Alignment,
+        gemini_alignment: Alignment,
+    ) -> tuple[Alignment, dict[str, Any]]:
+        """
+        Keep Azure timing/scoring basis, but let Gemini own word-level error labels.
+        This is a display/diagnostic overlay only; factor scores remain Azure-native.
+        """
+        from difflib import SequenceMatcher
+
+        if not azure_alignment.words:
+            return azure_alignment, {"mode": "empty_azure"}
+        if not gemini_alignment.words:
+            return azure_alignment, {"mode": "empty_gemini"}
+
+        word_ok = float(config.get("analysis.word_thresholds.ok", 65))
+        word_weak = float(config.get("analysis.word_thresholds.weak", 40))
+        baseline_floor = max(word_weak + 10.0, 55.0)
+
+        # Reset word tags first so reading highlights only reflect Gemini judgement.
+        for w in azure_alignment.words:
+            if float(getattr(w, "score", 0.0) or 0.0) <= 0.0:
+                w.score = baseline_floor
+            w.tag = WordTag.OK
+            w.diagnosis = ""
+
+        base_tokens = [self._normalize_token(w.word) for w in azure_alignment.words]
+        gem_tokens = [self._normalize_token(w.word) for w in gemini_alignment.words]
+        base_nonempty = [t for t in base_tokens if t]
+        gem_nonempty = [t for t in gem_tokens if t]
+        coverage_ratio = len(gem_nonempty) / max(1, len(base_nonempty))
+
+        applied = 0
+        missing_applied = 0
+        weak_applied = 0
+        poor_applied = 0
+        skipped_placeholder = 0
+        missing_indices: set[int] = set()
+        track_missing_indices = False
+
+        def _is_placeholder_judgement(gem_word: Any) -> bool:
+            text = str(getattr(gem_word, "diagnosis", "") or "").lower()
+            if not text:
+                return False
+            placeholder_markers = (
+                "sparse token coverage",
+                "kept acoustic judgement",
+                "alignment gap only",
+                "pending further evidence",
+            )
+            return any(marker in text for marker in placeholder_markers)
+
+        def _apply(base_idx: int, gem_word: Any) -> None:
+            nonlocal applied, missing_applied, weak_applied, poor_applied, skipped_placeholder
+            base_word = azure_alignment.words[base_idx]
+            if _is_placeholder_judgement(gem_word):
+                skipped_placeholder += 1
+                return
+            g_tag = getattr(gem_word, "tag", WordTag.OK)
+            base_word.tag = g_tag
+            if g_tag == WordTag.MISSING:
+                base_word.score = 0.0
+                missing_applied += 1
+                if track_missing_indices:
+                    missing_indices.add(base_idx)
+            elif g_tag == WordTag.WEAK:
+                base_word.score = min(float(base_word.score or 0.0), max(word_weak + 1.0, word_ok - 1.0))
+                weak_applied += 1
+            elif g_tag == WordTag.POOR:
+                base_word.score = min(float(base_word.score or 0.0), max(0.0, word_weak - 2.0))
+                poor_applied += 1
+            diag = str(getattr(gem_word, "diagnosis", "") or "").strip()
+            if diag:
+                base_word.diagnosis = diag
+            applied += 1
+
+        # Sparse output: Gemini likely returned issue words only.
+        if coverage_ratio < 0.70:
+            mode = "sparse_issue_overlay"
+            gem_issue_pool: dict[str, list[Any]] = {}
+            for gw in gemini_alignment.words:
+                key = self._normalize_token(gw.word)
+                if not key:
+                    continue
+                has_issue = (getattr(gw, "tag", WordTag.OK) != WordTag.OK) or bool(str(getattr(gw, "diagnosis", "") or "").strip())
+                if not has_issue:
+                    continue
+                gem_issue_pool.setdefault(key, []).append(gw)
+
+            for idx, bw in enumerate(azure_alignment.words):
+                key = self._normalize_token(bw.word)
+                candidates = gem_issue_pool.get(key) or []
+                if not candidates:
+                    continue
+                _apply(idx, candidates.pop(0))
+        else:
+            mode = "sequence_overlay"
+            track_missing_indices = True
+            matcher = SequenceMatcher(None, base_tokens, gem_tokens)
+            for op, i1, i2, j1, j2 in matcher.get_opcodes():
+                if op == "equal":
+                    for k in range(min(i2 - i1, j2 - j1)):
+                        _apply(i1 + k, gemini_alignment.words[j1 + k])
+                elif op == "replace":
+                    base_len = i2 - i1
+                    gem_len = j2 - j1
+                    if gem_len <= 0:
+                        continue
+                    for k in range(base_len):
+                        mapped = min(gem_len - 1, max(0, int(k * gem_len / max(base_len, 1))))
+                        _apply(i1 + k, gemini_alignment.words[j1 + mapped])
+                elif op == "insert":
+                    continue
+                elif op == "delete":
+                    continue
+
+        stats = {
+            "mode": mode,
+            "gemini_coverage_ratio": round(coverage_ratio, 3),
+            "applied_words": int(applied),
+            "skipped_placeholder": int(skipped_placeholder),
+            "missing_applied": int(missing_applied),
+            "missing_indices": sorted(missing_indices) if track_missing_indices else [],
+            "weak_applied": int(weak_applied),
+            "poor_applied": int(poor_applied),
+        }
+        return azure_alignment, stats
+
     def run(
         self,
         wav_path: Path,
@@ -34,27 +171,130 @@ class ProEngine:
         logger.info("Pro engine starting")
         cloud_errors: list[str] = []
 
-        # 1) Gemini first
-        gemini_key = config.get("engines.gemini.api_key") or os.getenv("GEMINI_API_KEY")
-        if gemini_key:
-            try:
-                from src.pipeline.engines.gemini import run_gemini_engine
-                logger.info("Pro engine: using Gemini first")
-                return run_gemini_engine(wav_path, script_text, work_dir)
-            except Exception as e:
-                cloud_errors.append(f"gemini: {e}")
-                logger.warning("Gemini failed inside Pro; trying next option: %s", e)
-
-        # 2) Azure second
+        # 1) Run cloud engines in parallel to reduce end-to-end latency.
+        azure_result: tuple[Alignment, dict[str, Any]] | None = None
+        gemini_result: tuple[Alignment, dict[str, Any]] | None = None
         azure_key = config.get("engines.azure.api_key") or os.getenv("AZURE_API_KEY")
-        if azure_key:
-            try:
+        gemini_key = config.get("engines.gemini.api_key") or os.getenv("GEMINI_API_KEY")
+        azure_future = None
+        gemini_future = None
+
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            if azure_key:
                 from src.pipeline.engines.azure import run_azure_engine
-                logger.info("Pro engine: trying Azure")
-                return run_azure_engine(wav_path, script_text, work_dir)
-            except Exception as e:
-                cloud_errors.append(f"azure: {e}")
-                logger.warning("Azure failed inside Pro; trying local fallback: %s", e)
+                logger.info("Pro engine: starting Azure baseline scoring")
+                azure_future = pool.submit(run_azure_engine, wav_path, script_text, work_dir)
+            if gemini_key:
+                from src.pipeline.engines.gemini import run_gemini_engine
+                logger.info("Pro engine: starting Gemini annotation pass")
+                gemini_future = pool.submit(run_gemini_engine, wav_path, script_text, work_dir)
+
+            if azure_future is not None:
+                try:
+                    azure_result = azure_future.result()
+                except Exception as e:
+                    cloud_errors.append(f"azure: {e}")
+                    logger.warning("Azure failed inside Pro; trying Gemini fallback: %s", e)
+
+            if gemini_future is not None:
+                try:
+                    if azure_result is not None:
+                        raw_wait = config.get("engines.pro.gemini_overlay_wait_sec", 10.0)
+                        try:
+                            overlay_wait_sec = max(0.0, float(raw_wait))
+                        except Exception:
+                            overlay_wait_sec = 10.0
+                        gemini_result = gemini_future.result(timeout=overlay_wait_sec)
+                    else:
+                        gemini_result = gemini_future.result()
+                except FutureTimeoutError:
+                    cloud_errors.append("gemini: overlay_wait_timeout")
+                    logger.warning(
+                        "Gemini overlay timed out after Azure baseline; continue with Azure-only annotation."
+                    )
+                except Exception as e:
+                    cloud_errors.append(f"gemini: {e}")
+                    logger.warning("Gemini failed inside Pro annotation pass: %s", e)
+        finally:
+            if gemini_future is not None and gemini_result is None and not gemini_future.done():
+                gemini_future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        # Azure baseline exists: keep Azure scores unchanged, overlay Gemini labels if available.
+        if azure_result is not None:
+            alignment, engine_raw = azure_result
+            engine_raw["engine_type"] = "pro_azure_scoring"
+            raw_prefer_gemini = config.get("engines.gemini.prefer_gemini", True)
+            prefer_gemini = str(raw_prefer_gemini).strip().lower() not in ("0", "false", "no", "off")
+            raw_overlay_retry_count = config.get("engines.pro.gemini_overlay_retry_count", 1)
+            try:
+                overlay_retry_count = int(raw_overlay_retry_count)
+            except Exception:
+                overlay_retry_count = 1
+            if overlay_retry_count < 0:
+                overlay_retry_count = 0
+
+            # GE priority: if Azure is ready but Gemini annotation missed, retry Gemini overlay once more.
+            if gemini_result is None and prefer_gemini and gemini_key and overlay_retry_count > 0:
+                from src.pipeline.engines.gemini import run_gemini_engine
+                for retry_idx in range(overlay_retry_count):
+                    try:
+                        logger.info(
+                            "Gemini overlay retry %d/%d on Azure baseline",
+                            retry_idx + 1,
+                            overlay_retry_count,
+                        )
+                        gemini_result = run_gemini_engine(wav_path, script_text, work_dir)
+                        logger.info("Gemini overlay retry succeeded.")
+                        break
+                    except Exception as e:
+                        cloud_errors.append(f"gemini_retry_{retry_idx + 1}: {e}")
+                        logger.warning(
+                            "Gemini overlay retry %d/%d failed: %s",
+                            retry_idx + 1,
+                            overlay_retry_count,
+                            e,
+                        )
+                        time.sleep(0.25)
+
+            if gemini_result is not None:
+                gemini_alignment, gemini_raw = gemini_result
+                alignment, anno_stats = self._overlay_gemini_annotations(alignment, gemini_alignment)
+                engine_raw["annotation_source"] = "gemini"
+                engine_raw["gemini_annotation_stats"] = anno_stats
+                engine_raw["gemini_missing_indices"] = list(anno_stats.get("missing_indices") or [])
+                if isinstance(gemini_raw, dict):
+                    if gemini_raw.get("ai_referee"):
+                        engine_raw["ai_referee"] = gemini_raw.get("ai_referee")
+                    if gemini_raw.get("integrated_feedback"):
+                        engine_raw["integrated_feedback"] = gemini_raw.get("integrated_feedback")
+                    if gemini_raw.get("script_reference"):
+                        engine_raw["script_reference"] = gemini_raw.get("script_reference")
+                    if gemini_raw.get("detected_transcript"):
+                        engine_raw["gemini_detected_transcript"] = gemini_raw.get("detected_transcript")
+                logger.info("Applied Gemini annotation overlay on Azure baseline: %s", anno_stats)
+            else:
+                engine_raw["annotation_source"] = "azure_only"
+
+            if cloud_errors:
+                engine_raw["pro_cloud_errors"] = cloud_errors
+            return alignment, engine_raw
+
+        raw_strict_azure = config.get("engines.pro.strict_azure_scoring", True)
+        strict_azure_scoring = str(raw_strict_azure).strip().lower() not in ("0", "false", "no", "off")
+        if strict_azure_scoring:
+            detail = " | ".join(cloud_errors) if cloud_errors else "Azure baseline unavailable."
+            raise RuntimeError(f"Azure scoring unavailable (strict_azure_scoring=true): {detail}")
+
+        # Azure unavailable but Gemini succeeded: optional fallback when strict mode is disabled.
+        if gemini_result is not None:
+            alignment, engine_raw = gemini_result
+            engine_raw["engine_type"] = "pro_gemini_only_fallback"
+            engine_raw["score_fallback"] = "gemini"
+            if cloud_errors:
+                engine_raw["pro_cloud_errors"] = cloud_errors
+            return alignment, engine_raw
 
         # Accuracy-first mode: never output local fallback scores as final results.
         raw_require_cloud = config.get("engines.pro.require_cloud_success", True)

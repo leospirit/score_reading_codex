@@ -38,20 +38,20 @@ class Config:
         如果未指定，则加载默认配置，并尝试合并用户配置。
         """
         # 1. 加载默认配置
-        self._data = self._get_default_config()
+        merged_data = self._get_default_config()
         
         # 2. 如果有默认配置文件，覆盖内置默认值 (可选)
         if DEFAULT_CONFIG_PATH.exists():
             with open(DEFAULT_CONFIG_PATH, encoding="utf-8") as f:
                 default_file_data = yaml.safe_load(f) or {}
-                self._merge_config(self._data, default_file_data)
+                self._merge_config(merged_data, default_file_data)
 
         # 3. 如果指定了配置文件，加载并覆盖
         if config_path:
             if config_path.exists():
                 with open(config_path, encoding="utf-8") as f:
                     custom_data = yaml.safe_load(f) or {}
-                    self._merge_config(self._data, custom_data)
+                    self._merge_config(merged_data, custom_data)
                 logger.info(f"已加载自定义配置文件: {config_path}")
             else:
                 logger.warning(f"指定配置文件不存在: {config_path}")
@@ -61,10 +61,13 @@ class Config:
             try:
                 with open(USER_CONFIG_PATH, encoding="utf-8") as f:
                     user_data = yaml.safe_load(f) or {}
-                    self._merge_config(self._data, user_data)
+                    self._merge_config(merged_data, user_data)
                 logger.info(f"已加载用户配置文件: {USER_CONFIG_PATH}")
             except Exception as e:
                 logger.warning(f"加载用户配置失败: {e}")
+
+        # Avoid exposing partially merged state during concurrent reloads.
+        self._data = merged_data
 
     def save_user_config(self, updates: dict[str, Any]) -> None:
         """
@@ -150,6 +153,12 @@ class Config:
                 "confusions_top_n": 2,
                 "word_thresholds": {"ok": 70, "weak": 40},
                 "phoneme_thresholds": {"ok": 70, "weak": 40},
+                "missing_debug": {
+                    "enabled": False,
+                    "path": "data/diagnostics/missing_debug.jsonl",
+                    "max_script_chars": 360,
+                    "max_transcript_chars": 360,
+                },
             },
             "fallback": {
                 "max_missing_words_ratio": 0.25,

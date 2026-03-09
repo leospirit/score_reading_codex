@@ -1,7 +1,8 @@
-﻿import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+﻿import { useState, useEffect, useCallback, useMemo, useRef, type ChangeEvent } from 'react';
 import { Printer, GripVertical, Check, X, Plus, Eye, Camera, Download } from 'lucide-react';
-import JSZip from 'jszip';
+import JSZip, { type JSZipObject } from 'jszip';
 import { API_HOST } from '../config/api';
+import { getFeedbackStatusHint } from './reportFeedbackStatus';
 
 // 鍙敤妯″潡瀹氫箟
 interface ModuleConfig {
@@ -136,6 +137,15 @@ interface ReportData {
         updated_at?: number;
         updated_by?: string;
     };
+    feedback_optimization?: {
+        status?: 'pending' | 'optimizing' | 'frozen' | 'final';
+        version?: number;
+        current_provider?: string;
+        current_text?: string;
+        updated_at?: number;
+        last_error?: string;
+        freeze_reason?: string;
+    };
 }
 
 type FeedbackPhraseCategory = 'praise' | 'issue' | 'advice' | 'encourage';
@@ -166,6 +176,54 @@ type WindowWithFsAccess = Window & {
     showSaveFilePicker?: (options?: unknown) => Promise<SaveFileHandleLike>;
     showDirectoryPicker?: (options?: unknown) => Promise<DirectoryHandleLike>;
 };
+type CaptureTemplate = 'classic' | 'aurora' | 'card' | 'mint' | 'sunset' | 'ink' | 'imported';
+type ImportedTemplateAssets = {
+    name: string;
+    topDataUrl: string;
+    middleDataUrl: string;
+    bottomDataUrl: string;
+    topHeightPx: number;
+    bottomHeightPx: number;
+    contentPaddingPx: number;
+};
+type ImportedTemplateManifest = {
+    name?: string;
+    top_height_px?: number;
+    bottom_height_px?: number;
+    content_padding_px?: number;
+    files?: {
+        top?: string;
+        middle?: string;
+        bottom?: string;
+    };
+};
+
+const CAPTURE_TEMPLATE_LABEL: Record<CaptureTemplate, string> = {
+    classic: '经典白底',
+    aurora: '柔彩渐变',
+    card: '卡片海报',
+    mint: '薄荷清新',
+    sunset: '暖阳橙金',
+    ink: '墨蓝课堂',
+    imported: '导入模板',
+};
+const CAPTURE_TEMPLATE_STORAGE_KEY = 'score_reading.capture_template';
+
+function isCaptureTemplate(raw: unknown): raw is CaptureTemplate {
+    if (typeof raw !== 'string') return false;
+    return Object.prototype.hasOwnProperty.call(CAPTURE_TEMPLATE_LABEL, raw);
+}
+
+function readCaptureTemplateFromStorage(): CaptureTemplate {
+    if (typeof window === 'undefined') return 'classic';
+    try {
+        const raw = window.localStorage.getItem(CAPTURE_TEMPLATE_STORAGE_KEY);
+        if (isCaptureTemplate(raw) && raw !== 'imported') return raw;
+    } catch {
+        // ignore
+    }
+    return 'classic';
+}
 
 const getErrorMessage = (value: unknown, fallback: string): string => {
     if (value instanceof Error && value.message) return value.message;
@@ -234,6 +292,282 @@ const FEEDBACK_PHRASE_CHIP_CLASS: Record<FeedbackPhraseCategory, string> = {
     issue: 'border-rose-300 text-rose-700 bg-rose-50 hover:bg-rose-100',
     advice: 'border-amber-300 text-amber-700 bg-amber-50 hover:bg-amber-100',
     encourage: 'border-sky-300 text-sky-700 bg-sky-50 hover:bg-sky-100',
+};
+const EXPORT_A4_WIDTH_PX = 1240;
+const EXPORT_A4_HEIGHT_PX = 1754;
+const EXPORT_PIXEL_RATIO = 2;
+const TEMPLATE_ZIP_MAX_MB = 20;
+const TEMPLATE_DEFAULT_TOP_HEIGHT_PX = 220;
+const TEMPLATE_DEFAULT_BOTTOM_HEIGHT_PX = 160;
+const TEMPLATE_DEFAULT_CONTENT_PADDING_PX = 72;
+
+const pickZipEntry = (zip: JSZip, names: string[]): JSZipObject | null => {
+    for (const name of names) {
+        const direct = zip.file(name);
+        if (direct) return direct;
+        const bySuffix = zip.file(new RegExp(`${name.replace('.', '\\.')}$`, 'i'));
+        if (bySuffix && bySuffix.length > 0) return bySuffix[0];
+    }
+    return null;
+};
+
+const imageDataUrlFromZipEntry = async (entry: JSZipObject): Promise<string> => {
+    const base64 = await entry.async('base64');
+    const lower = entry.name.toLowerCase();
+    const mime = lower.endsWith('.jpg') || lower.endsWith('.jpeg')
+        ? 'image/jpeg'
+        : lower.endsWith('.webp')
+            ? 'image/webp'
+            : 'image/png';
+    return `data:${mime};base64,${base64}`;
+};
+
+const fileToDataUrl = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error(`读取文件失败: ${file.name}`));
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.readAsDataURL(file);
+    });
+};
+
+const clamp = (value: number, min: number, max: number): number => {
+    return Math.min(max, Math.max(min, value));
+};
+
+const loadImageFromDataUrl = (dataUrl: string): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('图片加载失败'));
+        img.src = dataUrl;
+    });
+};
+
+const cropImageToDataUrl = (
+    image: HTMLImageElement,
+    sx: number,
+    sy: number,
+    sw: number,
+    sh: number,
+): string => {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(sw));
+    canvas.height = Math.max(1, Math.round(sh));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas context unavailable');
+    ctx.drawImage(
+        image,
+        Math.round(sx),
+        Math.round(sy),
+        Math.round(sw),
+        Math.round(sh),
+        0,
+        0,
+        canvas.width,
+        canvas.height,
+    );
+    return canvas.toDataURL('image/png');
+};
+
+type RowProfile = {
+    r: number;
+    g: number;
+    b: number;
+    edge: number;
+};
+
+const mean = (values: number[]): number => {
+    if (!values.length) return 0;
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+};
+
+const buildRowProfiles = (image: HTMLImageElement): { rows: RowProfile[]; sampleHeight: number; sourceHeight: number } => {
+    const sourceWidth = Math.max(1, image.naturalWidth || image.width);
+    const sourceHeight = Math.max(1, image.naturalHeight || image.height);
+    const sampleWidth = Math.min(320, sourceWidth);
+    const ratio = sampleWidth / sourceWidth;
+    const sampleHeight = Math.max(240, Math.min(1800, Math.round(sourceHeight * ratio)));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = sampleWidth;
+    canvas.height = sampleHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas context unavailable');
+    ctx.drawImage(image, 0, 0, sampleWidth, sampleHeight);
+
+    const data = ctx.getImageData(0, 0, sampleWidth, sampleHeight).data;
+    const rows: RowProfile[] = [];
+    for (let y = 0; y < sampleHeight; y++) {
+        let sumR = 0;
+        let sumG = 0;
+        let sumB = 0;
+        let edge = 0;
+        let prevR = 0;
+        let prevG = 0;
+        let prevB = 0;
+        for (let x = 0; x < sampleWidth; x++) {
+            const idx = (y * sampleWidth + x) * 4;
+            const r = data[idx];
+            const g = data[idx + 1];
+            const b = data[idx + 2];
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            if (x > 0) {
+                edge += Math.abs(r - prevR) + Math.abs(g - prevG) + Math.abs(b - prevB);
+            }
+            prevR = r;
+            prevG = g;
+            prevB = b;
+        }
+        rows.push({
+            r: sumR / sampleWidth,
+            g: sumG / sampleWidth,
+            b: sumB / sampleWidth,
+            edge: edge / Math.max(1, (sampleWidth - 1) * 3 * 255),
+        });
+    }
+    return { rows, sampleHeight, sourceHeight };
+};
+
+const findAutoSliceCuts = (image: HTMLImageElement): { topCutPx: number; bottomCutPx: number } => {
+    const { rows, sampleHeight, sourceHeight } = buildRowProfiles(image);
+    const edges = rows.map((row) => row.edge);
+    const smoothEdges = edges.map((_, y) => {
+        const win = [
+            edges[Math.max(0, y - 2)],
+            edges[Math.max(0, y - 1)],
+            edges[y],
+            edges[Math.min(sampleHeight - 1, y + 1)],
+            edges[Math.min(sampleHeight - 1, y + 2)],
+        ];
+        return mean(win);
+    });
+
+    const topMin = Math.round(sampleHeight * 0.1);
+    const topMax = Math.round(sampleHeight * 0.42);
+    const bottomMin = Math.round(sampleHeight * 0.56);
+    const bottomMax = Math.round(sampleHeight * 0.92);
+    const topTarget = Math.round(sampleHeight * 0.22);
+    const bottomTarget = Math.round(sampleHeight * 0.82);
+    const middleTarget = Math.round(sampleHeight * 0.58);
+    const minMiddle = Math.max(50, Math.round(sampleHeight * 0.26));
+
+    let bestTop = topTarget;
+    let bestBottom = bottomTarget;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let top = topMin; top <= topMax; top++) {
+        for (let bottom = bottomMin; bottom <= bottomMax; bottom++) {
+            const middle = bottom - top;
+            if (middle < minMiddle) continue;
+
+            const a = rows[top];
+            const b = rows[bottom];
+            const colorDiff =
+                (Math.abs(a.r - b.r) + Math.abs(a.g - b.g) + Math.abs(a.b - b.b)) / (3 * 255);
+            const edgePenalty = smoothEdges[top] + smoothEdges[bottom];
+            const positionPenalty =
+                Math.abs(top - topTarget) / sampleHeight +
+                Math.abs(bottom - bottomTarget) / sampleHeight;
+            const middlePenalty = Math.abs(middle - middleTarget) / sampleHeight;
+            const score = colorDiff * 0.62 + edgePenalty * 0.2 + positionPenalty * 0.1 + middlePenalty * 0.08;
+
+            if (score < bestScore) {
+                bestScore = score;
+                bestTop = top;
+                bestBottom = bottom;
+            }
+        }
+    }
+
+    const sampleToSource = (y: number) => Math.round((y / Math.max(1, sampleHeight - 1)) * Math.max(1, sourceHeight - 1));
+    let topCutPx = sampleToSource(bestTop);
+    let bottomCutPx = sampleToSource(bestBottom);
+
+    const minTopPx = Math.max(80, Math.round(sourceHeight * 0.1));
+    const minBottomPx = Math.max(80, Math.round(sourceHeight * 0.1));
+    const minMiddlePx = Math.max(120, Math.round(sourceHeight * 0.22));
+
+    topCutPx = clamp(topCutPx, minTopPx, sourceHeight - minBottomPx - minMiddlePx);
+    bottomCutPx = clamp(bottomCutPx, topCutPx + minMiddlePx, sourceHeight - minBottomPx);
+
+    return { topCutPx, bottomCutPx };
+};
+
+const getTemplateCaptureStyle = (
+    template: CaptureTemplate,
+    _importedTemplate: ImportedTemplateAssets | null,
+): { backgroundColor: string; style: Record<string, string> } => {
+    if (template === 'imported') {
+        return {
+            backgroundColor: '#ffffff',
+            style: {
+                background: '#ffffff',
+                padding: '0px',
+                borderRadius: '0px',
+            },
+        };
+    }
+    if (template === 'aurora') {
+        return {
+            backgroundColor: '#f4f7ff',
+            style: {
+                background: 'radial-gradient(90% 80% at 12% 8%, rgba(56,189,248,0.22), transparent 60%), radial-gradient(90% 80% at 92% 10%, rgba(251,113,133,0.18), transparent 58%), linear-gradient(160deg, #f8fbff 0%, #eef4ff 100%)',
+                padding: '72px',
+                borderRadius: '24px',
+            },
+        };
+    }
+    if (template === 'card') {
+        return {
+            backgroundColor: '#eef2f7',
+            style: {
+                background: 'linear-gradient(160deg, #f7f9fc 0%, #edf2f8 100%)',
+                padding: '64px',
+                borderRadius: '22px',
+            },
+        };
+    }
+    if (template === 'mint') {
+        return {
+            backgroundColor: '#f2fbf8',
+            style: {
+                background: 'radial-gradient(95% 85% at 10% 8%, rgba(45, 212, 191, 0.20), transparent 62%), radial-gradient(85% 78% at 92% 12%, rgba(16, 185, 129, 0.16), transparent 60%), linear-gradient(170deg, #f4fffb 0%, #edf8f5 100%)',
+                padding: '66px',
+                borderRadius: '24px',
+            },
+        };
+    }
+    if (template === 'sunset') {
+        return {
+            backgroundColor: '#fff7ef',
+            style: {
+                background: 'radial-gradient(88% 82% at 14% 10%, rgba(251, 146, 60, 0.18), transparent 60%), radial-gradient(90% 84% at 90% 12%, rgba(234, 179, 8, 0.18), transparent 62%), linear-gradient(165deg, #fff9f1 0%, #fff1de 100%)',
+                padding: '66px',
+                borderRadius: '24px',
+            },
+        };
+    }
+    if (template === 'ink') {
+        return {
+            backgroundColor: '#edf3ff',
+            style: {
+                background: 'radial-gradient(90% 80% at 12% 9%, rgba(37, 99, 235, 0.16), transparent 62%), radial-gradient(88% 76% at 90% 11%, rgba(30, 64, 175, 0.18), transparent 60%), linear-gradient(160deg, #f6f9ff 0%, #eaf1ff 100%)',
+                padding: '66px',
+                borderRadius: '24px',
+            },
+        };
+    }
+    return {
+        backgroundColor: '#ffffff',
+        style: {
+            background: '#ffffff',
+            padding: '54px',
+            borderRadius: '0px',
+        },
+    };
 };
 
 function normalizeFeedbackPhraseCategory(raw: unknown): FeedbackPhraseCategory {
@@ -547,17 +881,17 @@ function deriveIntonationFallback(words: ReportData['alignment']['words']): Into
         sentence: best.sentence,
         words: best.words,
         stress_accuracy: best.stress_accuracy,
-        tip: '重音分布自然，继续保持这个节奏。',
+        tip: '这句关键词比较突出，重弱分布较自然。继续保持这个节奏。',
     };
 
     const issueText = worst.issueWords.length
         ? `重点改进：${worst.issueWords.join(' / ')}`
-        : '重点改进：加强重音对比。';
+        : '重点改进：加强重弱对比。';
     const worstSentence: IntonationSentenceView = {
         sentence: worst.sentence,
         words: worst.words,
         stress_accuracy: worst.stress_accuracy,
-        tip: `${issueText} 做法：重读词稍微拉长，功能词轻读短读。`,
+        tip: `${issueText} 做法：让关键词更突出，连接词更轻一些。`,
     };
 
     return {
@@ -576,6 +910,8 @@ export default function ReportBuilder() {
     );
     const [draggedModule, setDraggedModule] = useState<string | null>(null);
     const [isCapturing, setIsCapturing] = useState(false);
+    const [captureTemplate, setCaptureTemplate] = useState<CaptureTemplate>(() => readCaptureTemplateFromStorage());
+    const [importedTemplate, setImportedTemplate] = useState<ImportedTemplateAssets | null>(null);
     const [scoreViewMode, setScoreViewMode] = useState<'score' | 'grade'>(() => readScoreViewModeFromStorage());
     const [gradeThresholds, setGradeThresholds] = useState<GradeThresholds>(() => readGradeThresholdsFromStorage());
 
@@ -589,10 +925,14 @@ export default function ReportBuilder() {
     const [teacherPhrases, setTeacherPhrases] = useState<TeacherPhraseItem[]>([]);
     const [isLoadingTeacherPhrases, setIsLoadingTeacherPhrases] = useState(false);
     const [isAddingTeacherPhrase, setIsAddingTeacherPhrase] = useState(false);
+    const [isDeletingTeacherPhraseId, setIsDeletingTeacherPhraseId] = useState('');
     const [newTeacherPhraseText, setNewTeacherPhraseText] = useState('');
     const [newTeacherPhraseCategory, setNewTeacherPhraseCategory] = useState<FeedbackPhraseCategory>('praise');
 
     const reportRef = useRef<HTMLDivElement>(null);
+    const templateZipInputRef = useRef<HTMLInputElement>(null);
+    const templateImageInputRef = useRef<HTMLInputElement>(null);
+    const templateSingleImageInputRef = useRef<HTMLInputElement>(null);
     const feedbackEditorRef = useRef<HTMLTextAreaElement>(null);
     const win = window as WindowWithFsAccess;
     const fetchWithTimeout = useCallback(async (
@@ -692,6 +1032,19 @@ export default function ReportBuilder() {
         void syncScoreDisplaySettings();
     }, [selectedReportId, syncScoreDisplaySettings]);
 
+    useEffect(() => {
+        if (captureTemplate === 'imported' && !importedTemplate) {
+            setCaptureTemplate(readCaptureTemplateFromStorage());
+            return;
+        }
+        if (captureTemplate === 'imported') return;
+        try {
+            window.localStorage.setItem(CAPTURE_TEMPLATE_STORAGE_KEY, captureTemplate);
+        } catch {
+            // ignore
+        }
+    }, [captureTemplate, importedTemplate]);
+
     const readingDisplayWords = useMemo(() => {
         const scriptText = String(reportData?.script_text || '');
         const missingIndices = Array.isArray(reportData?.analysis?.missing_indices) ? reportData.analysis.missing_indices : [];
@@ -727,7 +1080,7 @@ export default function ReportBuilder() {
 
     const feedbackSourceTag = useMemo(() => {
         const rawTag = String(reportData?.engine_raw?.feedback_source_tag || '').trim().toLowerCase();
-        if (rawTag === 'ge' || rawTag === 'az') return rawTag;
+        if (rawTag === 'db' || rawTag === 'ge' || rawTag === 'az') return rawTag;
         const source = String(reportData?.engine_raw?.source || '').toLowerCase();
         const annotationSource = String(reportData?.engine_raw?.annotation_source || '').toLowerCase();
         if (source.includes('gemini')) return 'ge';
@@ -744,6 +1097,14 @@ export default function ReportBuilder() {
         const overrideText = String(reportData?.feedback_override?.integrated_feedback_text || '').trim();
         return overrideText || baseIntegratedFeedbackText;
     }, [reportData, baseIntegratedFeedbackText]);
+
+    const feedbackStatusHint = useMemo(
+        () => getFeedbackStatusHint({
+            feedbackSourceTag,
+            feedbackOptimization: reportData?.feedback_optimization,
+        }),
+        [feedbackSourceTag, reportData?.feedback_optimization],
+    );
 
     const hasFeedbackOverride = useMemo(
         () => String(reportData?.feedback_override?.integrated_feedback_text || '').trim().length > 0,
@@ -820,7 +1181,22 @@ export default function ReportBuilder() {
         });
         return set;
     }, [reportData]);
-
+    const weakPhonemes = useMemo(() => {
+        const raw = reportData?.analysis?.weak_phonemes;
+        if (!Array.isArray(raw)) return [];
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const item of raw) {
+            const token = String(item || '').trim();
+            if (!token) continue;
+            const key = token.toLowerCase();
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(token);
+            if (out.length >= 16) break;
+        }
+        return out;
+    }, [reportData]);
     const loadTeacherPhrases = useCallback(async (silent = true) => {
         setIsLoadingTeacherPhrases(true);
         try {
@@ -879,6 +1255,49 @@ export default function ReportBuilder() {
         };
     }, [fetchWithTimeout]);
 
+    const fetchReportDataById = useCallback(async (reportId: string): Promise<ReportData> => {
+        const res = await fetchWithTimeout(`${API_HOST}/api/reports/${reportId}/data`);
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+        return await res.json() as ReportData;
+    }, [fetchWithTimeout]);
+
+    const freezeReportFeedback = useCallback(async (reportId: string) => {
+        const res = await fetchWithTimeout(
+            `${API_HOST}/api/reports/${reportId}/freeze-feedback`,
+            { method: 'POST' },
+            15000,
+        );
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+            throw new Error(detail);
+        }
+        return payload as {
+            feedback_optimization?: ReportData['feedback_optimization'];
+            feedback_override?: ReportData['feedback_override'];
+        };
+    }, [fetchWithTimeout]);
+
+    const freezeBatchFeedback = useCallback(async () => {
+        const res = await fetchWithTimeout(
+            `${API_HOST}/api/reports/freeze-feedback-batch`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: 'batch_export' }),
+            },
+            30000,
+        );
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+            throw new Error(detail);
+        }
+        return payload as { frozen_count?: number };
+    }, [fetchWithTimeout]);
+
     useEffect(() => {
         if (!selectedReportId) {
             setReportData(null);
@@ -887,13 +1306,9 @@ export default function ReportBuilder() {
         let cancelled = false;
         const loadReportData = async () => {
             try {
-                const res = await fetchWithTimeout(`${API_HOST}/api/reports/${selectedReportId}/data`);
-                if (!res.ok) {
-                    throw new Error(`HTTP ${res.status}`);
-                }
-                const data = await res.json();
+                const data = await fetchReportDataById(selectedReportId);
                 if (cancelled) return;
-                setReportData(data as ReportData);
+                setReportData(data);
             } catch (err) {
                 if (cancelled) return;
                 console.error(`Failed to load report data for ${selectedReportId}:`, err);
@@ -908,7 +1323,33 @@ export default function ReportBuilder() {
         return () => {
             cancelled = true;
         };
-    }, [selectedReportId, fetchWithTimeout]);
+    }, [selectedReportId, fetchReportDataById]);
+
+    useEffect(() => {
+        const status = String(reportData?.feedback_optimization?.status || '').trim().toLowerCase();
+        const updatedAt = Number(reportData?.feedback_optimization?.updated_at || 0);
+        if (!selectedReportId) return;
+        if (isCapturing) return;
+        if (!(status === 'optimizing' || (status === 'pending' && updatedAt === 0))) return;
+
+        const timer = window.setTimeout(async () => {
+            try {
+                const data = await fetchReportDataById(selectedReportId);
+                setReportData(data);
+            } catch (err) {
+                console.error(`Failed to refresh feedback optimization for ${selectedReportId}:`, err);
+            }
+        }, 4000);
+
+        return () => window.clearTimeout(timer);
+    }, [
+        selectedReportId,
+        reportData?.feedback_optimization?.status,
+        reportData?.feedback_optimization?.updated_at,
+        reportData?.feedback_optimization?.version,
+        isCapturing,
+        fetchReportDataById,
+    ]);
 
     useEffect(() => {
         setIsEditingFeedback(false);
@@ -1041,6 +1482,35 @@ export default function ReportBuilder() {
         }
     }, [fetchWithTimeout, newTeacherPhraseCategory, newTeacherPhraseText]);
 
+    const handleDeleteTeacherPhrase = useCallback(async (phraseId: string) => {
+        const id = String(phraseId || '').trim();
+        if (!id) return;
+        setIsDeletingTeacherPhraseId(id);
+        setActionNotice(null);
+        try {
+            const res = await fetchWithTimeout(
+                `${API_HOST}/api/teacher-phrases/${encodeURIComponent(id)}`,
+                { method: 'DELETE' },
+                10000,
+            );
+            const payload = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const detail = String((payload as { detail?: unknown }).detail || `HTTP ${res.status}`);
+                throw new Error(detail);
+            }
+            setTeacherPhrases((prev) => prev.filter((row) => row.id !== id));
+            setActionNotice({ type: 'success', message: '已删除教师自定义短语。' });
+        } catch (err) {
+            console.error('Failed to delete teacher phrase:', err);
+            setActionNotice({
+                type: 'error',
+                message: formatActionError('Delete teacher phrase', err, 'Unknown error'),
+            });
+        } finally {
+            setIsDeletingTeacherPhraseId('');
+        }
+    }, [fetchWithTimeout]);
+
     const insertFeedbackPhrase = (phrase: { id?: string; text: string } | string) => {
         const text = typeof phrase === 'string' ? String(phrase || '').trim() : String(phrase?.text || '').trim();
         const phraseId = typeof phrase === 'string' ? '' : String(phrase?.id || '').trim();
@@ -1145,43 +1615,271 @@ export default function ReportBuilder() {
         }
     };
 
+    const handlePickTemplateZip = () => {
+        templateZipInputRef.current?.click();
+    };
+
+    const handlePickTemplateImages = () => {
+        templateImageInputRef.current?.click();
+    };
+
+    const handlePickSingleTemplateImage = () => {
+        templateSingleImageInputRef.current?.click();
+    };
+
+    const handleImportTemplateImages = async (event: ChangeEvent<HTMLInputElement>) => {
+        const files = Array.from(event.target.files || []);
+        event.target.value = '';
+        if (files.length < 3) {
+            setActionNotice({ type: 'error', message: '请至少选择 3 张图（top/middle/bottom）。' });
+            return;
+        }
+        const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+        if (totalSize > TEMPLATE_ZIP_MAX_MB * 1024 * 1024) {
+            setActionNotice({ type: 'error', message: `图片总大小过大，请控制在 ${TEMPLATE_ZIP_MAX_MB}MB 以内。` });
+            return;
+        }
+
+        const remaining = [...files];
+        const takeByKeywords = (keywords: string[]): File | null => {
+            const idx = remaining.findIndex((file) => {
+                const lower = file.name.toLowerCase();
+                return keywords.some((key) => lower.includes(key));
+            });
+            if (idx < 0) return null;
+            return remaining.splice(idx, 1)[0];
+        };
+
+        const topFile = takeByKeywords(['top', 'header', 'head']) || remaining.shift() || null;
+        const middleFile = takeByKeywords(['middle', 'center', 'body']) || remaining.shift() || null;
+        const bottomFile = takeByKeywords(['bottom', 'footer', 'foot']) || remaining.shift() || null;
+        if (!topFile || !middleFile || !bottomFile) {
+            setActionNotice({ type: 'error', message: '无法识别三段图，请按顺序选择 top/middle/bottom。' });
+            return;
+        }
+
+        setActionNotice(null);
+        setIsCapturing(true);
+        try {
+            const imported: ImportedTemplateAssets = {
+                name: 'Canva三图模板',
+                topDataUrl: await fileToDataUrl(topFile),
+                middleDataUrl: await fileToDataUrl(middleFile),
+                bottomDataUrl: await fileToDataUrl(bottomFile),
+                topHeightPx: TEMPLATE_DEFAULT_TOP_HEIGHT_PX,
+                bottomHeightPx: TEMPLATE_DEFAULT_BOTTOM_HEIGHT_PX,
+                contentPaddingPx: TEMPLATE_DEFAULT_CONTENT_PADDING_PX,
+            };
+            setImportedTemplate(imported);
+            setCaptureTemplate('imported');
+            setActionNotice({ type: 'success', message: '已一键导入三图模板。' });
+        } catch (err) {
+            setActionNotice({ type: 'error', message: formatActionError('Import template images', err, '图片解析失败') });
+        } finally {
+            setIsCapturing(false);
+        }
+    };
+
+    const handleAutoSliceTemplateImage = async (event: ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        event.target.value = '';
+        if (!file) return;
+        if (!file.type.startsWith('image/')) {
+            setActionNotice({ type: 'error', message: '请上传图片文件。' });
+            return;
+        }
+        if (file.size > TEMPLATE_ZIP_MAX_MB * 1024 * 1024) {
+            setActionNotice({ type: 'error', message: `图片过大，请控制在 ${TEMPLATE_ZIP_MAX_MB}MB 以内。` });
+            return;
+        }
+
+        setActionNotice(null);
+        setIsCapturing(true);
+        try {
+            const dataUrl = await fileToDataUrl(file);
+            const image = await loadImageFromDataUrl(dataUrl);
+            const width = Math.max(1, image.naturalWidth || image.width);
+            const height = Math.max(1, image.naturalHeight || image.height);
+            if (height < 240 || width < 240) {
+                throw new Error('图片尺寸过小，建议至少 800x1200。');
+            }
+
+            let topCutPx = Math.round(height * 0.23);
+            let bottomCutPx = Math.round(height * 0.84);
+            try {
+                const cuts = findAutoSliceCuts(image);
+                topCutPx = cuts.topCutPx;
+                bottomCutPx = cuts.bottomCutPx;
+            } catch {
+                topCutPx = clamp(topCutPx, 80, Math.round(height * 0.42));
+                bottomCutPx = clamp(bottomCutPx, topCutPx + 120, height - 80);
+            }
+
+            const topSourceH = topCutPx;
+            const middleSourceH = Math.max(40, bottomCutPx - topCutPx);
+            const bottomSourceH = Math.max(40, height - bottomCutPx);
+
+            const topDataUrl = cropImageToDataUrl(image, 0, 0, width, topSourceH);
+            const middleDataUrl = cropImageToDataUrl(image, 0, topCutPx, width, middleSourceH);
+            const bottomDataUrl = cropImageToDataUrl(image, 0, bottomCutPx, width, bottomSourceH);
+
+            const topHeightPx = Math.max(80, Math.round((topSourceH / width) * EXPORT_A4_WIDTH_PX));
+            const bottomHeightPx = Math.max(80, Math.round((bottomSourceH / width) * EXPORT_A4_WIDTH_PX));
+
+            const imported: ImportedTemplateAssets = {
+                name: `${file.name.replace(/\.[^.]+$/, '') || '单图模板'}-自动切片`,
+                topDataUrl,
+                middleDataUrl,
+                bottomDataUrl,
+                topHeightPx,
+                bottomHeightPx,
+                contentPaddingPx: TEMPLATE_DEFAULT_CONTENT_PADDING_PX,
+            };
+            setImportedTemplate(imported);
+            setCaptureTemplate('imported');
+            setActionNotice({ type: 'success', message: '已自动切成三段并应用模板。' });
+        } catch (err) {
+            setActionNotice({ type: 'error', message: formatActionError('Auto-slice template', err, '自动分切失败') });
+        } finally {
+            setIsCapturing(false);
+        }
+    };
+
+    const handleImportTemplateZip = async (event: ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        event.target.value = '';
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.zip')) {
+            setActionNotice({ type: 'error', message: '模板导入仅支持 .zip 文件。' });
+            return;
+        }
+        if (file.size > TEMPLATE_ZIP_MAX_MB * 1024 * 1024) {
+            setActionNotice({ type: 'error', message: `模板包过大，请控制在 ${TEMPLATE_ZIP_MAX_MB}MB 以内。` });
+            return;
+        }
+
+        setActionNotice(null);
+        setIsCapturing(true);
+        try {
+            const zip = await JSZip.loadAsync(file);
+            const manifestEntry = pickZipEntry(zip, ['template.json', 'manifest.json']);
+            let manifest: ImportedTemplateManifest = {};
+            if (manifestEntry) {
+                try {
+                    const raw = await manifestEntry.async('string');
+                    const parsed = JSON.parse(raw) as ImportedTemplateManifest;
+                    if (parsed && typeof parsed === 'object') manifest = parsed;
+                } catch {
+                    manifest = {};
+                }
+            }
+
+            const topName = String(manifest.files?.top || 'top.png');
+            const middleName = String(manifest.files?.middle || 'middle.png');
+            const bottomName = String(manifest.files?.bottom || 'bottom.png');
+
+            const topEntry = pickZipEntry(zip, [topName, 'top.png', 'top.jpg', 'top.jpeg', 'top.webp']);
+            const middleEntry = pickZipEntry(zip, [middleName, 'middle.png', 'middle.jpg', 'middle.jpeg', 'middle.webp']);
+            const bottomEntry = pickZipEntry(zip, [bottomName, 'bottom.png', 'bottom.jpg', 'bottom.jpeg', 'bottom.webp']);
+            if (!topEntry || !middleEntry || !bottomEntry) {
+                throw new Error('模板包缺少 top/middle/bottom 三段图片。');
+            }
+
+            const imported: ImportedTemplateAssets = {
+                name: String(manifest.name || file.name.replace(/\.zip$/i, '')).trim() || '导入模板',
+                topDataUrl: await imageDataUrlFromZipEntry(topEntry),
+                middleDataUrl: await imageDataUrlFromZipEntry(middleEntry),
+                bottomDataUrl: await imageDataUrlFromZipEntry(bottomEntry),
+                topHeightPx: Math.max(80, Number(manifest.top_height_px || TEMPLATE_DEFAULT_TOP_HEIGHT_PX)),
+                bottomHeightPx: Math.max(80, Number(manifest.bottom_height_px || TEMPLATE_DEFAULT_BOTTOM_HEIGHT_PX)),
+                contentPaddingPx: Math.max(24, Number(manifest.content_padding_px || TEMPLATE_DEFAULT_CONTENT_PADDING_PX)),
+            };
+            setImportedTemplate(imported);
+            setCaptureTemplate('imported');
+            setActionNotice({ type: 'success', message: `模板导入成功：${imported.name}` });
+        } catch (err) {
+            setActionNotice({ type: 'error', message: formatActionError('Import template', err, '模板包解析失败') });
+        } finally {
+            setIsCapturing(false);
+        }
+    };
+
+    const currentImportedTemplate = captureTemplate === 'imported' ? importedTemplate : null;
+
+    const buildReportImageFileName = useCallback((data: ReportData | null): string => {
+        const name = String(data?.meta?.student_name || data?.meta?.student_id || 'student').trim();
+        const safe = name.replace(/[\\/:*?"<>|]+/g, '_');
+        return `${safe || 'student'}_report.png`;
+    }, []);
+
+    const renderReportImageBlob = useCallback(async (): Promise<Blob> => {
+        if (!reportRef.current) {
+            throw new Error('Report canvas not ready');
+        }
+        const { toBlob } = await import('html-to-image');
+        const templateStyle = getTemplateCaptureStyle(captureTemplate, currentImportedTemplate);
+        const widthPx = EXPORT_A4_WIDTH_PX;
+        const sourceWidthPx = Math.max(1, reportRef.current.getBoundingClientRect().width);
+        const sourceHeightPx = Math.max(1, reportRef.current.scrollHeight);
+        const dynamicHeightPx = Math.ceil((sourceHeightPx * widthPx) / sourceWidthPx);
+        const heightPx = Math.max(EXPORT_A4_HEIGHT_PX, dynamicHeightPx);
+        const blob = await toBlob(reportRef.current, {
+            cacheBust: true,
+            skipAutoScale: true,
+            width: widthPx,
+            height: heightPx,
+            pixelRatio: EXPORT_PIXEL_RATIO,
+            backgroundColor: templateStyle.backgroundColor,
+            style: {
+                width: `${widthPx}px`,
+                minHeight: `${heightPx}px`,
+                boxSizing: 'border-box',
+                margin: '0',
+                transform: 'none',
+                ...templateStyle.style,
+            },
+        });
+        if (!blob) {
+            throw new Error('Failed to render image blob');
+        }
+        return blob;
+    }, [captureTemplate, currentImportedTemplate]);
+
     // 鎴浘鍔熻兘 - 浣跨敤鍙﹀瓨涓哄璇濇
     const handleCapture = async () => {
-        if (!reportRef.current || !reportData) return;
+        if (!reportRef.current || !reportData || !selectedReportId) return;
         setActionNotice(null);
         setIsCapturing(true);
 
         try {
-            const { toPng, toBlob } = await import('html-to-image');
-            const dataUrl = await toPng(reportRef.current, {
-                backgroundColor: '#ffffff',
-                cacheBust: true,
-                pixelRatio: 2,
-            });
+            const freezePayload = await freezeReportFeedback(selectedReportId);
+            setReportData((prev) => prev ? ({
+                ...prev,
+                feedback_optimization: freezePayload.feedback_optimization ?? {
+                    ...prev.feedback_optimization,
+                    status: 'frozen',
+                    freeze_reason: 'single_export',
+                },
+                feedback_override: freezePayload.feedback_override ?? prev.feedback_override,
+            }) : prev);
 
-            const fileName = `${reportData.meta.student_name || reportData.meta.student_id}_report.png`;
+            const blob = await renderReportImageBlob();
+            const fileName = buildReportImageFileName(reportData);
 
             if (typeof win.showSaveFilePicker === 'function') {
                 try {
-                    const blob = await toBlob(reportRef.current, {
-                        backgroundColor: '#ffffff',
-                        pixelRatio: 2,
+                    const handle = await win.showSaveFilePicker({
+                        suggestedName: fileName,
+                        types: [{
+                            description: 'PNG Image',
+                            accept: { 'image/png': ['.png'] },
+                        }],
                     });
 
-                    if (blob) {
-                        const handle = await win.showSaveFilePicker({
-                            suggestedName: fileName,
-                            types: [{
-                                description: 'PNG Image',
-                                accept: { 'image/png': ['.png'] },
-                            }],
-                        });
-
-                        const writable = await handle.createWritable();
-                        await writable.write(blob);
-                        await writable.close();
-                        return;
-                    }
+                    const writable = await handle.createWritable();
+                    await writable.write(blob);
+                    await writable.close();
+                    return;
                 } catch (e: unknown) {
                     const errorName = e && typeof e === 'object' && 'name' in e
                         ? String((e as { name?: unknown }).name || '')
@@ -1192,8 +1890,10 @@ export default function ReportBuilder() {
 
             const link = document.createElement('a');
             link.download = fileName;
-            link.href = dataUrl;
+            const objectUrl = URL.createObjectURL(blob);
+            link.href = objectUrl;
             link.click();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 2000);
         } catch (err) {
             console.error('Capture failed:', err);
             setActionNotice({ type: 'error', message: formatActionError('Capture', err, 'Unknown error') });
@@ -1220,6 +1920,8 @@ export default function ReportBuilder() {
         const zip = new JSZip();
 
         try {
+            await freezeBatchFeedback();
+
             if (typeof win.showDirectoryPicker === 'function') {
                 try {
                     dirHandle = await win.showDirectoryPicker({ mode: 'readwrite' });
@@ -1235,8 +1937,6 @@ export default function ReportBuilder() {
                 }
             }
 
-            const { toBlob } = await import('html-to-image');
-
             for (let i = 0; i < ids.length; i++) {
                 const id = ids[i];
                 const report = reports.find(r => r.id === id);
@@ -1244,9 +1944,7 @@ export default function ReportBuilder() {
                 setBatchProgress({ current: i + 1, total: ids.length, name: studentName });
 
                 try {
-                    const res = await fetchWithTimeout(`${API_HOST}/api/reports/${id}/data`);
-                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                    const data = await res.json();
+                    const data = await fetchReportDataById(id);
                     setReportData(data);
 
                     await new Promise<void>((resolve) => {
@@ -1258,9 +1956,8 @@ export default function ReportBuilder() {
                     });
 
                     if (reportRef.current) {
-                        const fileName = `${data.meta?.student_name || data.meta?.student_id || studentName}_report.png`;
-                        const blob = await toBlob(reportRef.current, { backgroundColor: '#ffffff', pixelRatio: 2 });
-                        if (!blob) throw new Error('Failed to render image blob');
+                        const fileName = buildReportImageFileName(data);
+                        const blob = await renderReportImageBlob();
 
                         if (dirHandle) {
                             const fileHandle = await dirHandle.getFileHandle(fileName, { create: true });
@@ -1432,6 +2129,70 @@ export default function ReportBuilder() {
                                         </option>
                                     ))}
                                 </select>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs text-gray-400">图片模板</span>
+                                    <select
+                                        value={captureTemplate}
+                                        onChange={(e) => {
+                                            const next = e.target.value as CaptureTemplate;
+                                            if (next === 'imported' && !importedTemplate) return;
+                                            setCaptureTemplate(next);
+                                        }}
+                                        className="bg-[#1e1e24] border border-white/10 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-primary/50"
+                                    >
+                                        {(Object.keys(CAPTURE_TEMPLATE_LABEL) as CaptureTemplate[]).map((key) => (
+                                            <option key={key} value={key} disabled={key === 'imported' && !importedTemplate}>
+                                                {CAPTURE_TEMPLATE_LABEL[key]}
+                                            </option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        onClick={handlePickTemplateImages}
+                                        type="button"
+                                        className="px-3 py-2 rounded-lg text-xs font-semibold border border-cyan-400/30 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20"
+                                        title="一键导入 Canva 三图（top/middle/bottom）"
+                                    >
+                                        一键导入三图
+                                    </button>
+                                    <button
+                                        onClick={handlePickSingleTemplateImage}
+                                        type="button"
+                                        className="px-3 py-2 rounded-lg text-xs font-semibold border border-emerald-300/25 bg-emerald-500/8 text-emerald-100 hover:bg-emerald-500/16"
+                                        title="上传一张背景图，自动切成 top/middle/bottom"
+                                    >
+                                        单图自动切
+                                    </button>
+                                    <button
+                                        onClick={handlePickTemplateZip}
+                                        type="button"
+                                        className="px-3 py-2 rounded-lg text-xs font-semibold border border-white/15 bg-white/5 text-slate-200 hover:bg-white/10"
+                                        title="导入 Canva 模板包（zip，含 top/middle/bottom）"
+                                    >
+                                        导入模板包
+                                    </button>
+                                    <input
+                                        ref={templateImageInputRef}
+                                        type="file"
+                                        accept="image/png,image/jpeg,image/webp"
+                                        multiple
+                                        onChange={handleImportTemplateImages}
+                                        className="hidden"
+                                    />
+                                    <input
+                                        ref={templateSingleImageInputRef}
+                                        type="file"
+                                        accept="image/png,image/jpeg,image/webp"
+                                        onChange={handleAutoSliceTemplateImage}
+                                        className="hidden"
+                                    />
+                                    <input
+                                        ref={templateZipInputRef}
+                                        type="file"
+                                        accept=".zip,application/zip"
+                                        onChange={handleImportTemplateZip}
+                                        className="hidden"
+                                    />
+                                </div>
                             </div>
 
                             <div className="flex gap-2">
@@ -1441,7 +2202,7 @@ export default function ReportBuilder() {
                                     className="bg-blue-500 text-white px-5 py-2.5 rounded-xl font-bold flex items-center gap-2 hover:bg-blue-600 disabled:opacity-50 transition-all"
                                 >
                                     {isCapturing && batchProgress.total === 0 ? <Download className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
-                                    保存图片
+                                    一键导出
                                 </button>
                                 <button
                                     onClick={handlePrint}
@@ -1542,18 +2303,61 @@ export default function ReportBuilder() {
                         ref={reportRef}
                         onDragOver={handleDragOver}
                         onDrop={handleDrop}
-                        className={`report-print-root bg-white rounded-lg shadow-2xl mx-auto print:shadow-none print:rounded-none
+                        className={`report-print-root capture-template-${captureTemplate} rounded-lg shadow-2xl mx-auto print:shadow-none print:rounded-none
                             ${draggedModule ? 'ring-2 ring-primary ring-dashed' : ''}`}
-                        style={{ width: '210mm', minHeight: '297mm', padding: '12mm' }}
+                        style={{
+                            width: '210mm',
+                            minHeight: '297mm',
+                            padding: currentImportedTemplate ? '0' : '12mm',
+                        }}
                     >
-                        {!reportData ? (
-                            <div className="h-full flex flex-col items-center justify-center text-gray-400 py-32">
-                                <Eye className="w-16 h-16 mb-4 opacity-30" />
-                                <p className="text-lg font-medium">请选择一个学生报告</p>
-                                <p className="text-sm text-gray-500 mt-1">拖拽左侧模块自定义报告内容</p>
+                        {currentImportedTemplate && (
+                            <div className="report-template-bg" aria-hidden>
+                                <div
+                                    style={{
+                                        height: `${currentImportedTemplate.topHeightPx}px`,
+                                        backgroundImage: `url(${currentImportedTemplate.topDataUrl})`,
+                                        backgroundRepeat: 'no-repeat',
+                                        backgroundSize: '100% 100%',
+                                        backgroundPosition: 'top center',
+                                    }}
+                                />
+                                <div
+                                    style={{
+                                        flex: 1,
+                                        minHeight: '20px',
+                                        backgroundImage: `url(${currentImportedTemplate.middleDataUrl})`,
+                                        backgroundRepeat: 'repeat-y',
+                                        backgroundSize: '100% auto',
+                                        backgroundPosition: 'top center',
+                                    }}
+                                />
+                                <div
+                                    style={{
+                                        height: `${currentImportedTemplate.bottomHeightPx}px`,
+                                        backgroundImage: `url(${currentImportedTemplate.bottomDataUrl})`,
+                                        backgroundRepeat: 'no-repeat',
+                                        backgroundSize: '100% 100%',
+                                        backgroundPosition: 'bottom center',
+                                    }}
+                                />
                             </div>
-                        ) : (
-                            <div className="text-gray-800 space-y-4">
+                        )}
+
+                        <div
+                            className={`report-content-surface ${captureTemplate === 'classic' ? '' : 'report-content-surface-themed'} ${currentImportedTemplate ? 'report-content-surface-imported' : ''}`}
+                            style={currentImportedTemplate
+                                ? { padding: `${currentImportedTemplate.contentPaddingPx}px` }
+                                : undefined}
+                        >
+                            {!reportData ? (
+                                <div className="h-full flex flex-col items-center justify-center text-gray-400 py-32">
+                                    <Eye className="w-16 h-16 mb-4 opacity-30" />
+                                    <p className="text-lg font-medium">请选择一个学生报告</p>
+                                    <p className="text-sm text-gray-500 mt-1">拖拽左侧模块自定义报告内容</p>
+                                </div>
+                            ) : (
+                                <div className="text-gray-800 space-y-4">
                                 {/* 鎶ュ憡澶撮儴 */}
                                 <div className="report-header text-center pb-3 border-b-2 border-gray-200">
                                     <h1 className="text-xl font-bold text-gray-900">英语朗读评测报告</h1>
@@ -1664,15 +2468,21 @@ export default function ReportBuilder() {
                                                                 </span>
                                                             ))}
                                                         </div>
-                                                        {reportData.analysis.weak_phonemes?.length > 0 && (
+                                                        {weakPhonemes.length > 0 && (
                                                             <div className="mt-2">
                                                                 <div className="text-sm text-gray-600">弱读音素:</div>
-                                                                <div className="flex gap-2 mt-1">
-                                                                    {reportData.analysis.weak_phonemes.map((ph, idx) => (
-                                                                        <span key={idx} className="bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-sm">
-                                                                            /{ph}/
-                                                                        </span>
-                                                                    ))}
+                                                                <div className="mt-1 space-y-1.5">
+                                                                    {weakPhonemes.map((ph, idx) => {
+                                                                        return (
+                                                                            <div key={`${String(ph || '').trim()}-${idx}`} className="rounded-md border border-yellow-200 bg-yellow-50 px-2 py-1">
+                                                                                <div className="flex flex-wrap items-center gap-2">
+                                                                                    <span className="bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-sm">
+                                                                                        /{ph}/
+                                                                                    </span>
+                                                                                </div>
+                                                                            </div>
+                                                                        );
+                                                                    })}
                                                                 </div>
                                                             </div>
                                                         )}
@@ -1739,6 +2549,17 @@ export default function ReportBuilder() {
                                                         )}
                                                     </div>
                                                 </div>
+                                                {feedbackStatusHint && (
+                                                    <div
+                                                        className={`mb-2 text-[11px] ${
+                                                            feedbackStatusHint.tone === 'warning'
+                                                                ? 'text-amber-700'
+                                                                : 'text-gray-500'
+                                                        }`}
+                                                    >
+                                                        {feedbackStatusHint.text}
+                                                    </div>
+                                                )}
                                                 {hasFeedbackOverride && feedbackOverrideUpdatedAt > 0 && (
                                                     <div className="mb-2 text-[11px] text-emerald-700">
                                                         已更新：{new Date(feedbackOverrideUpdatedAt * 1000).toLocaleString()}
@@ -1783,16 +2604,35 @@ export default function ReportBuilder() {
                                                             {teacherPhraseSuggestions.length > 0 ? (
                                                                 <div className="flex flex-wrap gap-2">
                                                                     {teacherPhraseSuggestions.map((item) => (
-                                                                        <button
+                                                                        <div
                                                                             key={`bank_${item.id}`}
-                                                                            type="button"
-                                                                            onClick={() => insertFeedbackPhrase(item)}
-                                                                            className={`px-2.5 py-1 rounded-full border text-xs font-medium ${FEEDBACK_PHRASE_CHIP_CLASS[item.category]}`}
+                                                                            className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium ${FEEDBACK_PHRASE_CHIP_CLASS[item.category]}`}
                                                                             title={item.text}
                                                                         >
-                                                                            <span className="font-semibold mr-1">[{FEEDBACK_PHRASE_CATEGORY_LABEL[item.category]}]</span>
-                                                                            {item.text}
-                                                                        </button>
+                                                                            <button
+                                                                                type="button"
+                                                                                onClick={() => insertFeedbackPhrase(item)}
+                                                                                className="min-w-0 text-left"
+                                                                            >
+                                                                                <span className="font-semibold mr-1">[{FEEDBACK_PHRASE_CATEGORY_LABEL[item.category]}]</span>
+                                                                                {item.text}
+                                                                            </button>
+                                                                            {!item.builtin && (
+                                                                                <button
+                                                                                    type="button"
+                                                                                    onClick={(e) => {
+                                                                                        e.preventDefault();
+                                                                                        e.stopPropagation();
+                                                                                        void handleDeleteTeacherPhrase(item.id);
+                                                                                    }}
+                                                                                    disabled={isDeletingTeacherPhraseId === item.id}
+                                                                                    className="rounded-full border border-black/10 px-1.5 py-0.5 text-[10px] font-semibold text-gray-600 hover:bg-white/70 disabled:opacity-50"
+                                                                                    title="删除该教师短语"
+                                                                                >
+                                                                                    {isDeletingTeacherPhraseId === item.id ? '...' : '删'}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
                                                                     ))}
                                                                 </div>
                                                             ) : (
@@ -1989,26 +2829,29 @@ export default function ReportBuilder() {
                                                     {/* 澶撮儴 */}
                                                     <div className="flex items-center justify-between mb-4">
                                                         <h3 className="text-base font-bold flex items-center gap-2">
-                                                            🗣️ 语调分析
+                                                            🗣️ 重弱与节奏提示
                                                             <span className="text-2xl font-bold text-purple-500">{formatScoreCompact(intonationScore)}%</span>
                                                         </h3>
                                                         <div className="flex gap-4 text-xs text-gray-600">
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-3 h-3 rounded-full bg-green-500"></span> Correct stress
+                                                                <span className="w-3 h-3 rounded-full bg-green-500"></span> 绿色：自然
                                                             </span>
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-3 h-3 rounded-full bg-red-500"></span> Incorrect stress
+                                                                <span className="w-3 h-3 rounded-full bg-red-500"></span> 红色：需调整
                                                             </span>
                                                             <span className="flex items-center gap-1">
-                                                                <span className="w-2 h-2 rounded-full bg-gray-400"></span> Unstressed
+                                                                <span className="w-2 h-2 rounded-full bg-gray-400"></span> 灰色：轻读
                                                             </span>
                                                         </div>
+                                                    </div>
+                                                    <div className="mb-3 text-[11px] text-gray-500">
+                                                        大球表示相对更突出，小球表示相对更轻。红色表示该处的重弱处理还可调整。
                                                     </div>
                                                     {intonation?.best_sentence ? (
                                                         <div className="space-y-4">
                                                             {/* 鏈€浣冲彞瀛?*/}
                                                             <div className="bg-green-50 rounded-lg p-3">
-                                                                <div className="text-xs text-green-600 font-medium mb-2">✅ 最佳句子（重读准确率 {intonation.best_sentence.stress_accuracy.toFixed(0)}%）</div>
+                                                                <div className="text-xs text-green-600 font-medium mb-2">✅ 节奏自然的一句</div>
                                                                 {renderBouncingBalls(intonation.best_sentence.words)}
                                                                 <div className="text-xs text-gray-500 mt-2">{intonation.best_sentence.tip}</div>
                                                             </div>
@@ -2016,10 +2859,7 @@ export default function ReportBuilder() {
                                                             {/* 闇€鏀硅繘鍙ュ瓙 */}
                                                             {intonation.problem_sentences?.slice(0, 2).map((ps, idx) => (
                                                                 <div key={idx} className="bg-yellow-50 rounded-lg p-3">
-                                                                    <div className="flex items-center justify-between mb-2">
-                                                                        <span className="text-xs text-yellow-600 font-medium">需改进</span>
-                                                                        <span className="text-xs text-gray-500">准确率 {ps.stress_accuracy.toFixed(0)}%</span>
-                                                                    </div>
+                                                                    <div className="text-xs text-yellow-700 font-medium mb-2">🔧 最值得调整的一句</div>
                                                                     {renderBouncingBalls(ps.words)}
                                                                     <div className="text-xs text-orange-600 mt-2">{ps.tip}</div>
                                                                 </div>
@@ -2101,16 +2941,82 @@ export default function ReportBuilder() {
                                     </div>
                                 )}
 
-                                <div className="report-footer text-center text-xs text-gray-400 pt-3 border-t border-gray-200">
-                                    Generated by SpeechMaster © 2026
+                                    <div className="report-footer text-center text-xs text-gray-400 pt-3 border-t border-gray-200">
+                                        Generated by SpeechMaster © 2026
+                                    </div>
                                 </div>
-                            </div>
-                        )}
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
 
             <style>{`
+                .report-print-root {
+                    background: #ffffff;
+                    position: relative;
+                    overflow: hidden;
+                }
+                .report-content-surface {
+                    min-height: calc(297mm - 24mm);
+                    position: relative;
+                    z-index: 1;
+                }
+                .report-template-bg {
+                    position: absolute;
+                    inset: 0;
+                    display: flex;
+                    flex-direction: column;
+                    pointer-events: none;
+                    z-index: 0;
+                }
+                .report-print-root.capture-template-aurora {
+                    background:
+                        radial-gradient(90% 80% at 12% 8%, rgba(56, 189, 248, 0.2), transparent 60%),
+                        radial-gradient(90% 80% at 92% 10%, rgba(251, 113, 133, 0.16), transparent 58%),
+                        linear-gradient(160deg, #f8fbff 0%, #eef4ff 100%);
+                    padding: 14mm !important;
+                }
+                .report-print-root.capture-template-card {
+                    background: linear-gradient(160deg, #f7f9fc 0%, #edf2f8 100%);
+                    padding: 13mm !important;
+                }
+                .report-print-root.capture-template-mint {
+                    background:
+                        radial-gradient(95% 85% at 10% 8%, rgba(45, 212, 191, 0.2), transparent 62%),
+                        radial-gradient(85% 78% at 92% 12%, rgba(16, 185, 129, 0.16), transparent 60%),
+                        linear-gradient(170deg, #f4fffb 0%, #edf8f5 100%);
+                    padding: 13mm !important;
+                }
+                .report-print-root.capture-template-sunset {
+                    background:
+                        radial-gradient(88% 82% at 14% 10%, rgba(251, 146, 60, 0.18), transparent 60%),
+                        radial-gradient(90% 84% at 90% 12%, rgba(234, 179, 8, 0.18), transparent 62%),
+                        linear-gradient(165deg, #fff9f1 0%, #fff1de 100%);
+                    padding: 13mm !important;
+                }
+                .report-print-root.capture-template-ink {
+                    background:
+                        radial-gradient(90% 80% at 12% 9%, rgba(37, 99, 235, 0.16), transparent 62%),
+                        radial-gradient(88% 76% at 90% 11%, rgba(30, 64, 175, 0.18), transparent 60%),
+                        linear-gradient(160deg, #f6f9ff 0%, #eaf1ff 100%);
+                    padding: 13mm !important;
+                }
+                .report-content-surface.report-content-surface-themed {
+                    background: rgba(255, 255, 255, 0.97);
+                    border: 1px solid #e5e7eb;
+                    border-radius: 14px;
+                    padding: 9mm;
+                    box-shadow: 0 14px 30px rgba(15, 23, 42, 0.08);
+                }
+                .report-content-surface.report-content-surface-imported {
+                    background: transparent;
+                    border: none;
+                    border-radius: 0;
+                    box-shadow: none;
+                    min-height: 100%;
+                }
+
                 @media print {
                     @page { size: A4; margin: 8mm; }
                     html, body { width: 210mm; }
@@ -2127,10 +3033,24 @@ export default function ReportBuilder() {
                     .report-print-root {
                         width: auto !important;
                         min-height: auto !important;
+                        background: white !important;
                         padding: 0 !important;
                         margin: 0 !important;
                         box-shadow: none !important;
                         border-radius: 0 !important;
+                    }
+                    .report-content-surface {
+                        min-height: auto !important;
+                    }
+                    .report-template-bg {
+                        display: none !important;
+                    }
+                    .report-content-surface.report-content-surface-themed {
+                        background: transparent !important;
+                        border: none !important;
+                        border-radius: 0 !important;
+                        box-shadow: none !important;
+                        padding: 0 !important;
                     }
                     .report-print-root .space-y-4 > :not([hidden]) ~ :not([hidden]) {
                         margin-top: 3mm !important;
@@ -2278,6 +3198,8 @@ export default function ReportBuilder() {
         </div>
     );
 }
+
+
 
 
 

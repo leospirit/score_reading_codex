@@ -11,10 +11,15 @@ from typing import Any, Optional
 
 from src.analysis.openai_provider import OpenAIProvider
 from src.config import load_config
+from src.semantic_pronunciation import (
+    apply_semantic_priors_to_reference,
+    build_semantic_pronunciation_priors,
+    summarize_semantic_pronunciation_priors,
+)
 
 logger = logging.getLogger(__name__)
 
-_REF_VERSION = 5
+_REF_VERSION = 6
 _REF_DIR = Path("data/script_references")
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT_HASHES: set[str] = set()
@@ -101,6 +106,8 @@ def _is_modern_reference(data: Any) -> bool:
     if not isinstance(data.get("pause_rules"), list):
         return False
     if not isinstance(data.get("pace_norm"), dict):
+        return False
+    if not isinstance(data.get("semantic_pronunciation_priors"), list):
         return False
     return True
 
@@ -271,6 +278,10 @@ def summarize_script_reference(reference_data: dict[str, Any], max_words: int = 
         if compact:
             lines.append("Linking: " + " | ".join(compact))
 
+    semantic_priors = reference_data.get("semantic_pronunciation_priors") or []
+    if isinstance(semantic_priors, list):
+        lines.extend(summarize_semantic_pronunciation_priors(semantic_priors[:6]))
+
     return "\n".join(lines).strip()
 
 
@@ -394,6 +405,7 @@ def render_preheat_text(script_text: str, reference_data: Optional[dict[str, Any
     pause_rules = reference_data.get("pause_rules") or []
     pace = reference_data.get("pace_norm") or {}
     focus_words = [str(w).strip().lower() for w in (reference_data.get("focus_words") or []) if str(w).strip()]
+    semantic_priors = reference_data.get("semantic_pronunciation_priors") or []
 
     lines: list[str] = []
     lines.append("[Annotated Script]")
@@ -454,6 +466,14 @@ def render_preheat_text(script_text: str, reference_data: Optional[dict[str, Any
         lines.append(", ".join(focus_words[:24]))
     else:
         lines.append("No explicit focus words.")
+    lines.append("")
+    lines.append("[Semantic Pronunciation Priors]")
+    semantic_lines = summarize_semantic_pronunciation_priors(semantic_priors[:8]) if isinstance(semantic_priors, list) else []
+    if semantic_lines:
+        lines.extend(semantic_lines)
+    else:
+        lines.append("No explicit semantic pronunciation prior.")
+
     lines.append("")
     lines.append("[Pace Norm]")
     if isinstance(pace, dict) and pace:
@@ -695,6 +715,62 @@ def _build_template_pause_rules(script_text: str) -> list[dict[str, str]]:
     return template
 
 
+def build_local_script_reference(script_text: str, script_hash: str = "") -> dict[str, Any]:
+    """
+    Build a deterministic local-only script reference.
+    This is the immediate fallback used by the preheat UI when Gemini data
+    is unavailable or still building in the background.
+    """
+    raw_text = str(script_text or "").strip()
+    words = _tokenize_script(raw_text)
+    unique_word_count = len({word.lower() for word in words if str(word).strip()})
+    resolved_hash = str(script_hash or "").strip() or script_reference_hash(raw_text)
+    semantic_priors = build_semantic_pronunciation_priors(raw_text)
+
+    word_pronunciations: list[dict[str, str]] = []
+    for prior in semantic_priors:
+        word = str(prior.get("word", "")).strip()
+        ipa = str(prior.get("ipa", "")).strip()
+        meaning = str(prior.get("meaning", "")).strip()
+        if not word or not ipa:
+            continue
+        tip = f"{word} here means '{meaning}', so read it as /{ipa}/.".strip()
+        word_pronunciations.append(
+            {
+                "word": word,
+                "ipa": ipa,
+                "stress": "",
+                "tip": tip,
+            }
+        )
+
+    word_pronunciations, pronunciation_rules = apply_semantic_priors_to_reference(
+        word_pronunciations,
+        [],
+        semantic_priors,
+    )
+    pause_rules = _build_template_pause_rules(raw_text)
+    pace_norm = _default_pace_norm(len(words))
+    focus_words = _extract_focus_words(word_pronunciations, pronunciation_rules)
+
+    return {
+        "version": _REF_VERSION,
+        "script_hash": resolved_hash,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "model": "local_fallback",
+        "word_pronunciations": word_pronunciations,
+        "pronunciation_rules": pronunciation_rules,
+        "pause_rules": pause_rules,
+        "pace_norm": pace_norm,
+        "sentence_rhythm": [],
+        "common_linking": [],
+        "semantic_pronunciation_priors": semantic_priors,
+        "focus_words": focus_words,
+        "script_token_count": int(len(words)),
+        "unique_word_count": int(unique_word_count),
+    }
+
+
 def _merge_pause_rules_with_template(
     *,
     script_text: str,
@@ -803,6 +879,12 @@ def _normalize_reference(
 ) -> dict[str, Any]:
     word_pronunciations = _clean_word_pronunciations(parsed.get("word_pronunciations"))
     pronunciation_rules = _clean_pronunciation_rules(parsed.get("pronunciation_rules"))
+    semantic_priors = build_semantic_pronunciation_priors(script_text)
+    word_pronunciations, pronunciation_rules = apply_semantic_priors_to_reference(
+        word_pronunciations,
+        pronunciation_rules,
+        semantic_priors,
+    )
     pause_rules = _merge_pause_rules_with_template(
         script_text=script_text,
         gemini_pause_rules=_clean_pause_rules(parsed.get("pause_rules")),
@@ -823,6 +905,7 @@ def _normalize_reference(
         "pace_norm": pace_norm,
         "sentence_rhythm": sentence_rhythm,
         "common_linking": common_linking,
+        "semantic_pronunciation_priors": semantic_priors,
         "focus_words": focus_words,
         "script_token_count": int(script_token_count),
         "unique_word_count": int(unique_word_count),
@@ -866,6 +949,7 @@ def _generate_reference(script_text: str, script_hash: str) -> Optional[dict[str
         "task": "build_script_policy_profile_for_reading_assessment",
         "script": script_text,
         "words": unique_words,
+        "semantic_pronunciation_priors": build_semantic_pronunciation_priors(script_text),
         "goal": "Precompute pronunciation focus, pause policy, and pace norms before audio arrives.",
         "schema": {
             "word_pronunciations": [{"word": "string", "ipa": "string", "stress": "string", "tip": "string"}],
@@ -890,6 +974,7 @@ def _generate_reference(script_text: str, script_hash: str) -> Optional[dict[str
         },
         "rules": [
             "Use General American pronunciation baseline.",
+            "When semantic_pronunciation_priors are provided, obey them for ambiguous words.",
             "Pause rules must be concrete and script-specific.",
             "Pace norm should be practical for elementary reading tasks.",
             "Keep tips short and directly actionable.",

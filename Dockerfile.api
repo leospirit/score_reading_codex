@@ -1,7 +1,7 @@
-# 使用 PyTorch 官方镜像，已包含 CUDA 支持
+﻿# 浣跨敤 PyTorch 瀹樻柟闀滃儚锛屽凡鍖呭惈 CUDA 鏀寔
 FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
-# 设置工作目录
+# 璁剧疆宸ヤ綔鐩綍
 WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件
+# 澶嶅埗渚濊禆鏂囦欢
 COPY requirements.txt .
 
 # Base image already includes torch/torchaudio; skip reinstalling huge wheels.
@@ -37,19 +37,23 @@ RUN tr -d '\r' < requirements.txt | grep -Ev "^(torch|torchaudio|openai-whisper)
     && pip install --no-cache-dir --default-timeout=180 --retries 8 --no-build-isolation openai-whisper \
     && rm -f requirements.runtime.txt
 
-# 复制源代码
+# 澶嶅埗婧愪唬鐮?
 COPY server.py .
 COPY score_reading/ ./score_reading/
+COPY analytics_pg/ ./analytics_pg/
 
-# 创建数据目录
+# 鍒涘缓鏁版嵁鐩綍
 RUN mkdir -p /app/data
 
-# 暴露端口
+# 鏆撮湶绔彛
 EXPOSE 8000
 
-# 健康检查
+# 鍋ュ悍妫€鏌?
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/api/config || exit 1
 
-# 启动命令
+# 鍚姩鍛戒护
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+

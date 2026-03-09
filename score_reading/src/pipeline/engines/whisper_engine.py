@@ -5,6 +5,7 @@ Whisper 引擎 - 使用 faster-whisper 进行语音转录
 """
 import logging
 from pathlib import Path
+import threading
 from typing import Any
 
 import numpy as np
@@ -22,22 +23,31 @@ logger = logging.getLogger(__name__)
 
 # 延迟导入 faster_whisper 以避免在不使用时加载
 _whisper_model = None
+_whisper_model_lock = threading.Lock()
 
 
 def _get_whisper_model():
-    """延迟加载 Whisper 模型"""
+    """Lazy load Whisper model."""
     global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        
-        model_size = config.get("engines.whisper.model_size", "base")
-        device = config.get("engines.whisper.device", "cpu")
-        compute_type = config.get("engines.whisper.compute_type", "int8")
-        
-        logger.info(f"加载 Whisper 模型: {model_size} (device={device}, compute_type={compute_type})")
-        _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        logger.info("Whisper 模型加载完成")
-    
+    if _whisper_model is not None:
+        return _whisper_model
+
+    with _whisper_model_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+
+            model_size = config.get("engines.whisper.model_size", "base")
+            device = config.get("engines.whisper.device", "cpu")
+            compute_type = config.get("engines.whisper.compute_type", "int8")
+
+            logger.info(f"加载 Whisper 模型: {model_size} (device={device}, compute_type={compute_type})")
+            try:
+                _whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            except Exception:
+                _whisper_model = None
+                raise
+            logger.info("Whisper 模型加载完成")
+
     return _whisper_model
 
 

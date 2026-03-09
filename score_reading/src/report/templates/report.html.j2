@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 {% macro get_level(score) -%}
     {% if score >= 90 %}Advanced{% elif score >= 80 %}High-Intermediate{% elif score >= 70 %}Intermediate{% elif score >= 60 %}Basic{% else %}Beginner{% endif %}
@@ -29,6 +29,7 @@
             --text-primary: #1E293B; /* Slate-800 */
             --text-secondary: #64748B; /* Slate-500 */
             --accent: #2979FF;       /* Blue */
+            --card-border: #E2E8F0;
             
             /* Gradients */
             --grad-overall: linear-gradient(135deg, #00E5FF 0%, #2979FF 100%);
@@ -86,6 +87,12 @@
             font-size: 1.2rem; /* cleaned comment */
             margin-bottom: 0;
             color: var(--accent);
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
         }
         
         .meta-grid {
@@ -147,6 +154,43 @@
             transition: stroke-dashoffset 0.5s ease-in-out;
             transform: rotate(-90deg);
             transform-origin: 50% 50%;
+            stroke-linecap: round;
+            stroke-dasharray: var(--ring-circumference, 339);
+            stroke-dashoffset: var(--ring-circumference, 339);
+            animation: ringSweep 1100ms cubic-bezier(0.22, 1, 0.36, 1) 120ms forwards;
+        }
+
+        .ring-container.overall-main {
+            position: relative;
+            margin-bottom: 4px;
+        }
+
+        .overall-main .ring-center {
+            width: 96px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0;
+        }
+
+        .overall-main .ring-center .value {
+            font-size: 2.5rem;
+            line-height: 1;
+            margin-bottom: 0;
+            letter-spacing: -0.8px;
+        }
+
+        @keyframes ringSweep {
+            from { stroke-dashoffset: var(--ring-circumference, 339); }
+            to { stroke-dashoffset: var(--ring-offset, 339); }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .progress-ring__circle {
+                animation: none !important;
+                stroke-dashoffset: var(--ring-offset, 339);
+            }
         }
         
         .ring-center .value {
@@ -333,43 +377,75 @@
         
         /* cleaned comment */
         .text-section {
-            background: var(--bg-card);
-            border-radius: 16px;
+            background: linear-gradient(180deg, #FFFFFF 0%, #F8FBFF 100%);
+            border-radius: 18px;
             padding: 24px;
             margin-bottom: 20px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            box-shadow: var(--shadow-card);
+            border: 1px solid var(--card-border);
+            border-top: 4px solid #2979FF;
         }
         
         .text-section h2 {
-            font-size: 1.2rem;
+            font-size: 1.22rem;
+            margin-bottom: 0;
+            color: #1E40AF;
+            letter-spacing: 0.01em;
+        }
+
+        .section-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
             margin-bottom: 16px;
-            color: var(--accent);
+        }
+
+        .section-head .section-meta {
+            font-size: 0.78rem;
+            color: #475569;
+            background: #E8F0FF;
+            border: 1px solid #C7DAFF;
+            border-radius: 999px;
+            padding: 2px 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .reading-audio {
+            height: 36px;
+            border-radius: 18px;
+            background: #F8FAFC;
+            border: 1px solid #D1E0F7;
+            padding: 0 4px;
         }
         
         .highlighted-text {
             font-family: var(--font-text);
             font-size: 1.05rem; /* cleaned comment */
             line-height: 1.8;   /* cleaned comment */
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.4);
-            border: 1px solid rgba(0, 0, 0, 0.04);
-            border-radius: 12px;
+            padding: 20px 22px;
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 14px;
             text-align: justify;
         }
         
         .highlighted-text .word {
-            padding: 2px 6px;
-            border-radius: 4px;
+            padding: 2px 8px;
+            border-radius: 8px;
             margin: 0 2px;
             display: inline-block;
             cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
+            transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease, border-color 0.16s ease;
             position: relative;
+            border: 1px solid transparent;
         }
         
         .highlighted-text .word:hover {
-            transform: scale(1.15);
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+            transform: translateY(-1px);
+            box-shadow: 0 5px 14px rgba(15, 23, 42, 0.12);
         }
         
         .highlighted-text .word.playing {
@@ -389,24 +465,27 @@
         
         .highlighted-text .word.weak {
             /* cleaned comment */
-            background: transparent;
-            color: var(--color-weak);
+            background: #FFF7ED;
+            color: #C2410C;
+            border-color: #FDBA74;
             font-weight: 600;
         }
         
         .highlighted-text .word.poor {
             /* cleaned comment */
-            background: transparent;
-            color: var(--color-missing);
+            background: #FEF2F2;
+            color: #B91C1C;
+            border-color: #FCA5A5;
             font-weight: 600;
         }
         
         .highlighted-text .word.missing {
             /* cleaned comment */
-            background: transparent;
-            color: var(--color-missing);
+            background: #FFE4E6;
+            color: #9F1239;
             font-weight: 600;
-            opacity: 0.7;
+            border-color: #FDA4AF;
+            opacity: 0.95;
         }
 
         .highlighted-text .word.missing .missing-box {
@@ -430,31 +509,24 @@
 
         .highlighted-text .word.pause-flagged {
             font-weight: 700;
-            text-decoration: underline;
-            text-decoration-style: wavy;
-            text-decoration-thickness: 1.5px;
-            text-underline-offset: 3px;
         }
 
         .highlighted-text .word.pause-too-long {
             background: #FFE4E6;
             color: #9F1239;
             box-shadow: inset 0 -2px 0 #F43F5E;
-            text-decoration-color: #F43F5E;
         }
 
         .highlighted-text .word.pause-phrase-break {
             background: #FEE2E2;
             color: #991B1B;
             box-shadow: inset 0 -2px 0 #EF4444;
-            text-decoration-color: #EF4444;
         }
 
         .highlighted-text .word.pause-too-short {
             background: #FFFBEB;
             color: #92400E;
             box-shadow: inset 0 -2px 0 #F59E0B;
-            text-decoration-color: #F59E0B;
         }
 
         .word-factor-pop {
@@ -590,17 +662,30 @@
                 max-width: none;
                 box-shadow: none;
             }
-                box-shadow: none;
-                border: 1px solid #eee;
-                break-inside: avoid;
+            .print-btn, .score-toggle-btn { display: none; }
+            .ring-center .value {
+                background: none !important;
+                -webkit-background-clip: border-box !important;
+                -webkit-text-fill-color: #0F172A !important;
+                color: #0F172A !important;
             }
-            .print-btn { display: none; }
+            .ring-center .unit {
+                color: #334155 !important;
+                opacity: 1 !important;
+            }
+            .overall-main .progress-ring__circle {
+                animation: none !important;
+                stroke-dashoffset: var(--ring-offset, 339) !important;
+            }
             .pause-guide-tag.inline[data-print-hint]::after {
                 content: " (" attr(data-print-hint) ")";
                 font-size: 0.66rem;
                 font-weight: 600;
                 color: #475569;
                 margin-left: 2px;
+            }
+            .transcription-section {
+                display: none !important;
             }
         }
         
@@ -621,6 +706,23 @@
         .print-btn:hover {
             background: #2962FF;
         }
+
+        .score-toggle-btn {
+            background: #fff;
+            color: var(--text-primary);
+            border: 1px solid #CBD5E1;
+            padding: 8px 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: var(--font-body);
+            font-weight: 600;
+            font-size: 0.84rem;
+            transition: all 0.2s;
+        }
+        .score-toggle-btn:hover {
+            border-color: #94A3B8;
+            background: #F8FAFC;
+        }
         
         .reading-legend {
             display: flex;
@@ -634,9 +736,9 @@
             align-items: center;
             gap: 6px;
             border-radius: 999px;
-            padding: 3px 9px;
+            padding: 5px 10px;
             border: 1px solid transparent;
-            font-size: 0.78rem;
+            font-size: 0.79rem;
             font-weight: 700;
             line-height: 1.1;
             white-space: nowrap;
@@ -710,14 +812,36 @@
             padding: 16px;
             margin-bottom: 24px;
         }
-        
-        .transcription-section h3 {
+
+        .transcription-summary {
             font-size: 0.95rem;
             color: #1E293B;
-            margin-bottom: 8px;
+            margin-bottom: 0;
             display: flex;
             align-items: center;
             gap: 6px;
+            cursor: pointer;
+            font-weight: 700;
+            list-style: none;
+            user-select: none;
+        }
+
+        .transcription-summary::-webkit-details-marker {
+            display: none;
+        }
+        .transcription-summary::before {
+            content: ">";
+            color: #3B82F6;
+            font-size: 0.9rem;
+            line-height: 1;
+            transform: translateY(-1px);
+        }
+        .transcription-section[open] .transcription-summary::before {
+            content: "v";
+        }
+
+        .transcription-body {
+            margin-top: 10px;
         }
         
         .detected-content {
@@ -746,7 +870,8 @@
             border-radius: 16px;
             padding: 24px;
             margin-bottom: 20px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            box-shadow: var(--shadow-card);
+            border: 1px solid var(--card-border);
         }
         
         .analysis-section h2 {
@@ -762,7 +887,8 @@
         }
         
         .analysis-card {
-            background: rgba(255, 255, 255, 0.05);
+            background: #F8FAFC;
+            border: 1px solid #E2E8F0;
             border-radius: 12px;
             padding: 16px;
         }
@@ -780,16 +906,18 @@
         }
         
         .analysis-card .item {
-            background: rgba(255, 255, 255, 0.1);
+            background: #EEF2FF;
+            border: 1px solid #DBEAFE;
             padding: 4px 12px;
             border-radius: 16px;
             font-size: 0.85rem;
             cursor: pointer;
-            transition: transform 0.2s;
+            transition: transform 0.16s ease, box-shadow 0.16s ease;
         }
         
         .analysis-card .item:hover {
-            transform: scale(1.1);
+            transform: translateY(-1px);
+            box-shadow: 0 5px 10px rgba(15, 23, 42, 0.08);
         }
         
         .analysis-card .item.weak {
@@ -808,7 +936,8 @@
             border-radius: 16px;
             padding: 24px;
             margin-bottom: 20px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            box-shadow: var(--shadow-card);
+            border: 1px solid var(--card-border);
         }
         
         .pronunciation-section h2 {
@@ -916,7 +1045,7 @@
             padding: 24px;
             margin-bottom: 20px;
             box-shadow: var(--shadow-card);
-            border: 1px solid rgba(0,0,0,0.02);
+            border: 1px solid var(--card-border);
         }
         
         .feedback-section h2 {
@@ -993,6 +1122,35 @@
             opacity: 0.5;
             margin-bottom: 12px;
         }
+
+        @media (max-width: 960px) {
+            .scores-section {
+                grid-template-columns: 1fr;
+            }
+
+            .bottom-row {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+
+            .section-head {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .highlighted-text {
+                font-size: 1rem;
+                line-height: 1.75;
+                padding: 16px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1000,14 +1158,17 @@
         <!-- cleaned comment -->
         <div class="header">
             <h1>Speaking Report - {{ meta.student_id }}</h1>
-            <button class="print-btn" onclick="window.print()">Generate Report</button>
+            <div class="header-actions">
+                <button id="scoreToggleBtn" class="score-toggle-btn" type="button" onclick="toggleScoreViewMode()" style="display:inline-flex;">Show Grade</button>
+                <button class="print-btn" onclick="window.print()">Generate Report</button>
+            </div>
         </div>
         
         <!-- cleaned comment -->
         <div class="scores-section">
             <!-- cleaned comment -->
             <div class="overall-card">
-                <div class="ring-container" style="transform: scale(0.9); margin-bottom: -10px;">
+                <div class="ring-container overall-main">
                     <svg class="progress-ring" width="120" height="120">
                         <circle
                             class="progress-ring__circle-bg"
@@ -1025,7 +1186,7 @@
                             r="54"
                             cx="60"
                             cy="60"
-                            style="stroke-dasharray: 339; stroke-dashoffset: {{ 339 - (339 * scores.overall_100 / 100) }}"/>
+                            style="--ring-circumference: 339; --ring-offset: {{ 339 - (339 * scores.overall_100 / 100) }};"/>
                         <defs>
                             <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
                                 <stop offset="0%" stop-color="#00E5FF" />
@@ -1034,8 +1195,12 @@
                         </defs>
                     </svg>
                     <div class="ring-center">
-                        <div class="value" style="font-size: 2rem;">{{ score_int(scores.overall_100) }}%</div>
-                        <div class="unit">{{ get_level(scores.overall_100) }}</div>
+                        <div
+                            id="overallScoreValue"
+                            class="value report-score-value"
+                            data-score="{{ ('%.2f' % (scores.overall_100 | float)).rstrip('0').rstrip('.') }}"
+                            data-default-color="#2979FF"
+                        >{{ score_int(scores.overall_100) }}%</div>
                     </div>
                 </div>
                 <div class="overall-feedback">
@@ -1047,27 +1212,28 @@
             
             <!-- cleaned comment -->
             <div class="breakdown-grid">
-                {% set completeness_display_score = (completeness_analysis.coverage if completeness_analysis and completeness_analysis.coverage is defined else scores.completeness_100) %}
+                {% set completeness_payload = completeness_analysis if completeness_analysis else (analysis.completeness if analysis and analysis.completeness is defined else none) %}
+                {% set completeness_display_score = (completeness_payload.coverage if completeness_payload and completeness_payload.coverage is defined else scores.completeness_100) %}
                 <div class="skill-card pronunciation" onclick="openPronunciationModal()" style="cursor: pointer;">
-                    <div class="skill-score">{{ score_int(scores.pronunciation_100) }}%</div>
+                    <div class="skill-score report-score-value" data-score="{{ ('%.2f' % (scores.pronunciation_100 | float)).rstrip('0').rstrip('.') }}" data-default-color="#2979FF">{{ score_int(scores.pronunciation_100) }}%</div>
                     <div class="skill-label">Pronunciation</div>
                     <div class="skill-level">{{ get_level(scores.pronunciation_100) }}</div>
                 </div>
                 
                 <div class="skill-card intonation" onclick="openIntonationModal()" style="cursor: pointer;">
-                    <div class="skill-score">{{ score_int(scores.intonation_100) }}%</div>
+                    <div class="skill-score report-score-value" data-score="{{ ('%.2f' % (scores.intonation_100 | float)).rstrip('0').rstrip('.') }}" data-default-color="#00C853">{{ score_int(scores.intonation_100) }}%</div>
                     <div class="skill-label">Prosody</div>
                     <div class="skill-level">{{ get_level(scores.intonation_100) }}</div>
                 </div>
                 
                 <div class="skill-card fluency" onclick="openFluencyModal()" style="cursor: pointer;">
-                    <div class="skill-score">{{ score_int(scores.fluency_100) }}%</div>
+                    <div class="skill-score report-score-value" data-score="{{ ('%.2f' % (scores.fluency_100 | float)).rstrip('0').rstrip('.') }}" data-default-color="#FF9100">{{ score_int(scores.fluency_100) }}%</div>
                     <div class="skill-label">Fluency</div>
                     <div class="skill-level">{{ get_level(scores.fluency_100) }}</div>
                 </div>
                 
                 <div class="skill-card completeness" onclick="openCompletenessModal()" style="cursor: pointer;">
-                    <div class="skill-score">{{ score_int(completeness_display_score) }}%</div>
+                    <div class="skill-score report-score-value" data-score="{{ ('%.2f' % (completeness_display_score | float)).rstrip('0').rstrip('.') }}" data-default-color="#AA00FF">{{ score_int(completeness_display_score) }}%</div>
                     <div class="skill-label">Completeness</div>
                     <div class="skill-level">{{ get_level(completeness_display_score) }}</div>
                 </div>
@@ -1077,13 +1243,16 @@
 
         
         <!-- cleaned comment -->
-        {% if engine_raw.detected_transcript %}
-        <div class="transcription-section">
-            <h3>Transcript Comparison</h3>
-            <div class="detected-content">{{ engine_raw.detected_transcript }}</div>
-            <p style="font-size: 0.8rem; color: #64748B; margin-top: 8px;">
-                <b>提示：</b>这是实际听到的内容。若与参考文本不一致，请优先关注高亮差异。
-        </div>
+                {% if engine_raw.detected_transcript %}
+        <details class="transcription-section">
+            <summary class="transcription-summary">Transcript Comparison</summary>
+            <div class="transcription-body">
+                <div class="detected-content">{{ engine_raw.detected_transcript }}</div>
+                <p style="font-size: 0.8rem; color: #64748B; margin-top: 8px;">
+                    <b>提示:</b> 这是识别到的实际朗读内容，与参考文本不同处可重点关注。
+                </p>
+            </div>
+        </details>
         {% endif %}
 
         {% set _pause_profile = engine_raw.pause_profile if engine_raw and engine_raw.pause_profile else {} %}
@@ -1091,49 +1260,43 @@
         {% set show_missing_break = not low_conf_pause %}
         <!-- cleaned comment -->
         <div class="text-section">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-                <h2 style="margin-bottom: 0;">Reading Analysis</h2>
+            <div class="section-head">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <h2>Reading Analysis</h2>
+                    <span class="section-meta">Core View</span>
+                </div>
                 {% if audio_base64 %}
-                <audio controls style="height: 36px; border-radius: 18px;">
+                <audio class="reading-audio" controls>
                     <source src="data:audio/mp3;base64,{{ audio_base64 }}" type="audio/mpeg">
                     Your browser does not support the audio element.
                 </audio>
                 {% endif %}
             </div>
             <div class="highlighted-text" id="highlightedText">
-                {% for word in alignment.words %}
-                {% set pause_before_cls = '' %}
-                {% if not loop.first and loop.previtem.pause %}
-                    {% set prev_pause_issue = (loop.previtem.pause.issue | default('') | lower) %}
-                    {% if prev_pause_issue == '' %}
-                        {% if loop.previtem.pause.type == 'bad' %}
-                            {% set prev_pause_issue = 'too_long' %}
-                        {% elif loop.previtem.pause.type == 'missed' %}
-                            {% set prev_pause_issue = 'too_short' %}
-                        {% endif %}
-                    {% endif %}
-                    {% if prev_pause_issue == 'too_long' %}
-                        {% set prev_expected_type = (loop.previtem.pause.expected_type | default('') | lower) %}
-                        {% set prev_phrase_break = (prev_expected_type in ['none', 'light', 'medium'] or (word.is_linked | default(false))) %}
-                        {% if prev_phrase_break %}
-                            {% set pause_before_cls = 'phrase-break' %}
-                            <span class="break-chip unexpected phrase-break" title="Phrase break: pause too long before this word">Phrase Break</span>
-                        {% else %}
-                            {% set pause_before_cls = 'too-long' %}
-                            <span class="break-chip unexpected" title="Pause too long before this word">Too Long</span>
-                        {% endif %}
-                    {% elif show_missing_break and prev_pause_issue == 'too_short' %}
-                        {% set pause_before_cls = 'too-short' %}
-                        <span class="break-chip missing" title="Pause too short before this word">Too Short</span>
-                    {% endif %}
+                {% set reading_word_list = reading_words if reading_words is defined and reading_words else alignment.words %}
+                {% for word in reading_word_list %}
+                {% set display_tag = word.tag %}
+                {% if engine_raw and engine_raw.source and ('azure' in (engine_raw.source | lower)) and display_tag == 'ok' and (word.score | float) < 50 %}
+                {% set display_tag = 'weak' %}
                 {% endif %}
-                <span class="word {{ word.tag }}{% if pause_before_cls %} pause-flagged pause-{{ pause_before_cls }}{% endif %}" 
+                {% if engine_raw and engine_raw.source and ('azure' in (engine_raw.source | lower)) and display_tag == 'ok' and word.phoneme_breakdown %}
+                {% set low_factor = namespace(hit=false) %}
+                {% for ph in word.phoneme_breakdown %}
+                    {% if (ph.score | float) < 50 %}
+                        {% set low_factor.hit = true %}
+                    {% endif %}
+                {% endfor %}
+                {% if low_factor.hit %}
+                {% set display_tag = 'weak' %}
+                {% endif %}
+                {% endif %}
+                <span class="word {{ display_tag }}" 
                       title="{% if word.diagnosis %}Diagnosis: {{ word.diagnosis }}{% else %}Score: {{ ('%.1f' % (word.score | float)).rstrip('0').rstrip('.') }}{% endif %}"
                       data-start="{{ word.start }}"
                       data-end="{{ word.end }}"
                       data-index="{{ loop.index0 }}"
                       {% if word.diagnosis %}data-diagnosis="{{ word.diagnosis }}"{% endif %}>
-                    {% if word.tag == 'missing' %}
+                    {% if display_tag == 'missing' %}
                     <span class="missing-box">[ ]</span><span class="missing-text">{{ word.word }}</span>
                     {% else %}
                     {{ word.word }}
@@ -1161,13 +1324,6 @@
                 <span class="legend-item weak">Weak</span>
                 <span class="legend-item poor">Needs Improvement</span>
                 <span class="legend-item missing">Missing</span>
-                <span class="legend-item break-unexpected" title="Pause too long">Too Long Pause</span>
-                <span class="legend-item break-phrase" title="Pause splits linked words">Phrase Break</span>
-                {% if show_missing_break %}
-                <span class="legend-item break-missing" title="Pause too short">Too Short Pause</span>
-                {% else %}
-                <span class="legend-item break-missing" title="Too-short label hidden on low-confidence timing">Too Short Hidden (low confidence)</span>
-                {% endif %}
             </div>
         </div>
         
@@ -1389,15 +1545,16 @@
         <div id="intonationModal" class="modal-overlay">
         <div class="modal-container" style="max-width: 980px;">
             <div class="modal-header">
-                <h2>Prosody Analysis (Stress & Rhythm)</h2>
+                <h2>Stress & Rhythm Guide</h2>
                 <button class="close-btn" onclick="closeIntonationModal()">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="intonation-legend-row">
-                    <span class="legend-pill"><span class="legend-dot ok"></span>Stress Correct</span>
-                    <span class="legend-pill"><span class="legend-dot bad"></span>Stress Incorrect</span>
-                    <span class="legend-pill"><span class="legend-dot light"></span>Unstressed</span>
+                    <span class="legend-pill"><span class="legend-dot ok"></span>Natural</span>
+                    <span class="legend-pill"><span class="legend-dot bad"></span>Needs Adjustment</span>
+                    <span class="legend-pill"><span class="legend-dot light"></span>Light</span>
                 </div>
+                <div class="intonation-legend-note">Large bubbles show relatively stronger words. Red means the stress-rhythm handling at that spot can be adjusted.</div>
                 <div id="intonationRhythmRoot" class="intonation-rhythm-root">
                     <div class="intonation-empty">Generating intonation stress analysis...</div>
                 </div>
@@ -1411,6 +1568,12 @@
             gap: 16px;
             flex-wrap: wrap;
             margin-bottom: 16px;
+        }
+
+        .intonation-legend-note {
+            font-size: 0.8rem;
+            color: #64748b;
+            margin-bottom: 12px;
         }
 
         .legend-pill {
@@ -1907,6 +2070,170 @@
 
     <script>
         // Modal Control
+        const SCORE_VIEW_MODE_STORAGE_KEY = 'score_reading.score_view_mode';
+        const GRADE_THRESHOLDS_STORAGE_KEY = 'score_reading.grade_thresholds';
+        const DEFAULT_GRADE_THRESHOLDS = { cMin: 0, bMin: 75, aMin: 85, aPlusMin: 95 };
+        let currentScoreViewMode = 'score';
+        let currentGradeThresholds = DEFAULT_GRADE_THRESHOLDS;
+
+        function clampThreshold(value, min, max) {
+            if (!Number.isFinite(value)) return min;
+            return Math.min(max, Math.max(min, Math.round(value)));
+        }
+
+        function normalizeGradeThresholds(raw) {
+            const cMin = clampThreshold(Number(raw && raw.cMin), 0, 97);
+            const bMin = clampThreshold(Number(raw && raw.bMin), cMin + 1, 98);
+            const aMin = clampThreshold(Number(raw && raw.aMin), bMin + 1, 99);
+            const aPlusMin = clampThreshold(Number(raw && raw.aPlusMin), aMin + 1, 100);
+            return { cMin, bMin, aMin, aPlusMin };
+        }
+
+        function isLegacyDefaultThresholds(thresholds) {
+            return thresholds
+                && Number(thresholds.cMin) === 61
+                && Number(thresholds.bMin) === 71
+                && Number(thresholds.aMin) === 81
+                && Number(thresholds.aPlusMin) === 86;
+        }
+
+        function getGradeInfo(score, thresholds) {
+            const n = Number(score);
+            if (!Number.isFinite(n)) return { label: '--', color: '#6B7280' };
+            if (n >= thresholds.aPlusMin) return { label: 'A+', color: '#A855F7' };
+            if (n >= thresholds.aMin) return { label: 'A', color: '#22C55E' };
+            if (n >= thresholds.bMin) return { label: 'B', color: '#3B82F6' };
+            return { label: 'C', color: '#F59E0B' };
+        }
+
+        function readScoreDisplayPreferencesFromStorage() {
+            let mode = 'score';
+            let gradeThresholds = DEFAULT_GRADE_THRESHOLDS;
+            try {
+                mode = localStorage.getItem(SCORE_VIEW_MODE_STORAGE_KEY) === 'grade' ? 'grade' : 'score';
+                const rawThresholds = localStorage.getItem(GRADE_THRESHOLDS_STORAGE_KEY);
+                const parsedThresholds = rawThresholds
+                    ? normalizeGradeThresholds(JSON.parse(rawThresholds))
+                    : DEFAULT_GRADE_THRESHOLDS;
+                gradeThresholds = isLegacyDefaultThresholds(parsedThresholds) ? DEFAULT_GRADE_THRESHOLDS : parsedThresholds;
+            } catch {
+                mode = 'score';
+                gradeThresholds = DEFAULT_GRADE_THRESHOLDS;
+            }
+            return { mode, gradeThresholds };
+        }
+
+        function parseReportDisplayPayload(raw) {
+            const source = raw && typeof raw === 'object' ? raw : {};
+            const mode = String(source.score_view_mode || source.scoreViewMode || '').trim().toLowerCase() === 'grade'
+                ? 'grade'
+                : 'score';
+            const thresholdRaw = source.grade_thresholds || source.gradeThresholds || {};
+            const gradeThresholds = normalizeGradeThresholds({
+                cMin: Number(thresholdRaw.c_min ?? thresholdRaw.cMin),
+                bMin: Number(thresholdRaw.b_min ?? thresholdRaw.bMin),
+                aMin: Number(thresholdRaw.a_min ?? thresholdRaw.aMin),
+                aPlusMin: Number(thresholdRaw.a_plus_min ?? thresholdRaw.aPlusMin),
+            });
+            return {
+                mode,
+                gradeThresholds: isLegacyDefaultThresholds(gradeThresholds) ? DEFAULT_GRADE_THRESHOLDS : gradeThresholds,
+            };
+        }
+
+        async function fetchScoreDisplayPreferences() {
+            try {
+                const res = await fetch('/api/report-display', { cache: 'no-store' });
+                if (res.ok) {
+                    const data = await res.json();
+                    const prefs = parseReportDisplayPayload(data && data.report_display);
+                    try {
+                        localStorage.setItem(SCORE_VIEW_MODE_STORAGE_KEY, prefs.mode);
+                        localStorage.setItem(GRADE_THRESHOLDS_STORAGE_KEY, JSON.stringify(prefs.gradeThresholds));
+                    } catch {
+                        // Ignore storage write failures in restrictive browsers.
+                    }
+                    return prefs;
+                }
+            } catch {
+                // Fall back to local storage values.
+            }
+            return readScoreDisplayPreferencesFromStorage();
+        }
+
+        async function saveScoreDisplayPreferences(mode, thresholds) {
+            const payload = {
+                score_view_mode: mode === 'grade' ? 'grade' : 'score',
+                grade_thresholds: {
+                    c_min: thresholds.cMin,
+                    b_min: thresholds.bMin,
+                    a_min: thresholds.aMin,
+                    a_plus_min: thresholds.aPlusMin,
+                },
+            };
+            try {
+                await fetch('/api/report-display', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+            } catch {
+                // Save failure should not block local UI update.
+            }
+        }
+
+        function applyScoreDisplayMode(mode, thresholds) {
+            currentScoreViewMode = mode === 'grade' ? 'grade' : 'score';
+            currentGradeThresholds = normalizeGradeThresholds(thresholds || DEFAULT_GRADE_THRESHOLDS);
+            const button = document.getElementById('scoreToggleBtn');
+            if (button) {
+                button.textContent = currentScoreViewMode === 'grade' ? 'Show Score' : 'Show Grade';
+            }
+            const scoreNodes = document.querySelectorAll('.report-score-value');
+            scoreNodes.forEach((node) => {
+                const score = Number(node.getAttribute('data-score'));
+                if (!Number.isFinite(score)) return;
+                if (currentScoreViewMode === 'grade') {
+                    const info = getGradeInfo(score, currentGradeThresholds);
+                    node.textContent = info.label;
+                    node.style.color = info.color;
+                } else {
+                    node.textContent = `${Math.round(score)}%`;
+                    const fallbackColor = String(node.getAttribute('data-default-color') || '').trim();
+                    node.style.color = fallbackColor;
+                }
+            });
+        }
+
+        async function initScoreViewMode() {
+            const prefs = await fetchScoreDisplayPreferences();
+            applyScoreDisplayMode(prefs.mode, prefs.gradeThresholds);
+        }
+
+        window.toggleScoreViewMode = async function() {
+            const nextMode = currentScoreViewMode === 'grade' ? 'score' : 'grade';
+            try {
+                localStorage.setItem(SCORE_VIEW_MODE_STORAGE_KEY, nextMode);
+                localStorage.setItem(GRADE_THRESHOLDS_STORAGE_KEY, JSON.stringify(currentGradeThresholds));
+            } catch {
+                // Keep in-memory state only when storage is unavailable.
+            }
+            applyScoreDisplayMode(nextMode, currentGradeThresholds);
+            await saveScoreDisplayPreferences(nextMode, currentGradeThresholds);
+        };
+
+        window.initScoreViewMode = initScoreViewMode;
+
+        window.addEventListener('storage', function(event) {
+            if (!event.key || event.key === SCORE_VIEW_MODE_STORAGE_KEY || event.key === GRADE_THRESHOLDS_STORAGE_KEY) {
+                initScoreViewMode();
+            }
+        });
+
+        window.addEventListener('score-report-settings-updated', function() {
+            initScoreViewMode();
+        });
+
                 window.openIntonationModal = function() {
             document.getElementById('intonationModal').classList.add('active');
             document.body.style.overflow = 'hidden';
@@ -1928,11 +2255,13 @@
 
                 const pause = w.pause || null;
                 const pauseDuration = pause ? Number(pause.duration || 0) : 0;
+                const expectedType = pause ? String(pause.expected_type || '').toLowerCase() : '';
+                const byPunctuation = Boolean(w.sentence_end) || expectedType === 'strong';
                 const byPause = pauseDuration >= 0.38;
                 const byLength = current.length >= 16;
                 const isLast = i === words.length - 1;
 
-                if (byPause || byLength || isLast) {
+                if (byPunctuation || byPause || byLength || isLast) {
                     if (current.length >= 4) chunks.push(current);
                     current = [];
                 }
@@ -1998,6 +2327,7 @@
             const tokens = [];
             let stressTargets = 0;
             let stressCorrect = 0;
+            const lowerWords = words.map((w) => String(w.word || '').toLowerCase());
             const rawStress = words.map((w) => {
                 const s = Number(w.stress ?? 0);
                 const sc = Number(w.score ?? 0);
@@ -2043,6 +2373,11 @@
             if (spread < 0.05) issueScore += 1;
             if (accuracy < 70) issueScore += 2;
             else if (accuracy < 85) issueScore += 1;
+            const hasMissing = words.some((w) => String(w.tag || '').toLowerCase() === 'missing');
+            const tailToken = lowerWords.length ? lowerWords[lowerWords.length - 1] : '';
+            const incompleteTailWords = new Set(['what', 'where', 'when', 'why', 'how', 'which', 'who']);
+            const contentWordCount = lowerWords.filter((w) => inferExpectedStressByWord(w)).length;
+            const isCompleteEnough = !hasMissing && words.length >= 4 && contentWordCount >= 2 && !incompleteTailWords.has(tailToken);
             return {
                 words,
                 tokens,
@@ -2055,13 +2390,16 @@
                 spread,
                 overStressCount,
                 issueScore,
+                hasMissing,
+                isCompleteEnough,
             };
         }
 
         function pickBestAndWorst(sentenceStats) {
             const analyzable = sentenceStats.filter((s) => Number(s.stressTargets || 0) >= 2);
             const pool = analyzable.length ? analyzable : sentenceStats;
-            const sorted = [...pool].sort((a, b) => {
+            const bestPool = pool.filter((s) => !s.hasMissing);
+            const sorted = [...(bestPool.length ? bestPool : pool)].sort((a, b) => {
                 if (b.accuracy !== a.accuracy) return b.accuracy - a.accuracy;
                 return b.stressCorrect - a.stressCorrect;
             });
@@ -2070,8 +2408,9 @@
             const bestText = best ? best.text : null;
             let candidates = pool.filter((s) => !bestText || s.text !== bestText);
             if (!candidates.length) candidates = pool;
-            const issueCandidates = candidates.filter((s) => Number(s.issueScore || 0) > 0);
-            const worstPool = issueCandidates.length ? issueCandidates : candidates;
+            const completeCandidates = candidates.filter((s) => s.isCompleteEnough);
+            const issueCandidates = completeCandidates.filter((s) => Number(s.issueScore || 0) > 0);
+            const worstPool = issueCandidates.length ? issueCandidates : (completeCandidates.length ? completeCandidates : candidates);
             const worst = [...worstPool].sort((a, b) => {
                 if ((b.issueScore || 0) !== (a.issueScore || 0)) return (b.issueScore || 0) - (a.issueScore || 0);
                 if (a.accuracy !== b.accuracy) return a.accuracy - b.accuracy;
@@ -2093,33 +2432,33 @@
 
             if (miss.length) {
                 return {
-                    title: `Key issue: missed stress on ${miss.join(' / ')}`,
-                    action: 'Fix: lengthen each focus word by about 0.1-0.2s and raise pitch slightly on its vowel.',
+                    title: `Key words to highlight a little more: ${miss.join(' / ')}`,
+                    action: 'Method: make these keywords a little longer and more prominent.',
                 };
             }
             if (overUniq.length) {
                 return {
-                    title: `Key issue: over-stressed light words ${overUniq.join(' / ')}`,
-                    action: 'Fix: keep these words shorter and lighter; move emphasis back to content words.',
+                    title: `Light words to keep gentler: ${overUniq.join(' / ')}`,
+                    action: 'Method: keep these words shorter and lighter; move emphasis back to content words.',
                 };
             }
             if (Number(stat.contrast || 0) < 0.10) {
                 return {
-                    title: 'Key issue: stress contrast is too flat in this sentence',
-                    action: 'Fix: keep 2-4 key stresses and reduce energy on connecting words.',
+                    title: 'This sentence could use a clearer stress contrast',
+                    action: 'Method: keep 2-4 key stresses and reduce energy on connecting words.',
                 };
             }
             return {
-                title: 'Key issue: rhythm control is unstable in this sentence',
-                action: 'Fix: read once slowly with marked stress words, then repeat at normal pace.',
+                title: 'This sentence needs steadier rhythm control',
+                action: 'Method: read once slowly with marked stress words, then repeat at normal pace.',
             };
         }
 
         function buildCard(stat, variant) {
-            const title = variant === 'best' ? 'Best Performance' : 'Needs Improvement';
+            const title = variant === 'best' ? 'Natural Rhythm Example' : 'Most Worth Adjusting';
             const issue = deriveIntonationIssue(stat);
             const note = variant === 'best'
-                ? 'Stress rhythm is accurate and natural. Keep it up.'
+                ? 'The key words stand out clearly and the stress-rhythm pattern sounds natural.'
                 : `${issue.title}. ${issue.action}`;
 
             const cardClass = variant === 'best' ? 'intonation-card best' : 'intonation-card warning';
@@ -2136,7 +2475,6 @@
                 <section class="${cardClass}">
                     <div class="intonation-card-head">
                         <h3 class="${titleClass}">${title}</h3>
-                        <span class="${accClass}">Accuracy ${stat.accuracy}%</span>
                     </div>
                     <div class="intonation-token-row">${tokenHtml}</div>
                     <p class="intonation-note">${note}</p>
@@ -2155,10 +2493,10 @@
             const uniqueWeak = [...new Set(weakWords)].filter(Boolean).slice(0, 3);
             const uniqueOver = [...new Set(overWords)].filter(Boolean).slice(0, 3);
             const focusText = uniqueWeak.length
-                ? `Missed stress words: ${uniqueWeak.join(' / ')}`
+                ? `Practice focus: ${uniqueWeak.join(' / ')}`
                 : uniqueOver.length
-                    ? `Over-stressed light words: ${uniqueOver.join(' / ')}`
-                    : 'Focus words: keep stress on key content words in each sentence.';
+                    ? `Practice focus: ${uniqueOver.join(' / ')}`
+                    : 'Practice focus: keep the main stress on key content words in each sentence.';
             const methodText = uniqueWeak.length
                 ? 'Method: for each focus word, slow down slightly, lengthen the vowel by about 0.1-0.2 seconds, and add a small pitch rise.'
                 : uniqueOver.length
@@ -2167,7 +2505,7 @@
 
             return `
                 <section class="intonation-method">
-                    <h4>How to Improve Stress</h4>
+                    <h4>How to Make Key Words Stand Out</h4>
                     <p>${focusText}</p>
                     <p>${methodText}</p>
                 </section>
@@ -2178,7 +2516,7 @@
             const root = document.getElementById('intonationRhythmRoot');
             if (!root) return;
 
-            const words = {{ alignment.words | tojson | default('[]') }};
+            const words = {{ reading_words | tojson | default('[]') }};
             if (!Array.isArray(words) || words.length === 0) {
                 root.innerHTML = '<div class="intonation-empty">No intonation data available.</div>';
                 return;
@@ -2434,11 +2772,7 @@
                     <div class="transcript-box">
                         <h3>Transcript</h3>
                         <div class="pause-guide-legend">
-                            <span class="pause-guide-tag phrase-break">Phrase Break</span>
-                            <span class="pause-guide-tag too-long">Too Long</span>
-                            {% if low_conf_pause or show_missing_break %}
-                            <span class="pause-guide-tag too-short">Too Short</span>
-                            {% endif %}
+                            <span class="pause-guide-tag too-long">Long Pause</span>
                         </div>
                         <div class="transcript-content">
                             {% for word in alignment.words %}
@@ -2458,7 +2792,7 @@
                                             {% endif %}
                                         {% endfor %}
                                     {% endif %}
-                                    {% if focus.item and (focus.item.issue == 'too_long' or focus.item.issue == 'too_short') %}
+                                    {% if focus.item and (focus.item.issue == 'too_long') %}
                                         {% set left_word = focus.item.left_word | default(word.word) %}
                                         {% set right_word = focus.item.right_word | default('next word') %}
                                         {% set actual_ms = ((focus.item.actual_gap | default(0) | float) * 1000) | round | int %}
@@ -2471,7 +2805,7 @@
                                         {% set issue_print = 'add ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
                                         {% set student_title = 'Too Short: add a clearer pause here' %}
                                         {% if focus.item.issue == 'too_long' %}
-                                            {% set issue_label = 'TOO LONG' %}
+                                            {% set issue_label = 'LONG PAUSE' %}
                                             {% set issue_cls = 'too-long' %}
                                             {% set issue_tip = 'After ' ~ left_word ~ ' before ' ~ right_word ~ ': pause too long (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Shorten by about ' ~ adjust_ms ~ ' ms.' %}
                                             {% set issue_print = 'shorten ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
@@ -2483,7 +2817,7 @@
                                                 {% set phrase_break = true %}
                                             {% endif %}
                                             {% if phrase_break %}
-                                                {% set issue_label = 'PHRASE BREAK' %}
+                                                {% set issue_label = 'LONG PAUSE' %}
                                                 {% set issue_cls = 'phrase-break' %}
                                                 {% set issue_tip = 'After ' ~ left_word ~ ' before ' ~ right_word ~ ': this pause is too long and breaks a connected phrase (' ~ actual_ms ~ ' ms). Keep the phrase connected; target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms.' %}
                                                 {% set issue_print = 'phrase split: connect words; shorten ~' ~ adjust_ms ~ ' ms' %}
@@ -2506,7 +2840,7 @@
                                             {% set pause_issue = 'too_short' %}
                                         {% endif %}
                                     {% endif %}
-                                    {% if pause_issue == 'too_long' or (show_missing_break and pause_issue == 'too_short') %}
+                                    {% if pause_issue == 'too_long' %}
                                         {% set right_word = loop.nextitem.word if loop.nextitem is defined else 'next word' %}
                                         {% set actual_ms = ((word.pause.duration | default(0) | float) * 1000) | round | int %}
                                         {% set target_min_ms = ((word.pause.target_min | default(0) | float) * 1000) | round | int %}
@@ -2518,7 +2852,7 @@
                                         {% set issue_print = 'add ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
                                         {% set student_title = 'Too Short: add a clearer pause here' %}
                                         {% if pause_issue == 'too_long' %}
-                                            {% set issue_label = 'TOO LONG' %}
+                                            {% set issue_label = 'LONG PAUSE' %}
                                             {% set issue_cls = 'too-long' %}
                                             {% set issue_tip = 'After ' ~ word.word ~ ' before ' ~ right_word ~ ': pause too long (' ~ actual_ms ~ ' ms). Target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms. Shorten by about ' ~ adjust_ms ~ ' ms.' %}
                                             {% set issue_print = 'shorten ~' ~ adjust_ms ~ ' ms (target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms)' %}
@@ -2530,7 +2864,7 @@
                                                 {% set phrase_break = true %}
                                             {% endif %}
                                             {% if phrase_break %}
-                                                {% set issue_label = 'PHRASE BREAK' %}
+                                                {% set issue_label = 'LONG PAUSE' %}
                                                 {% set issue_cls = 'phrase-break' %}
                                                 {% set issue_tip = 'After ' ~ word.word ~ ' before ' ~ right_word ~ ': this pause is too long and breaks a connected phrase (' ~ actual_ms ~ ' ms). Keep the phrase connected; target ' ~ target_min_ms ~ '-' ~ target_max_ms ~ ' ms.' %}
                                                 {% set issue_print = 'phrase split: connect words; shorten ~' ~ adjust_ms ~ ' ms' %}
@@ -2993,31 +3327,24 @@
 
         .t-word.pause-issue-word {
             font-weight: 700;
-            text-decoration: underline;
-            text-decoration-style: wavy;
-            text-decoration-thickness: 1.5px;
-            text-underline-offset: 3px;
         }
 
         .t-word.pause-issue-word.too-long {
             background: #FFE4E6;
             color: #9F1239;
             box-shadow: inset 0 -2px 0 #F43F5E;
-            text-decoration-color: #F43F5E;
         }
 
         .t-word.pause-issue-word.phrase-break {
             background: #FEE2E2;
             color: #991B1B;
             box-shadow: inset 0 -2px 0 #EF4444;
-            text-decoration-color: #EF4444;
         }
 
         .t-word.pause-issue-word.too-short {
             background: #FFFBEB;
             color: #92400E;
             box-shadow: inset 0 -2px 0 #F59E0B;
-            text-decoration-color: #F59E0B;
         }
         
         /* Pause Visualization */
@@ -3414,24 +3741,25 @@
                 <button class="close-btn" onclick="closeCompletenessModal()">&times;</button>
             </div>
             <div class="modal-body">
-                {% if completeness_analysis %}
+                {% set completeness_payload = completeness_analysis if completeness_analysis else (analysis.completeness if analysis and analysis.completeness is defined else none) %}
+                {% if completeness_payload %}
                 <!-- Metrics Dashboard -->
                 <div class="comp-dashboard">
                     <div class="comp-metric main">
-                        <div class="c-value">{{ completeness_analysis.coverage }}%</div>
+                        <div class="c-value">{{ completeness_payload.coverage }}%</div>
                         <div class="c-label">Coverage</div>
                     </div>
                     <div class="comp-divider"></div>
                     <div class="comp-metric">
-                        <div class="c-value red">{{ completeness_analysis.missing_stats.total }}</div>
+                        <div class="c-value red">{{ completeness_payload.missing_stats.total }}</div>
                         <div class="c-label">Missed</div>
                     </div>
                     <div class="comp-metric">
-                        <div class="c-value">{{ completeness_analysis.missing_stats.keywords }}</div>
+                        <div class="c-value">{{ completeness_payload.missing_stats.keywords }}</div>
                         <div class="c-label">Keywords</div>
                     </div>
                     <div class="comp-metric">
-                        <div class="c-value">{{ completeness_analysis.missing_stats.function_words }}</div>
+                        <div class="c-value">{{ completeness_payload.missing_stats.function_words }}</div>
                         <div class="c-label">Function Words</div>
                     </div>
                 </div>
@@ -3439,7 +3767,7 @@
                 <!-- Insight Alert -->
                 <div class="comp-insight">
                     <span class="icon">*</span>
-                    <span class="text">{{ completeness_analysis.insight }}</span>
+                    <span class="text">{{ completeness_payload.insight }}</span>
                 </div>
 
                 <!-- Ghost Text View -->
@@ -3449,6 +3777,15 @@
                         Words shown as <span class="ghost-word demo">faded words</span> are the parts that were missed.
                     </p>
                     <div class="ghost-content">
+                        {% if script_missing_map %}
+                        {% for item in script_missing_map %}
+                            {% if item.is_missing %}
+                                <span class="ghost-word" title="You missed this word">{{ item.word }}</span>
+                            {% else %}
+                                <span class="normal-word">{{ item.word }}</span>
+                            {% endif %}
+                        {% endfor %}
+                        {% else %}
                         {% for word in alignment.words %}
                             {% if word.tag == 'missing' %}
                                 <span class="ghost-word" title="You missed this word">{{ word.word }}</span>
@@ -3456,6 +3793,7 @@
                                 <span class="normal-word">{{ word.word }}</span>
                             {% endif %}
                         {% endfor %}
+                        {% endif %}
                     </div>
                 </div>
 
@@ -3463,7 +3801,7 @@
                 <div class="comp-tips">
                     <h4>Suggestions</h4>
                     <ul>
-                        {% for tip in completeness_analysis.tips %}
+                        {% for tip in completeness_payload.tips %}
                         <li>{{ tip }}</li>
                         {% endfor %}
                     </ul>
@@ -3545,6 +3883,9 @@
         }
         // Fallback: Add event listeners manually to ensure clicks work
         document.addEventListener('DOMContentLoaded', function() {
+            if (window.initScoreViewMode) {
+                window.initScoreViewMode();
+            }
             const fluencyCard = document.querySelector('.skill-card.fluency');
             if (fluencyCard) {
                 fluencyCard.addEventListener('click', function(e) {
@@ -3597,4 +3938,6 @@
     </script>
 </body>
 </html>
+
+
 

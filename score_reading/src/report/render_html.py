@@ -8,6 +8,7 @@ import base64
 import logging
 import re
 from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,138 @@ def encode_audio_base64(audio_path: Path) -> str | None:
     except Exception as e:
         logger.warning(f"无法编码音频文件: {e}")
         return None
+
+
+def _normalize_word_token(token: str) -> str:
+    return re.sub(r"[^a-z']+", "", str(token or "").lower())
+
+
+def build_script_missing_map(
+    script_text: str,
+    missing_words: list[str] | None,
+    engine_raw: dict[str, Any] | None = None,
+    missing_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Build a script-based missing-word map for UI display.
+    This keeps missing positions visible even when alignment tags are sparse.
+    """
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    if not script_tokens:
+        return []
+
+    missing_index_set: set[int] = set()
+    for raw_idx in (missing_indices or []):
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(script_tokens):
+            missing_index_set.add(idx)
+
+    raw_engine = engine_raw or {}
+    if not missing_index_set:
+        for raw_idx in (raw_engine.get("stable_missing_indices") or []):
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(script_tokens):
+                missing_index_set.add(idx)
+
+    if not missing_index_set:
+        missing_seq: list[str] = []
+        for raw in (missing_words or []):
+            norm = _normalize_word_token(str(raw or ""))
+            if norm:
+                missing_seq.append(norm)
+        ptr = 0
+        for idx, token in enumerate(script_tokens):
+            norm = _normalize_word_token(token)
+            if ptr < len(missing_seq) and norm and norm == missing_seq[ptr]:
+                missing_index_set.add(idx)
+                ptr += 1
+
+    out: list[dict[str, Any]] = []
+    for idx, token in enumerate(script_tokens):
+        out.append({"word": token, "is_missing": idx in missing_index_set})
+    return out
+
+
+def _build_script_word_index_map(
+    script_tokens: list[str],
+    alignment_words: list[dict[str, Any]],
+) -> dict[int, int]:
+    script_norm = [_normalize_word_token(tok) for tok in script_tokens]
+    align_norm = [_normalize_word_token(str(row.get("word", "") or "")) for row in alignment_words]
+    matcher = SequenceMatcher(None, script_norm, align_norm, autojunk=False)
+    mapped: dict[int, int] = {}
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for off in range(i2 - i1):
+                mapped[i1 + off] = j1 + off
+        elif tag == "replace" and (i2 - i1) > 0 and (j2 - j1) > 0:
+            span = min(i2 - i1, j2 - j1)
+            for off in range(span):
+                mapped[i1 + off] = j1 + off
+    return mapped
+
+
+def _build_reading_words_from_script(
+    script_text: str,
+    alignment_words: list[dict[str, Any]],
+    missing_indices: list[int] | None = None,
+    stable_missing_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    if not script_tokens:
+        return list(alignment_words or [])
+
+    missing_set: set[int] = set()
+    for raw_idx in (missing_indices or []):
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(script_tokens):
+            missing_set.add(idx)
+    for raw_idx in (stable_missing_indices or []):
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(script_tokens):
+            missing_set.add(idx)
+
+    index_map = _build_script_word_index_map(script_tokens, alignment_words or [])
+    out: list[dict[str, Any]] = []
+    for s_idx, token in enumerate(script_tokens):
+        a_idx = index_map.get(s_idx)
+        row = dict(alignment_words[a_idx]) if (a_idx is not None and 0 <= a_idx < len(alignment_words)) else {}
+        row["word"] = token
+        row.setdefault("score", 100.0)
+        row.setdefault("tag", "ok")
+        row.setdefault("start", 0.0)
+        row.setdefault("end", 0.0)
+        row.setdefault("stress", None)
+        row.setdefault("expected_stress", None)
+        row.setdefault("is_linked", False)
+        row.setdefault("diagnosis", "")
+        row.setdefault("phoneme_breakdown", [])
+        if s_idx in missing_set:
+            row["tag"] = "missing"
+            row["score"] = 0.0
+            if not row.get("diagnosis"):
+                row["diagnosis"] = "Missing from reference script."
+        elif row.get("tag") == "missing":
+            # A mapped alignment row may still carry a stale missing tag after
+            # phrase-level reanchoring corrected the stable script indices.
+            row["tag"] = "ok"
+            if float(row.get("score") or 0.0) <= 0.0:
+                row["score"] = 100.0
+            row["diagnosis"] = ""
+        out.append(row)
+    return out
 
 
 def _find_uploaded_audio_for_submission(submission_id: str, json_path: Path) -> Path | None:
@@ -664,6 +797,12 @@ def render_html_report(
                 "expected_type": getattr(word.pause, "expected_type", "") or "",
             }
         alignment_words.append(word_data)
+    reading_words = _build_reading_words_from_script(
+        script_text=result.script_text,
+        alignment_words=alignment_words,
+        missing_indices=list(result.analysis.missing_indices or []),
+        stable_missing_indices=list((result.engine_raw or {}).get("stable_missing_indices") or []),
+    )
     
     # 编码音频为 base64
     audio_base64 = encode_audio_base64(audio_path) if audio_path else None
@@ -716,12 +855,21 @@ def render_html_report(
         "alignment": {
             "words": alignment_words,
         },
+        "reading_words": reading_words,
         "analysis": {
             "weak_words": result.analysis.weak_words,
             "weak_phonemes": result.analysis.weak_phonemes,
             "missing_words": result.analysis.missing_words,
+            "missing_indices": result.analysis.missing_indices,
             "mistakes": result.analysis.mistakes,
         },
+        "script_text": result.script_text,
+        "script_missing_map": build_script_missing_map(
+            result.script_text,
+            result.analysis.missing_words or [],
+            result.engine_raw or {},
+            result.analysis.missing_indices or [],
+        ),
         "pronunciation_analysis": generate_pronunciation_analysis(
             result.analysis.weak_words,
             result.analysis.weak_phonemes,
@@ -917,7 +1065,30 @@ def regenerate_report_from_json(json_path: Path, output_path: Path) -> None:
     # 确保 engine_raw 存在 (解决 UndefinedError)
     if "engine_raw" not in data:
         data["engine_raw"] = {}
-    
+
+    analysis_obj = data.get("analysis", {}) if isinstance(data.get("analysis"), dict) else {}
+    if not data.get("completeness_analysis"):
+        completeness_obj = analysis_obj.get("completeness")
+        if isinstance(completeness_obj, dict):
+            data["completeness_analysis"] = completeness_obj
+    if not data.get("hesitations"):
+        hesitations_obj = analysis_obj.get("hesitations")
+        if isinstance(hesitations_obj, dict):
+            data["hesitations"] = hesitations_obj
+
+    data["script_missing_map"] = build_script_missing_map(
+        str(data.get("script_text", "") or ""),
+        list(analysis_obj.get("missing_words") or []),
+        data.get("engine_raw", {}) if isinstance(data.get("engine_raw"), dict) else {},
+        list(analysis_obj.get("missing_indices") or []),
+    )
+    data["reading_words"] = _build_reading_words_from_script(
+        script_text=str(data.get("script_text", "") or ""),
+        alignment_words=list((data.get("alignment", {}) or {}).get("words") or []),
+        missing_indices=list(analysis_obj.get("missing_indices") or []),
+        stable_missing_indices=list((data.get("engine_raw", {}) or {}).get("stable_missing_indices") or []),
+    )
+
     # 渲染 HTML
     html_content = template.render(**data)
     

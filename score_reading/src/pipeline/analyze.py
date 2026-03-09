@@ -1,12 +1,16 @@
-"""
-口语评分 CLI 框架 - 分析模块
+﻿"""
+鍙ｈ璇勫垎 CLI 妗嗘灦 - 鍒嗘瀽妯″潡
 
-负责提取 weak_words、weak_phonemes、confusions 等分析结果。
+璐熻矗鎻愬彇 weak_words銆亀eak_phonemes銆乧onfusions 绛夊垎鏋愮粨鏋溿€?
 """
 import logging
 import math
 import re
+import json
 from collections import Counter
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
 from src.config import config
@@ -29,34 +33,138 @@ from src.models import (
 logger = logging.getLogger(__name__)
 
 
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on", "enabled"}
+
+
+def _clip_text(value: Any, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
+
+
+def _append_jsonl_line(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _maybe_log_missing_debug_sample(
+    alignment: Alignment,
+    script_text: str,
+    engine_raw: dict[str, Any],
+    stable_missing_indices: list[int],
+    missing_source: str,
+    completeness: CompletenessStats | None,
+    context: dict[str, Any] | None = None,
+) -> None:
+    debug_cfg = config.get("analysis.missing_debug", {}) or {}
+    if not isinstance(debug_cfg, dict):
+        return
+    if not _is_truthy(debug_cfg.get("enabled", False)):
+        return
+
+    path_raw = str(debug_cfg.get("path", "data/diagnostics/missing_debug.jsonl") or "").strip()
+    if not path_raw:
+        path_raw = "data/diagnostics/missing_debug.jsonl"
+    try:
+        max_script_chars = int(debug_cfg.get("max_script_chars", 360))
+    except Exception:
+        max_script_chars = 360
+    try:
+        max_transcript_chars = int(debug_cfg.get("max_transcript_chars", 360))
+    except Exception:
+        max_transcript_chars = 360
+
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    stable_indices = sorted(set(i for i in stable_missing_indices if 0 <= i < len(script_tokens)))
+    stable_words = [script_tokens[i] for i in stable_indices]
+    alignment_indices = _alignment_missing_script_indices(alignment, script_tokens)
+    alignment_words = [script_tokens[i] for i in alignment_indices if 0 <= i < len(script_tokens)]
+
+    detected_transcript = str((engine_raw or {}).get("detected_transcript", "") or "").strip()
+    gemini_transcript = str((engine_raw or {}).get("gemini_detected_transcript", "") or "").strip()
+
+    payload: dict[str, Any] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "submission_id": str((context or {}).get("submission_id", "") or ""),
+        "student_id": str((context or {}).get("student_id", "") or ""),
+        "task_id": str((context or {}).get("task_id", "") or ""),
+        "source": str((engine_raw or {}).get("source", "") or ""),
+        "annotation_source": str((engine_raw or {}).get("annotation_source", "") or ""),
+        "missing_source": str(missing_source or ""),
+        "script_word_count": len(script_tokens),
+        "detected_word_count": len(_tokenize_for_compare(detected_transcript)),
+        "gemini_detected_word_count": len(_tokenize_for_compare(gemini_transcript)),
+        "stable_missing_indices": stable_indices,
+        "stable_missing_words": stable_words,
+        "alignment_missing_indices": alignment_indices,
+        "alignment_missing_words": alignment_words,
+        "completeness_coverage": int(getattr(completeness, "coverage", 0) or 0),
+        "azure_completeness_score": (engine_raw or {}).get("completeness_score"),
+        "script_preview": _clip_text(script_text, max_script_chars),
+        "detected_preview": _clip_text(detected_transcript, max_transcript_chars),
+        "gemini_detected_preview": _clip_text(gemini_transcript, max_transcript_chars),
+    }
+
+    raw_overlay = (engine_raw or {}).get("gemini_missing_indices")
+    if isinstance(raw_overlay, list):
+        payload["gemini_missing_indices_raw"] = raw_overlay[:32]
+    raw_stable = (engine_raw or {}).get("stable_missing_indices")
+    if isinstance(raw_stable, list):
+        payload["stable_missing_indices_raw"] = raw_stable[:32]
+
+    try:
+        log_path = Path(path_raw).expanduser()
+        if not log_path.is_absolute():
+            log_path = Path.cwd() / log_path
+        _append_jsonl_line(log_path, payload)
+    except Exception as exc:
+        logger.warning("Missing-debug sample log write failed: %s", exc)
+
+
 
 def analyze_results(
     alignment: Alignment,
     script_text: str,
     engine_raw: dict[str, Any],
+    context: dict[str, Any] | None = None,
 ) -> Analysis:
     """
-    分析评分结果，提取关键信息
+    鍒嗘瀽璇勫垎缁撴灉锛屾彁鍙栧叧閿俊鎭?
     
     Args:
-        alignment: 对齐信息
-        script_text: 标准文本
-        engine_raw: 引擎原始输出
+        alignment: 瀵归綈淇℃伅
+        script_text: 鏍囧噯鏂囨湰
+        engine_raw: 寮曟搸鍘熷杈撳嚭
+        context: Optional identifiers for diagnostics logging
         
     Returns:
-        分析结果
+        鍒嗘瀽缁撴灉
     """
-    logger.info("开始分析评分结果")
+    logger.info("Start analysis")
     
     analysis = Analysis()
     
-    # 0. 强力对齐：强制 alignment.words 与 script_text 结构一致 (Reference Mode)
-    # 这解决了 Missing Words 不显示的问题
+    # 0. 寮哄姏瀵归綈锛氬己鍒?alignment.words 涓?script_text 缁撴瀯涓€鑷?(Reference Mode)
+    # 杩欒В鍐充簡 Missing Words 涓嶆樉绀虹殑闂
     source = str((engine_raw or {}).get("source", "")).lower()
     gemini_hint = ("gemini" in source) or bool((engine_raw or {}).get("script_reference"))
     script_tokens = _tokenize_for_compare(script_text)
     len_ratio = (len(alignment.words) / max(1, len(script_tokens))) if script_tokens else 0.0
-    should_realign = not (gemini_hint and 0.80 <= len_ratio <= 1.25)
+    is_azure_source = "azure" in source
+    # Azure alignment already carries stable word timing; forced script realign can
+    # inflate false missing labels when ASR transcript drops words.
+    if is_azure_source:
+        should_realign = False
+    else:
+        should_realign = not (gemini_hint and 0.80 <= len_ratio <= 1.25)
     if should_realign:
         align_to_script(alignment, script_text)
     else:
@@ -67,10 +175,12 @@ def analyze_results(
 
     apply_gemini_missing_correction(alignment, script_text, engine_raw)
     suppress_over_missing_for_gemini(alignment, script_text, engine_raw)
+    # Keep missing-word judgement on the Gemini/script-reference path only.
+    # Azure-specific missing correction is intentionally disabled to avoid
+    # overwriting real omissions (e.g. 1-3 truly missing words).
     # pause/linking detection runs after timeline repair
 
-    # 1. 预处理：停顿检测 与 连读检测（这就地修改 alignment）
-    detect_pauses(alignment, script_text, engine_raw)
+    # 1. 棰勫鐞嗭細鍋滈】妫€娴?涓?杩炶妫€娴嬶紙杩欏氨鍦颁慨鏀?alignment锛?    detect_pauses(alignment, script_text, engine_raw)
     
     feedback_error_words = extract_feedback_error_words(engine_raw)
     apply_feedback_top_errors_to_alignment(alignment, feedback_error_words)
@@ -81,49 +191,84 @@ def analyze_results(
     generate_expected_stress(alignment)
     ensure_stress_signal(alignment)
     
-    # 2. 提取 weak words
+    # 2. 鎻愬彇 weak words
     analysis.weak_words = extract_weak_words(alignment)
     analysis.weak_words = merge_feedback_words(analysis.weak_words, feedback_error_words)
     
-    # 3. 提取 weak phonemes (用于 AI 深度指导)
+    # 3. 鎻愬彇 weak phonemes (鐢ㄤ簬 AI 娣卞害鎸囧)
     analysis.weak_phonemes = extract_weak_phonemes(alignment)
-    # 由于已经对其过，直接找 tag=MISSING 即可
-    analysis.missing_words = [w.word for w in alignment.words if w.tag == WordTag.MISSING]
-    
-    # 4. 提取具体错误摘要 (Mistake Highlights)
+    # Keep both missing words and missing indices for deterministic rendering.
+    stable_missing_indices, missing_source = derive_stable_missing_indices(
+        alignment,
+        script_text,
+        engine_raw,
+    )
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    reconcile_alignment_missing_tags(
+        alignment,
+        stable_missing_indices,
+        source=missing_source,
+        script_text=script_text,
+    )
+    analysis.missing_indices = [
+        idx for idx in stable_missing_indices if 0 <= idx < len(script_tokens)
+    ]
+    analysis.missing_words = [script_tokens[idx] for idx in analysis.missing_indices]
+    if isinstance(engine_raw, dict):
+        engine_raw["stable_missing_source"] = missing_source
+        engine_raw["stable_missing_indices"] = list(analysis.missing_indices)
+
+    # 4. 鎻愬彇鍏蜂綋閿欒鎽樿 (Mistake Highlights)
     analysis.mistakes = detect_mistakes(alignment, engine_raw)
     
     
-    # 3. 提取 missing words (Already done above)
+    # 3. 鎻愬彇 missing words (Already done above)
     # analysis.missing_words = extract_missing_words(alignment, script_text)
     
-    # 4. 提取 confusions（如果引擎提供）
+    # 4. 鎻愬彇 confusions锛堝鏋滃紩鎿庢彁渚涳級
     analysis.confusions = extract_confusions(engine_raw)
     
-    # 5. 语速趋势分析
+    # 5. 璇€熻秼鍔垮垎鏋?
     audio_duration_sec = _safe_float((engine_raw or {}).get("audio_duration_sec"), 0.0)
     analysis.pace_chart_data = calculate_pace_trend(
         alignment,
         audio_duration_sec=audio_duration_sec,
     )
     
-    # 6. 完整度高级分析
+    # 6. 瀹屾暣搴﹂珮绾у垎鏋?
     analysis.completeness = analyze_completeness(alignment, script_text, analysis.missing_words)
+    _maybe_log_missing_debug_sample(
+        alignment=alignment,
+        script_text=script_text,
+        engine_raw=engine_raw,
+        stable_missing_indices=analysis.missing_indices,
+        missing_source=missing_source,
+        completeness=analysis.completeness,
+        context=context,
+    )
     
-    # 7. 迟疑分析 (Basic Text Matching)
+    # 7. 杩熺枒鍒嗘瀽 (Basic Text Matching)
     analysis.hesitations = analyze_hesitations(alignment)
     
-    # 8. 语调曲线数据提取
+    # 8. 璇皟鏇茬嚎鏁版嵁鎻愬彇
     if "pitch_contour" in engine_raw:
         analysis.pitch_contour = [
             PitchPoint(t=p["t"], f0=p["f"]) for p in engine_raw["pitch_contour"]
         ]
-    
-    # 9. 生成期望重音模式 (Native Speaker 参考)
+
+    audio_path = str((context or {}).get("audio_path", "") or "").strip()
+    analysis.intonation_analysis = _build_prosody_intonation_analysis(
+        alignment,
+        script_text,
+        engine_raw=engine_raw,
+        audio_path=audio_path,
+    )
+
+    # 9. 鐢熸垚鏈熸湜閲嶉煶妯″紡 (Native Speaker 鍙傝€?
     generate_expected_stress(alignment)
     
     logger.info(
-        f"分析完成: weak_words={len(analysis.weak_words)}, "
+        f"鍒嗘瀽瀹屾垚: weak_words={len(analysis.weak_words)}, "
         f"weak_phonemes={len(analysis.weak_phonemes)}, "
         f"missing={len(analysis.missing_words)}, "
         f"confusions={len(analysis.confusions)}"
@@ -132,23 +277,23 @@ def analyze_results(
     return analysis
 
 
-# 常见虚词列表（弱读词）
+# 甯歌铏氳瘝鍒楄〃锛堝急璇昏瘝锛?
 FUNCTION_WORDS = {
-    # 冠词
+    # 鍐犺瘝
     "a", "an", "the",
-    # 介词
+    # 浠嬭瘝
     "to", "of", "in", "on", "at", "for", "with", "by", "from", "up", "about",
     "into", "over", "after", "before", "between", "under", "without", "through",
-    # 连词
+    # 杩炶瘝
     "and", "or", "but", "so", "if", "because", "although", "while", "when",
-    # 代词
+    # 浠ｈ瘝
     "i", "me", "my", "you", "your", "he", "him", "his", "she", "her", "it", "its",
     "we", "us", "our", "they", "them", "their", "this", "that", "these", "those",
-    # 助动词
+    # 鍔╁姩璇?
     "is", "am", "are", "was", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did",
     "will", "would", "shall", "should", "can", "could", "may", "might", "must",
-    # 其他
+    # 鍏朵粬
     "not", "just", "some", "any", "no", "very", "too", "also",
 }
 
@@ -196,14 +341,11 @@ def extract_feedback_error_words(engine_raw: dict[str, Any]) -> list[str]:
 
 def apply_feedback_top_errors_to_alignment(alignment: Alignment, feedback_words: list[str]) -> None:
     """
-    Ensure words shown in pronunciation diagnostics are reflected in reading analysis colors/tags.
+    Attach pronunciation-diagnostics hints to matching words.
+    This linkage is advisory only: do not alter word score/tag to avoid false positives.
     """
     if not alignment.words or not feedback_words:
         return
-
-    word_ok = float(config.get("analysis.word_thresholds.ok", 65))
-    word_weak = float(config.get("analysis.word_thresholds.weak", 40))
-    cap_score = max(word_weak + 8.0, word_ok - 3.0)
 
     used_idx: set[int] = set()
     matched = 0
@@ -217,10 +359,6 @@ def apply_feedback_top_errors_to_alignment(alignment: Alignment, feedback_words:
             if _normalize_token(word.word) != target:
                 continue
 
-            if float(word.score or 0) > cap_score:
-                word.score = cap_score
-            if word.tag == WordTag.OK:
-                word.tag = WordTag.WEAK
             note = "Linked from pronunciation diagnostics."
             word.diagnosis = f"{word.diagnosis} | {note}".strip(" |")
             used_idx.add(idx)
@@ -320,14 +458,14 @@ def apply_script_reference_focus_rescore(alignment: Alignment, engine_raw: dict[
 
 def align_to_script(alignment: Alignment, script_text: str) -> None:
     """
-    使用 difflib 将识别结果强制对齐到脚本结构。
+    浣跨敤 difflib 灏嗚瘑鍒粨鏋滃己鍒跺榻愬埌鑴氭湰缁撴瀯銆?
     
-    目的：
-    1. 确保 UI 显示的单词列表与脚本 1:1 对应（Ghost Words View 需要）。
-    2. 发现并标记漏读的词（Missing）。
-    3. 处理多读的词（忽略或标记）。
+    鐩殑锛?
+    1. 纭繚 UI 鏄剧ず鐨勫崟璇嶅垪琛ㄤ笌鑴氭湰 1:1 瀵瑰簲锛圙host Words View 闇€瑕侊級銆?
+    2. 鍙戠幇骞舵爣璁版紡璇荤殑璇嶏紙Missing锛夈€?
+    3. 澶勭悊澶氳鐨勮瘝锛堝拷鐣ユ垨鏍囪锛夈€?
     
-    策略：
+    绛栫暐锛?
     - Reference: Script Tokens
     - Hypothesis: Recognized Words
     - OpCodes:
@@ -342,7 +480,7 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
         return
         
     # 1. Tokenize Script (Robust split)
-    # 使用 \w+ 包括数字和字母，handle ' for contractions
+    # 浣跨敤 \w+ 鍖呮嫭鏁板瓧鍜屽瓧姣嶏紝handle ' for contractions
     ref_tokens = re.findall(r"[\w']+", script_text)
     if not ref_tokens:
         return
@@ -357,7 +495,7 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
     
     new_words: list[WordAlignment] = []
     
-    # 使用时间游标来为插入的 Missing 词估算时间
+    # 浣跨敤鏃堕棿娓告爣鏉ヤ负鎻掑叆鐨?Missing 璇嶄及绠楁椂闂?
     current_time_cursor = 0.0
     if hyp_words:
         current_time_cursor = hyp_words[0].start
@@ -366,10 +504,10 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
         # ref[i1:i2] vs hyp[j1:j2]
         
         if tag == 'equal':
-            # 完全匹配：保留识别结果
+            # 瀹屽叏鍖归厤锛氫繚鐣欒瘑鍒粨鏋?
             for k in range(j1, j2):
                 w = hyp_words[k]
-                # 强制修正单词拼写为 Script 的样子 (Case correction)
+                # 寮哄埗淇鍗曡瘝鎷煎啓涓?Script 鐨勬牱瀛?(Case correction)
                 ref_idx = i1 + (k - j1)
                 if ref_idx < len(ref_tokens):
                     w.word = ref_tokens[ref_idx]
@@ -377,8 +515,8 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
                 current_time_cursor = w.end
                 
         elif tag == 'delete':
-            # Ref 有，Hyp 没有 -> Missing
-            # 插入 Missing Words
+            # Ref 鏈夛紝Hyp 娌℃湁 -> Missing
+            # 鎻掑叆 Missing Words
             for k in range(i1, i2):
                 missing_word = ref_tokens[k]
                 new_w = WordAlignment(
@@ -392,12 +530,12 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
                 current_time_cursor += 0.1
                 
         elif tag == 'replace':
-            # Ref 有，Hyp 也有但不同 -> Mispronunciation (Wait, or just align error)
-            # 逻辑：用户想读 Ref，但读成了 Hyp。
-            # 我们保留 Ref 的单词文本，但继承 Hyp 的分数（通常较低）或标记为 WEAK
+            # Ref 鏈夛紝Hyp 涔熸湁浣嗕笉鍚?-> Mispronunciation (Wait, or just align error)
+            # 閫昏緫锛氱敤鎴锋兂璇?Ref锛屼絾璇绘垚浜?Hyp銆?
+            # 鎴戜滑淇濈暀 Ref 鐨勫崟璇嶆枃鏈紝浣嗙户鎵?Hyp 鐨勫垎鏁帮紙閫氬父杈冧綆锛夋垨鏍囪涓?WEAK
             
-            # 这里的数量可能不一致 (e.g. Ref: "cat", Hyp: "bat mat")
-            # 简单策略：按 1:1 映射，多余的忽略/补全
+            # 杩欓噷鐨勬暟閲忓彲鑳戒笉涓€鑷?(e.g. Ref: "cat", Hyp: "bat mat")
+            # 绠€鍗曠瓥鐣ワ細鎸?1:1 鏄犲皠锛屽浣欑殑蹇界暐/琛ュ叏
             len_ref = i2 - i1
             len_hyp = j2 - j1
             common_len = min(len_ref, len_hyp)
@@ -407,10 +545,10 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
                 ref_word = ref_tokens[i1 + k]
                 hyp_word_before = w_orig.word
                 
-                # 修改文本为 Target
+                # Keep script token text while preserving timing and acoustic score.
                 w_orig.word = ref_word
-                # 避免“全橙”误判：仅在词形差异较大时才降分。
-                # 对于近似词（如缩写/轻微拼写差异）保留原始评分。
+
+                # Prevent replacement mismatches from being promoted as fully OK.
                 sim_ratio = difflib.SequenceMatcher(
                     None,
                     str(ref_word).lower(),
@@ -426,7 +564,7 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
                 new_words.append(w_orig)
                 current_time_cursor = w_orig.end
                 
-            # 处理剩余的 Ref (视为 Missing)
+            # 澶勭悊鍓╀綑鐨?Ref (瑙嗕负 Missing)
             if len_ref > len_hyp:
                 for k in range(i1 + common_len, i2):
                     missing_word = ref_tokens[k]
@@ -440,14 +578,14 @@ def align_to_script(alignment: Alignment, script_text: str) -> None:
                     new_words.append(new_w)
                     current_time_cursor += 0.1
                     
-            # 处理剩余的 Hyp (视为 Extra - 忽略，因为我们要保持 Script 结构)
+            # 澶勭悊鍓╀綑鐨?Hyp (瑙嗕负 Extra - 蹇界暐锛屽洜涓烘垜浠淇濇寔 Script 缁撴瀯)
             pass
             
         elif tag == 'insert':
-            # Hyp 有 (extra)，Ref 没有 -> 忽略
+            # Hyp 鏈?(extra)锛孯ef 娌℃湁 -> 蹇界暐
             pass
             
-    # 更新 Alignment
+    # 鏇存柊 Alignment
     alignment.words = new_words
     
     # CRITICAL: Re-assign tags after reconstruction to ensure Missing/Weak/OK are set correctly
@@ -460,20 +598,879 @@ def _tokenize_for_compare(text: str) -> list[str]:
     return [w.lower() for w in re.findall(r"[A-Za-z']+", text or "")]
 
 
-def _gemini_missing_indices(script_text: str, detected_transcript: str) -> set[int]:
+def _expand_alignment_tokens_for_mapping(alignment: Alignment) -> tuple[list[str], list[int]]:
+    tokens: list[str] = []
+    parents: list[int] = []
+    for idx, word in enumerate(alignment.words):
+        raw = str(getattr(word, "word", "") or "")
+        parts = re.findall(r"[A-Za-z']+", raw)
+        if not parts:
+            token = _normalize_token(raw)
+            if token:
+                parts = [token]
+        for part in parts:
+            token = _normalize_token(part)
+            if not token:
+                continue
+            tokens.append(token)
+            parents.append(idx)
+    return tokens, parents
+
+
+def _build_script_alignment_maps(
+    script_tokens: list[str],
+    alignment: Alignment,
+) -> tuple[dict[int, int], dict[int, int]]:
+    script_norm = [_normalize_token(t) for t in script_tokens]
+    align_tokens, align_parents = _expand_alignment_tokens_for_mapping(alignment)
+    if not script_norm or not align_tokens:
+        return {}, {}
+
+    script_to_align: dict[int, int] = {}
+    align_to_script: dict[int, int] = {}
+    matcher = SequenceMatcher(None, script_norm, align_tokens)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                s_idx = i1 + k
+                a_idx = align_parents[j1 + k]
+                script_to_align.setdefault(s_idx, a_idx)
+                align_to_script.setdefault(a_idx, s_idx)
+            continue
+        if tag != "replace":
+            continue
+        left_len = i2 - i1
+        right_len = j2 - j1
+        if left_len <= 0 or right_len <= 0:
+            continue
+        for k in range(left_len):
+            rel = int(k * right_len / max(left_len, 1))
+            rel = min(max(rel, 0), right_len - 1)
+            s_idx = i1 + k
+            a_idx = align_parents[j1 + rel]
+            script_to_align.setdefault(s_idx, a_idx)
+            align_to_script.setdefault(a_idx, s_idx)
+
+    return script_to_align, align_to_script
+
+
+def _alignment_missing_script_indices(
+    alignment: Alignment,
+    script_tokens: list[str],
+) -> list[int]:
+    if not alignment.words or not script_tokens:
+        return []
+    _script_to_align, align_to_script = _build_script_alignment_maps(script_tokens, alignment)
+    out: set[int] = set()
+    for a_idx, word in enumerate(alignment.words):
+        if word.tag != WordTag.MISSING:
+            continue
+        s_idx = align_to_script.get(a_idx)
+        if s_idx is not None and 0 <= s_idx < len(script_tokens):
+            out.add(s_idx)
+    return sorted(out)
+
+
+def _script_indices_to_alignment_indices(
+    script_indices: list[int],
+    script_tokens: list[str],
+    alignment: Alignment,
+) -> set[int]:
+    if not script_indices:
+        return set()
+    script_to_align, _align_to_script = _build_script_alignment_maps(script_tokens, alignment)
+    mapped: set[int] = set()
+    for raw_idx in script_indices:
+        try:
+            s_idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        a_idx = script_to_align.get(s_idx)
+        if a_idx is not None and 0 <= a_idx < len(alignment.words):
+            mapped.add(a_idx)
+        elif 0 <= s_idx < len(alignment.words):
+            mapped.add(s_idx)
+    return mapped
+
+
+def _engine_transcript_tokens(engine_raw: dict[str, Any]) -> list[str]:
+    detected = str((engine_raw or {}).get("detected_transcript", "") or "").strip()
+    if detected:
+        return _tokenize_for_compare(detected)
+
+    source = str((engine_raw or {}).get("source", "")).lower()
+    if "azure" in source:
+        raw = (engine_raw or {}).get("json_raw") or {}
+        nbest = raw.get("NBest") if isinstance(raw, dict) else None
+        if isinstance(nbest, list) and nbest:
+            first = nbest[0] if isinstance(nbest[0], dict) else {}
+            display = str(first.get("Display", "") or first.get("Lexical", "") or "").strip()
+            if display:
+                return _tokenize_for_compare(display)
+        display_text = str(raw.get("DisplayText", "") or "").strip() if isinstance(raw, dict) else ""
+        if display_text:
+            return _tokenize_for_compare(display_text)
+
+    return []
+
+
+def apply_azure_false_missing_correction(
+    alignment: Alignment,
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> None:
+    """
+    Conservative guard for Azure path:
+    if transcript evidence is present and overall missing ratio is not high,
+    convert obvious false-missing words to non-missing.
+    """
+    if not alignment.words:
+        return
+    source = str((engine_raw or {}).get("source", "")).lower()
+    if "azure" not in source:
+        return
+
+    ref_tokens = _tokenize_for_compare(script_text)
+    if not ref_tokens:
+        return
+
+    missing_total = sum(1 for w in alignment.words if w.tag == WordTag.MISSING)
+    if missing_total <= 0:
+        return
+    # Keep genuine small omissions (1-3 words) untouched.
+    # Azure false-missing bursts usually appear as larger clusters.
+    if missing_total < 4:
+        return
+    missing_ratio = missing_total / max(1, len(ref_tokens))
+    if missing_ratio > 0.25:
+        return
+
+    transcript_tokens = _engine_transcript_tokens(engine_raw)
+    if not transcript_tokens:
+        return
+    transcript_ratio = len(transcript_tokens) / max(1, len(ref_tokens))
+    if transcript_ratio < 0.52:
+        return
+
+    likely_missing = _gemini_missing_indices(script_text, " ".join(transcript_tokens))
+    word_ok = float(config.get("analysis.word_thresholds.ok", 65))
+    word_weak = float(config.get("analysis.word_thresholds.weak", 40))
+    accuracy = float((engine_raw or {}).get("accuracy_score") or (engine_raw or {}).get("pronunciation_score") or 70.0)
+
+    corrected_score = max(word_weak + 16.0, min(82.0, accuracy - 2.0))
+    promote_to_ok = transcript_ratio >= 0.68 and missing_ratio <= 0.18
+    if promote_to_ok:
+        corrected_score = max(corrected_score, word_ok + 1.0)
+
+    corrected = 0
+    for idx, word in enumerate(alignment.words):
+        if word.tag != WordTag.MISSING:
+            continue
+        if idx in likely_missing:
+            continue
+
+        word.score = max(float(word.score or 0.0), corrected_score)
+        word.tag = WordTag.OK if promote_to_ok and word.score >= word_ok else WordTag.WEAK
+        note = "Azure transcript evidence indicates this word was spoken."
+        word.diagnosis = f"{word.diagnosis} | {note}".strip(" |")
+        corrected += 1
+
+    if corrected and isinstance(engine_raw, dict):
+        engine_raw["azure_false_missing_corrected_count"] = int(corrected)
+        logger.info(
+            "Azure false-missing correction adjusted %s words (missing_ratio=%.2f, transcript_ratio=%.2f, promote_to_ok=%s).",
+            corrected,
+            missing_ratio,
+            transcript_ratio,
+            promote_to_ok,
+        )
+
+
+def _token_similarity_ratio(a: str, b: str) -> float:
     import difflib
 
+    left = str(a or "").strip().lower()
+    right = str(b or "").strip().lower()
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if len(left) >= 3 and len(right) >= 3 and left[:3] == right[:3]:
+        return 0.82
+    return float(difflib.SequenceMatcher(None, left, right).ratio())
+
+
+def _compute_missing_indices_by_alignment(
+    ref_tokens: list[str],
+    hyp_tokens: list[str],
+) -> set[int]:
+    """
+    Edit-path alignment with substitution-friendly costs.
+    This avoids repeated-word drift from value-order matching and reduces
+    false deletions when a token is substituted rather than omitted.
+    """
+    if not ref_tokens or not hyp_tokens:
+        return set()
+
+    n = len(ref_tokens)
+    m = len(hyp_tokens)
+    delete_cost = 1.0
+    insert_cost = 1.0
+
+    dp: list[list[float]] = [[0.0] * (m + 1) for _ in range(n + 1)]
+    back: list[list[int]] = [[0] * (m + 1) for _ in range(n + 1)]  # 0=sub/match, 1=delete, 2=insert
+
+    for i in range(1, n + 1):
+        dp[i][0] = i * delete_cost
+        back[i][0] = 1
+    for j in range(1, m + 1):
+        dp[0][j] = j * insert_cost
+        back[0][j] = 2
+
+    priority = {0: 0, 2: 1, 1: 2}  # prefer sub/match, then insert, then delete on ties
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            ref = ref_tokens[i - 1]
+            hyp = hyp_tokens[j - 1]
+            if ref == hyp:
+                sub_cost = 0.0
+            else:
+                sim = _token_similarity_ratio(ref, hyp)
+                if sim >= 0.86:
+                    sub_cost = 0.35
+                elif sim >= 0.70:
+                    sub_cost = 0.65
+                else:
+                    sub_cost = 0.95
+
+            candidates = (
+                (dp[i - 1][j - 1] + sub_cost, 0),
+                (dp[i][j - 1] + insert_cost, 2),
+                (dp[i - 1][j] + delete_cost, 1),
+            )
+            best_cost, best_op = min(candidates, key=lambda item: (item[0], priority[item[1]]))
+            dp[i][j] = best_cost
+            back[i][j] = best_op
+
+    missing: set[int] = set()
+    i = n
+    j = m
+    while i > 0 or j > 0:
+        op = back[i][j] if i >= 0 and j >= 0 else 0
+        if i > 0 and j > 0 and op == 0:
+            i -= 1
+            j -= 1
+            continue
+        if i > 0 and (j == 0 or op == 1):
+            missing.add(i - 1)
+            i -= 1
+            continue
+        if j > 0:
+            j -= 1
+            continue
+        break
+
+    return missing
+
+
+def _gemini_missing_indices(script_text: str, detected_transcript: str) -> set[int]:
     ref_tokens = _tokenize_for_compare(script_text)
     hyp_tokens = _tokenize_for_compare(detected_transcript)
     if not ref_tokens or not hyp_tokens:
         return set()
+    return _compute_missing_indices_by_alignment(ref_tokens, hyp_tokens)
 
-    matcher = difflib.SequenceMatcher(None, ref_tokens, hyp_tokens)
-    missing_indices: set[int] = set()
-    for tag, i1, i2, _, _ in matcher.get_opcodes():
-        if tag == "delete":
-            missing_indices.update(range(i1, i2))
-    return missing_indices
+
+def _anchored_delete_indices(
+    ref_tokens: list[str],
+    hyp_tokens: list[str],
+    *,
+    max_delete_run: int = 3,
+) -> set[int]:
+    """
+    Conservative delete detector:
+    only keep short delete spans with exact anchors around the gap.
+    """
+    if not ref_tokens or not hyp_tokens:
+        return set()
+
+    out: set[int] = set()
+    matcher = SequenceMatcher(None, ref_tokens, hyp_tokens)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "delete":
+            continue
+        run_len = i2 - i1
+        if run_len <= 0 or run_len > max_delete_run:
+            continue
+
+        left_anchor = i1 > 0 and j1 > 0 and ref_tokens[i1 - 1] == hyp_tokens[j1 - 1]
+        right_anchor = (
+            i2 < len(ref_tokens)
+            and j1 < len(hyp_tokens)
+            and ref_tokens[i2] == hyp_tokens[j1]
+        )
+
+        if i1 > 0 and i2 < len(ref_tokens):
+            if not (left_anchor and right_anchor):
+                continue
+        else:
+            if not (left_anchor or right_anchor):
+                continue
+
+        out.update(range(i1, i2))
+
+    return out
+
+
+def _safe_transcript_missing_indices(
+    script_text: str,
+    engine_raw: dict[str, Any],
+    *,
+    transcript_field: str,
+    min_cov: float = 0.72,
+    max_cov: float = 1.30,
+    max_missing_ratio: float = 0.16,
+    max_missing_abs: int = 8,
+) -> set[int]:
+    ref_tokens = _tokenize_for_compare(script_text)
+    if not ref_tokens:
+        return set()
+
+    transcript = str((engine_raw or {}).get(transcript_field, "")).strip()
+    if not transcript:
+        return set()
+
+    hyp_tokens = _tokenize_for_compare(transcript)
+    if not hyp_tokens:
+        return set()
+
+    coverage = len(hyp_tokens) / max(1, len(ref_tokens))
+    if not (min_cov <= coverage <= max_cov):
+        return set()
+
+    missing = _gemini_missing_indices(script_text, transcript)
+    max_missing = max(max_missing_abs, int(len(ref_tokens) * max_missing_ratio))
+    if len(missing) > max_missing:
+        return set()
+
+    return {idx for idx in missing if 0 <= idx < len(ref_tokens)}
+
+
+def _extract_ai_referee_missing_indices(
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> list[int]:
+    """
+    Extract high-confidence explicit omissions from ai_referee conflict comments.
+    Example supported forms:
+      - missed 'the' before 'last'
+      - missed 'a'
+    We intentionally ignore suffix-only misses (plural/possessive/ending).
+    """
+    ref_tokens = _tokenize_for_compare(script_text)
+    if not ref_tokens:
+        return []
+
+    ai_ref = (engine_raw or {}).get("ai_referee") or {}
+    details = ai_ref.get("conflict_details") if isinstance(ai_ref, dict) else None
+    if not isinstance(details, list):
+        return []
+
+    def _norm(token: str) -> str:
+        return _normalize_token(token)
+
+    explicit: set[int] = set()
+    loose_words: list[str] = []
+
+    # Gemini transcript hints help place repeated function words (e.g., multiple "a"/"you").
+    transcript_hint_indices = _safe_transcript_missing_indices(
+        script_text,
+        engine_raw,
+        transcript_field="gemini_detected_transcript",
+        min_cov=0.70,
+        max_cov=1.35,
+        max_missing_ratio=0.22,
+        max_missing_abs=12,
+    )
+
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        comment = str(item.get("comment", "") or "")
+        lowered = comment.lower()
+        has_omit_hint = any(
+            key in lowered for key in ("missed", "skipped", "omitted", "left out")
+        )
+        if not has_omit_hint:
+            continue
+        if any(k in lowered for k in ("plural", "possessive", "ending", "/", "sound")):
+            continue
+
+        m_before = re.search(
+            r"(?:missed|skipped|omitted)\s+'([^']+)'\s+before\s+'([^']+)'",
+            comment,
+            flags=re.IGNORECASE,
+        )
+        if m_before:
+            miss_word = _norm(m_before.group(1))
+            anchor_word = _norm(m_before.group(2))
+            if miss_word and anchor_word:
+                for idx, tok in enumerate(ref_tokens):
+                    if tok != anchor_word or idx <= 0:
+                        continue
+                    if ref_tokens[idx - 1] == miss_word:
+                        explicit.add(idx - 1)
+            continue
+
+        m_plain = re.search(
+            r"(?:missed|skipped|omitted)\s+'([^']+)'",
+            comment,
+            flags=re.IGNORECASE,
+        )
+        if m_plain:
+            miss_word = _norm(m_plain.group(1))
+            if miss_word:
+                loose_words.append(miss_word)
+            continue
+
+        # Handle terse forms like "Word was skipped." where target is only in item["word"].
+        word_field = _norm(str(item.get("word", "") or ""))
+        if word_field:
+            loose_words.append(word_field)
+
+    # Conservative placement for plain omission words.
+    # Prefer transcript-supported indices for repeated tokens; otherwise fallback sequentially.
+    used: set[int] = set(explicit)
+    search_start = 0
+    for miss_word in loose_words:
+        candidates = [
+            idx
+            for idx, token in enumerate(ref_tokens)
+            if token == miss_word and idx not in used
+        ]
+        if not candidates:
+            continue
+
+        pick: int | None = None
+        hinted = [idx for idx in candidates if idx in transcript_hint_indices]
+        if hinted:
+            pick = hinted[0]
+        else:
+            for idx in candidates:
+                if idx >= search_start:
+                    pick = idx
+                    break
+            if pick is None:
+                pick = candidates[0]
+
+        explicit.add(pick)
+        used.add(pick)
+        search_start = pick + 1
+
+    return sorted(explicit)
+
+
+def _consensus_missing_indices_from_transcripts(
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> list[int]:
+    """
+    Conservative fallback: only keep missing indices agreed by both Gemini and Azure transcripts.
+    """
+    ref_tokens = _tokenize_for_compare(script_text)
+    if not ref_tokens:
+        return []
+
+    gemini_transcript = str((engine_raw or {}).get("gemini_detected_transcript", "")).strip()
+    azure_transcript = str((engine_raw or {}).get("detected_transcript", "")).strip()
+    if not gemini_transcript or not azure_transcript:
+        return []
+
+    gem_tokens = _tokenize_for_compare(gemini_transcript)
+    az_tokens = _tokenize_for_compare(azure_transcript)
+    if not gem_tokens or not az_tokens:
+        return []
+
+    gem_cov = len(gem_tokens) / max(1, len(ref_tokens))
+    az_cov = len(az_tokens) / max(1, len(ref_tokens))
+    if not (0.78 <= gem_cov <= 1.22 and 0.78 <= az_cov <= 1.28):
+        return []
+
+    gem_missing = _gemini_missing_indices(script_text, gemini_transcript)
+    az_missing = _gemini_missing_indices(script_text, azure_transcript)
+    consensus = sorted(gem_missing.intersection(az_missing))
+    if not consensus:
+        return []
+
+    max_missing = max(3, int(len(ref_tokens) * 0.08))
+    if len(consensus) > max_missing:
+        return []
+    return consensus
+
+
+def extract_gemini_overlay_missing_indices(
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> list[int]:
+    """
+    For Azure+Gemini overlay mode, derive stable missing indices for script words.
+    Priority:
+    1) Explicit Gemini overlay indices from Pro engine (sequence mode),
+    2) Gemini transcript alignment indices only when explicit indices are absent
+       (legacy payload compatibility).
+    """
+    source = str((engine_raw or {}).get("source", "")).lower()
+    annotation_source = str((engine_raw or {}).get("annotation_source", "")).lower()
+    if "azure" not in source or annotation_source != "gemini":
+        return []
+
+    ref_tokens = _tokenize_for_compare(script_text)
+    if not ref_tokens:
+        return []
+
+    max_index = len(ref_tokens) - 1
+    raw_indices = (engine_raw or {}).get("gemini_missing_indices")
+    if isinstance(raw_indices, list):
+        # Explicit overlay indices are authoritative, including explicit empty list.
+        explicit: set[int] = set()
+        for raw in raw_indices:
+            try:
+                idx = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx <= max_index:
+                explicit.add(idx)
+        if explicit:
+            ai_ref_missing = _extract_ai_referee_missing_indices(script_text, engine_raw)
+            ai_ref_set = {i for i in ai_ref_missing if 0 <= i <= max_index}
+            gemini_transcript_missing = _safe_transcript_missing_indices(
+                script_text,
+                engine_raw,
+                transcript_field="gemini_detected_transcript",
+                min_cov=0.72,
+                max_cov=1.30,
+                max_missing_ratio=0.16,
+                max_missing_abs=8,
+            )
+
+            # Validate explicit overlay indices with extra evidence to avoid index-shift artifacts
+            # (common around repeated function words such as "you", "a", "the").
+            if ai_ref_set or gemini_transcript_missing:
+                validated: set[int] = set()
+                for idx in explicit:
+                    token = ref_tokens[idx]
+                    support = 1  # explicit overlay
+                    if idx in ai_ref_set:
+                        support += 1
+                    if idx in gemini_transcript_missing:
+                        support += 1
+                    else:
+                        has_near_same_token = any(
+                            abs(cand - idx) <= 2 and ref_tokens[cand] == token
+                            for cand in gemini_transcript_missing
+                        )
+                        if has_near_same_token:
+                            support += 1
+                    if support >= 2:
+                        validated.add(idx)
+                explicit = validated
+
+            merged = set(explicit)
+            if ai_ref_set:
+                merged.update(ai_ref_set)
+            if not merged and ai_ref_set:
+                merged = set(ai_ref_set)
+
+            consensus_missing = _consensus_missing_indices_from_transcripts(script_text, engine_raw)
+            if consensus_missing:
+                extras = [i for i in consensus_missing if i not in merged]
+                if len(extras) <= 2:
+                    merged.update(extras)
+            return sorted(merged)
+
+        # Explicit empty list: try high-confidence ai_referee omissions first.
+        ai_ref_missing = _extract_ai_referee_missing_indices(script_text, engine_raw)
+        if ai_ref_missing:
+            return sorted(set(i for i in ai_ref_missing if 0 <= i <= max_index))
+
+        # Last fallback for explicit-empty: dual-transcript consensus only.
+        consensus_missing = _consensus_missing_indices_from_transcripts(script_text, engine_raw)
+        if consensus_missing:
+            return sorted(set(i for i in consensus_missing if 0 <= i <= max_index))
+        return []
+
+    # Legacy compatibility path: older payloads without gemini_missing_indices.
+    detected_transcript = str((engine_raw or {}).get("gemini_detected_transcript", "")).strip()
+    if detected_transcript:
+        hyp_tokens = _tokenize_for_compare(detected_transcript)
+        if hyp_tokens:
+            coverage = len(hyp_tokens) / max(1, len(ref_tokens))
+            if 0.78 <= coverage <= 1.22:
+                transcript_missing = _gemini_missing_indices(script_text, detected_transcript)
+                max_missing = max(6, int(len(ref_tokens) * 0.14))
+                if len(transcript_missing) <= max_missing:
+                    return sorted(transcript_missing)
+
+    return []
+
+
+def extract_gemini_overlay_missing_words(
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> list[str]:
+    missing_indices = extract_gemini_overlay_missing_indices(script_text, engine_raw)
+    if not missing_indices:
+        return []
+
+    ref_tokens = _tokenize_for_compare(script_text)
+    missing_words: list[str] = []
+    for idx in missing_indices:
+        if 0 <= idx < len(ref_tokens):
+            missing_words.append(ref_tokens[idx])
+    if missing_words:
+        logger.info(
+            "Using Gemini overlay missing indices for completeness: %s",
+            len(missing_words),
+        )
+    return missing_words
+
+
+def _prefer_transcript_anchor_over_shifted_alignment(
+    script_tokens: list[str],
+    alignment_missing: list[int],
+    transcript_tokens: list[str],
+) -> list[int] | None:
+    """
+    Correct common local shift artifacts where Azure alignment marks a neighboring
+    word as missing but Azure transcript supports a cleaner short phrase omission.
+    """
+    if not alignment_missing or not transcript_tokens or not script_tokens:
+        return None
+
+    ref_norm = [t.lower() for t in script_tokens]
+    hyp_norm = [t.lower() for t in transcript_tokens]
+    anchored_missing = sorted(
+        _anchored_delete_indices(
+            ref_norm,
+            hyp_norm,
+            max_delete_run=3,
+        )
+    )
+    if not anchored_missing:
+        return None
+
+    align_set = sorted(set(int(i) for i in alignment_missing if 0 <= int(i) < len(script_tokens)))
+    anchor_set = sorted(set(int(i) for i in anchored_missing if 0 <= int(i) < len(script_tokens)))
+    if not align_set or not anchor_set:
+        return None
+
+    def _is_pronoun_like(idx: int) -> bool:
+        tok = ref_norm[idx]
+        return tok in {"i'm", "im", "i", "you", "we", "we're", "they", "he", "she"}
+
+    def _cluster(indices: list[int]) -> list[list[int]]:
+        if not indices:
+            return []
+        items = sorted(indices)
+        clusters: list[list[int]] = [[items[0]]]
+        for idx in items[1:]:
+            if idx == clusters[-1][-1] + 1:
+                clusters[-1].append(idx)
+            else:
+                clusters.append([idx])
+        return clusters
+
+    align_clusters = _cluster(align_set)
+    anchor_clusters = _cluster(anchor_set)
+
+    # Prefer a short contiguous phrase omission when alignment points to an
+    # adjacent pronoun/contraction but transcript keeps that token and skips the
+    # following phrase, e.g. "I'm bring" -> missing "going to".
+    replaced = False
+    merged = list(align_set)
+    for a_cluster in align_clusters:
+        if len(a_cluster) != 1:
+            continue
+        a0 = a_cluster[0]
+        if not _is_pronoun_like(a0):
+            continue
+        for t_cluster in anchor_clusters:
+            if len(t_cluster) < 2:
+                continue
+            if t_cluster[0] == a0 + 1 and t_cluster[-1] <= a0 + 3:
+                merged = [idx for idx in merged if idx != a0]
+                merged.extend(t_cluster)
+                replaced = True
+                break
+        if replaced:
+            break
+
+    if replaced:
+        return sorted(set(merged))
+
+    # More general local rule: if transcript-anchor produces a short contiguous
+    # deletion near a shifted single-token alignment miss and explains more
+    # tokens, prefer the anchored phrase locally.
+    for a_cluster in align_clusters:
+        if len(a_cluster) != 1:
+            continue
+        a0 = a_cluster[0]
+        for t_cluster in anchor_clusters:
+            if len(t_cluster) <= len(a_cluster):
+                continue
+            if t_cluster != list(range(t_cluster[0], t_cluster[-1] + 1)):
+                continue
+            if max(abs(t_cluster[0] - a0), abs(t_cluster[-1] - a0)) <= 2:
+                merged = [idx for idx in align_set if idx != a0] + t_cluster
+                return sorted(set(merged))
+
+    return None
+
+
+def derive_stable_missing_indices(
+    alignment: Alignment,
+    script_text: str,
+    engine_raw: dict[str, Any],
+) -> tuple[list[int], str]:
+    """
+    Derive robust missing-word indices for UI/completeness.
+    Final missing-word output follows Azure evidence only:
+    1) Azure alignment-based missing,
+    2) Azure transcript-anchor fallback,
+    3) Never use transcript-only missing without anchored alignment support.
+    """
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    if not script_tokens:
+        return [], "none"
+    alignment_missing = sorted(set(_alignment_missing_script_indices(alignment, script_tokens)))
+
+    raw = engine_raw or {}
+    source = str(raw.get("source", "")).lower()
+
+    if "azure" in source:
+        transcript_tokens = _engine_transcript_tokens(engine_raw)
+        if alignment_missing and transcript_tokens:
+            reanchored = _prefer_transcript_anchor_over_shifted_alignment(
+                script_tokens,
+                alignment_missing,
+                transcript_tokens,
+            )
+            if reanchored and reanchored != alignment_missing:
+                logger.info(
+                    "Re-anchor Azure alignment missing to transcript phrase: %s -> %s",
+                    alignment_missing,
+                    reanchored,
+                )
+                return reanchored, "alignment_reanchor"
+
+    if alignment_missing:
+        return alignment_missing, "alignment"
+
+    if "azure" in source:
+        transcript_tokens = _engine_transcript_tokens(engine_raw)
+        if transcript_tokens:
+            ref_norm = [t.lower() for t in script_tokens]
+            transcript_missing = sorted(_compute_missing_indices_by_alignment(ref_norm, transcript_tokens))
+            coverage = len(transcript_tokens) / max(1, len(script_tokens))
+            anchored_missing = sorted(
+                _anchored_delete_indices(
+                    ref_norm,
+                    transcript_tokens,
+                    max_delete_run=3,
+                )
+            )
+            max_anchor_missing = max(2, int(len(script_tokens) * 0.03))
+            if (
+                not alignment_missing
+                and 0.86 <= coverage <= 1.12
+                and 0 < len(anchored_missing) <= max_anchor_missing
+            ):
+                logger.info(
+                    "Apply Azure anchored-missing fallback: anchored=%s coverage=%.2f",
+                    len(anchored_missing),
+                    coverage,
+                )
+                return anchored_missing, "transcript_anchor"
+            if transcript_missing:
+                logger.info(
+                    "Ignore Azure transcript-only missing (no Gemini evidence / no alignment evidence): transcript=%s",
+                    len(transcript_missing),
+                )
+    return [], "alignment"
+
+
+def reconcile_alignment_missing_tags(
+    alignment: Alignment,
+    stable_missing_indices: list[int],
+    source: str,
+    script_text: str,
+) -> None:
+    """
+    Keep alignment missing tags consistent with stable missing indices so UI and
+    downstream mistake summaries do not show inflated false-missing words.
+    """
+    if source not in {"overlay", "transcript", "transcript_anchor"}:
+        return
+    if not alignment.words:
+        return
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    if not script_tokens:
+        return
+    if abs(len(alignment.words) - len(script_tokens)) > 2:
+        logger.info(
+            "Skip missing-tag reconciliation: alignment/script length mismatch (%s vs %s).",
+            len(alignment.words),
+            len(script_tokens),
+        )
+        return
+
+    script_to_align, _align_to_script = _build_script_alignment_maps(script_tokens, alignment)
+    missing_set: set[int] = set()
+    for raw_idx in stable_missing_indices:
+        try:
+            s_idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= s_idx < len(script_tokens)):
+            continue
+        a_idx = script_to_align.get(s_idx)
+        if a_idx is None or not (0 <= a_idx < len(alignment.words)):
+            continue
+        script_token = _normalize_token(script_tokens[s_idx])
+        align_parts = [
+            _normalize_token(tok)
+            for tok in re.findall(r"[A-Za-z']+", str(getattr(alignment.words[a_idx], "word", "") or ""))
+        ]
+        # Only mark as missing when mapped alignment token still carries the same
+        # lexical token. Otherwise it is likely a shift-to-neighbor artifact.
+        if script_token and script_token in align_parts:
+            missing_set.add(a_idx)
+    word_ok = float(config.get("analysis.word_thresholds.ok", 65))
+    word_weak = float(config.get("analysis.word_thresholds.weak", 40))
+    recover_score = max(word_weak + 14.0, min(word_ok + 1.0, 66.0))
+
+    adjusted = 0
+    for idx, word in enumerate(alignment.words):
+        if idx in missing_set:
+            if word.tag != WordTag.MISSING:
+                word.tag = WordTag.MISSING
+                word.score = min(float(word.score or 0.0), max(0.0, word_weak - 2.0))
+                adjusted += 1
+            continue
+
+        if word.tag == WordTag.MISSING:
+            word.score = max(float(word.score or 0.0), recover_score)
+            word.tag = WordTag.OK if word.score >= word_ok else WordTag.WEAK
+            note = "Missing tag cleared by transcript evidence."
+            word.diagnosis = f"{word.diagnosis} | {note}".strip(" |")
+            adjusted += 1
+
+    if adjusted:
+        logger.info(
+            "Reconciled %s missing tags using %s source.",
+            adjusted,
+            source,
+        )
 
 
 def apply_gemini_missing_correction(
@@ -491,7 +1488,10 @@ def apply_gemini_missing_correction(
     if not detected_transcript:
         return
     source = str((engine_raw or {}).get("source", "")).lower()
-    if "gemini" not in source and not (engine_raw or {}).get("script_reference"):
+    # This correction is for Gemini-primary runs only.
+    # In Azure+Gemini overlay mode, completeness missing words are derived via
+    # extract_gemini_overlay_missing_words().
+    if "gemini" not in source:
         return
     ref_tokens = _tokenize_for_compare(script_text)
     hyp_tokens = _tokenize_for_compare(detected_transcript)
@@ -517,9 +1517,7 @@ def apply_gemini_missing_correction(
     total_words = max(1, len(alignment.words))
     conflict_ratio = conflicts / total_words
 
-    # 不再把“被 Gemini 证明已读到”的词统一压到 45 分。
-    # 评分来自全局质量，防止长文本几乎全橙。
-    corrected_score = max(word_weak + 18.0, min(82.0, accuracy - 4.0))
+    # 涓嶅啀鎶娾€滆 Gemini 璇佹槑宸茶鍒扳€濈殑璇嶇粺涓€鍘嬪埌 45 鍒嗐€?    # 璇勫垎鏉ヨ嚜鍏ㄥ眬璐ㄩ噺锛岄槻姝㈤暱鏂囨湰鍑犱箮鍏ㄦ銆?    corrected_score = max(word_weak + 18.0, min(82.0, accuracy - 4.0))
     promote_to_ok = completeness >= 90.0 and fluency >= 70.0 and conflict_ratio <= 0.20
     if promote_to_ok:
         corrected_score = max(corrected_score, word_ok + 2.0)
@@ -558,7 +1556,7 @@ def suppress_over_missing_for_gemini(
         return
 
     source = str((engine_raw or {}).get("source", "")).lower()
-    has_gemini_hint = ("gemini" in source) or bool((engine_raw or {}).get("script_reference"))
+    has_gemini_hint = "gemini" in source
     if not has_gemini_hint:
         return
 
@@ -769,12 +1767,12 @@ def ensure_stress_signal(alignment: Alignment) -> None:
 
 def generate_expected_stress(alignment: Alignment) -> None:
     """
-    为每个单词生成期望重音值 (Native Speaker 参考)
+    涓烘瘡涓崟璇嶇敓鎴愭湡鏈涢噸闊冲€?(Native Speaker 鍙傝€?
     
-    规则：
-    - 实词（名词、动词、形容词、副词）：高重音 (0.7-0.9)
-    - 虚词（冠词、介词、代词、助动词）：低重音 (0.2-0.4)
-    - 句首/句尾词通常略重
+    瑙勫垯锛?
+    - 瀹炶瘝锛堝悕璇嶃€佸姩璇嶃€佸舰瀹硅瘝銆佸壇璇嶏級锛氶珮閲嶉煶 (0.7-0.9)
+    - 铏氳瘝锛堝啝璇嶃€佷粙璇嶃€佷唬璇嶃€佸姪鍔ㄨ瘝锛夛細浣庨噸闊?(0.2-0.4)
+    - 鍙ラ/鍙ュ熬璇嶉€氬父鐣ラ噸
     """
     words = alignment.words
     if not words:
@@ -783,17 +1781,17 @@ def generate_expected_stress(alignment: Alignment) -> None:
     for i, word in enumerate(words):
         clean_word = word.word.lower().strip(".,!?;:\"'")
         
-        # 基础判定：实词 vs 虚词
+        # 鍩虹鍒ゅ畾锛氬疄璇?vs 铏氳瘝
         if clean_word in FUNCTION_WORDS:
-            base_stress = 0.3  # 虚词 - 弱读
+            base_stress = 0.3  # 铏氳瘝 - 寮辫
         else:
-            base_stress = 0.8  # 实词 - 重读
+            base_stress = 0.8  # 瀹炶瘝 - 閲嶈
         
-        # 句首加成
+        # 鍙ラ鍔犳垚
         if i == 0:
             base_stress = min(1.0, base_stress + 0.1)
         
-        # 句尾加成（最后一个或者倒数第二个实词）
+        # 鍙ュ熬鍔犳垚锛堟渶鍚庝竴涓垨鑰呭€掓暟绗簩涓疄璇嶏級
         if i >= len(words) - 2 and clean_word not in FUNCTION_WORDS:
             base_stress = min(1.0, base_stress + 0.1)
         
@@ -813,6 +1811,286 @@ def _collect_script_words_and_punctuation(script_text: str) -> tuple[list[str], 
         words.append(word.lower())
         puncts.append(marks)
     return words, puncts
+
+
+def _normalize_index_map(raw_map: dict[int, float]) -> dict[int, float]:
+    finite = {idx: float(value) for idx, value in raw_map.items() if math.isfinite(float(value))}
+    if not finite:
+        return {}
+    values = list(finite.values())
+    low = min(values)
+    high = max(values)
+    if high - low <= 1e-6:
+        return {idx: 0.5 for idx in finite}
+    return {
+        idx: _clamp((value - low) / (high - low), 0.0, 1.0)
+        for idx, value in finite.items()
+    }
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _quantile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    pos = max(0, min(len(sorted_vals) - 1, round((len(sorted_vals) - 1) * q)))
+    return float(sorted_vals[pos])
+
+
+def _extract_pitch_by_word(
+    alignment: Alignment,
+    engine_raw: dict[str, Any] | None,
+) -> dict[int, float]:
+    contour = (engine_raw or {}).get("pitch_contour")
+    if not isinstance(contour, list) or not contour:
+        return {}
+
+    out: dict[int, float] = {}
+    for idx, word in enumerate(alignment.words):
+        start = _safe_float(getattr(word, "start", 0.0), 0.0)
+        end = _safe_float(getattr(word, "end", 0.0), 0.0)
+        if end <= start or getattr(word, "tag", WordTag.OK) == WordTag.MISSING:
+            continue
+        values = [
+            _safe_float(point.get("f", point.get("f0", 0.0)), 0.0)
+            for point in contour
+            if start <= _safe_float(point.get("t", 0.0), 0.0) <= end
+        ]
+        values = [value for value in values if value > 50.0]
+        if not values:
+            continue
+        out[idx] = max(values)
+    return out
+
+
+def _extract_energy_by_word(
+    alignment: Alignment,
+    audio_path: str = "",
+) -> dict[int, float]:
+    path = Path(str(audio_path or "").strip())
+    if not path.exists():
+        return {}
+    try:
+        import librosa
+    except Exception:
+        return {}
+
+    try:
+        y, sr = librosa.load(str(path), sr=16000)
+        rms = librosa.feature.rms(y=y, hop_length=512)[0]
+        times = librosa.times_like(rms, sr=sr, hop_length=512)
+    except Exception as exc:
+        logger.warning("Prosody energy extraction failed: %s", exc)
+        return {}
+
+    out: dict[int, float] = {}
+    for idx, word in enumerate(alignment.words):
+        start = _safe_float(getattr(word, "start", 0.0), 0.0)
+        end = _safe_float(getattr(word, "end", 0.0), 0.0)
+        if end <= start or getattr(word, "tag", WordTag.OK) == WordTag.MISSING:
+            continue
+        vals = [float(rms[i]) for i, t in enumerate(times) if start <= float(t) <= end]
+        if vals:
+            out[idx] = max(vals)
+    return out
+
+
+def _compute_word_prominence_scores(
+    alignment: Alignment,
+    *,
+    pitch_by_index: dict[int, float] | None = None,
+    energy_by_index: dict[int, float] | None = None,
+) -> list[float]:
+    duration_raw: dict[int, float] = {}
+    for idx, word in enumerate(alignment.words):
+        if getattr(word, "tag", WordTag.OK) == WordTag.MISSING:
+            continue
+        duration_raw[idx] = max(0.05, _safe_float(getattr(word, "end", 0.0), 0.0) - _safe_float(getattr(word, "start", 0.0), 0.0))
+
+    duration_norm = _normalize_index_map(duration_raw)
+    pitch_norm = _normalize_index_map(pitch_by_index or {})
+    energy_norm = _normalize_index_map(energy_by_index or {})
+
+    out: list[float] = []
+    for idx, word in enumerate(alignment.words):
+        if getattr(word, "tag", WordTag.OK) == WordTag.MISSING:
+            word.prominence_score = 0.0
+            out.append(0.0)
+            continue
+
+        duration_score = duration_norm.get(idx, 0.0)
+        energy_score = energy_norm.get(idx, 0.0)
+        pitch_score = pitch_norm.get(idx, 0.0)
+        stress_score = _clamp(_safe_float(getattr(word, "stress", 0.0), 0.0), 0.0, 1.0)
+        expected_score = _clamp(_safe_float(getattr(word, "expected_stress", 0.5), 0.5), 0.0, 1.0)
+
+        prominence = (
+            0.40 * duration_score
+            + 0.25 * energy_score
+            + 0.20 * pitch_score
+            + 0.15 * max(stress_score, expected_score * 0.85)
+        )
+
+        token = _normalize_token(getattr(word, "word", ""))
+        if token in FUNCTION_WORDS:
+            prominence *= 0.86
+        elif expected_score >= 0.62:
+            prominence = min(1.0, prominence + 0.04)
+
+        word.prominence_score = round(_clamp(prominence, 0.0, 1.0), 3)
+        out.append(word.prominence_score)
+    return out
+
+
+def _split_prosody_sentences(
+    alignment: Alignment,
+    script_text: str,
+) -> list[list[WordAlignment]]:
+    words = [word for word in alignment.words if str(getattr(word, "word", "")).strip()]
+    if len(words) < 4:
+        return []
+
+    script_words, puncts = _collect_script_words_and_punctuation(script_text)
+    usable = min(len(words), len(script_words)) if script_words else len(words)
+    chunks: list[list[WordAlignment]] = []
+    current: list[WordAlignment] = []
+    for idx, word in enumerate(words[:usable]):
+        current.append(word)
+        marks = puncts[idx] if idx < len(puncts) else ""
+        should_cut = any(mark in marks for mark in ".!?")
+        if not should_cut and len(current) >= 10:
+            should_cut = True
+        if should_cut:
+            if len(current) >= 4:
+                chunks.append(current)
+            current = []
+    if len(current) >= 4:
+        chunks.append(current)
+    if not chunks and len(words) >= 4:
+        chunks.append(words[: min(len(words), 10)])
+    return chunks
+
+
+def _build_prosody_intonation_analysis(
+    alignment: Alignment,
+    script_text: str,
+    *,
+    engine_raw: dict[str, Any] | None = None,
+    pitch_by_index: dict[int, float] | None = None,
+    energy_by_index: dict[int, float] | None = None,
+    audio_path: str = "",
+) -> dict[str, Any] | None:
+    if not alignment.words or len(alignment.words) < 4:
+        return None
+
+    computed_pitch = pitch_by_index if pitch_by_index is not None else _extract_pitch_by_word(alignment, engine_raw)
+    computed_energy = energy_by_index if energy_by_index is not None else _extract_energy_by_word(alignment, audio_path)
+    prominence_scores = _compute_word_prominence_scores(
+        alignment,
+        pitch_by_index=computed_pitch,
+        energy_by_index=computed_energy,
+    )
+    if not prominence_scores:
+        return None
+
+    sentence_chunks = _split_prosody_sentences(alignment, script_text)
+    if not sentence_chunks:
+        return None
+
+    evaluated: list[dict[str, Any]] = []
+    for chunk in sentence_chunks:
+        values = [float(getattr(word, "prominence_score", 0.0) or 0.0) for word in chunk]
+        if len(values) < 4:
+            continue
+        cutoff = max(0.55, min(0.80, _quantile(values, 0.68)))
+
+        targets = 0
+        correct = 0
+        issue_words: list[str] = []
+        token_views: list[dict[str, Any]] = []
+        strong_vals: list[float] = []
+        light_vals: list[float] = []
+        over_stress = 0
+
+        for word in chunk:
+            token = _normalize_token(getattr(word, "word", ""))
+            expected = _safe_float(getattr(word, "expected_stress", 0.5), 0.5) >= 0.62
+            actual = float(getattr(word, "prominence_score", 0.0) or 0.0) >= cutoff
+            tag = str(getattr(word, "tag", WordTag.OK).value if hasattr(getattr(word, "tag", None), "value") else getattr(word, "tag", "ok")).lower()
+            blocked = tag in {"missing", "poor"}
+            if expected:
+                targets += 1
+                ok = actual and not blocked
+                if ok:
+                    correct += 1
+                else:
+                    issue_words.append(str(getattr(word, "word", "")))
+                strong_vals.append(float(getattr(word, "prominence_score", 0.0) or 0.0))
+                token_views.append({"word": word.word, "is_stressed": True, "stress_correct": ok})
+            else:
+                light_vals.append(float(getattr(word, "prominence_score", 0.0) or 0.0))
+                over = actual and not blocked and token in FUNCTION_WORDS
+                if over:
+                    over_stress += 1
+                    issue_words.append(str(getattr(word, "word", "")))
+                token_views.append({"word": word.word, "is_stressed": False, "stress_correct": not over})
+
+        if targets <= 0:
+            continue
+
+        base_accuracy = round((correct / max(1, targets)) * 100)
+        contrast = _mean(strong_vals) - _mean(light_vals)
+        spread = (max(values) - min(values)) if values else 0.0
+        penalty = 0
+        if contrast < 0.06:
+            penalty += 22
+        elif contrast < 0.10:
+            penalty += 12
+        elif contrast < 0.14:
+            penalty += 6
+        if spread < 0.05:
+            penalty += 8
+        penalty += min(18, over_stress * 5)
+        score = int(round(_clamp(base_accuracy - penalty, 0.0, 100.0)))
+
+        if issue_words:
+            tip = f"重点改进：{' / '.join(list(dict.fromkeys(issue_words))[:3])}。做法：让关键词更突出，连接词更轻一些。"
+        elif contrast < 0.12:
+            tip = "这句的重弱对比还不够明显。做法：让关键词更突出，连接词更轻一些。"
+        else:
+            tip = "这句关键词比较突出，重弱分布较自然。继续保持这个节奏。"
+
+        evaluated.append(
+            {
+                "sentence": " ".join(str(getattr(word, "word", "")).strip() for word in chunk).strip(),
+                "words": token_views,
+                "stress_accuracy": score,
+                "tip": tip,
+                "contrast": round(contrast, 3),
+            }
+        )
+
+    if not evaluated:
+        return None
+
+    best = max(evaluated, key=lambda row: int(row.get("stress_accuracy", 0)))
+    worst = min(evaluated, key=lambda row: int(row.get("stress_accuracy", 0)))
+    best = {
+        **best,
+        "tip": "这句关键词比较突出，重弱分布较自然。继续保持这个节奏。",
+    }
+    worst = {
+        **worst,
+        "tip": str(worst.get("tip") or "这句的重弱对比还不够明显。"),
+    }
+    return {
+        "best_sentence": best,
+        "problem_sentences": [worst],
+        "method": "prominence_v1",
+    }
 
 
 def _build_reference_pause_targets(
@@ -939,6 +2217,50 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         elif any(ch in marks for ch in ",;:"):
             punct_target[idx] = "medium"
 
+    # Map alignment-word indices to script-word indices.
+    # This avoids punctuation drift when ASR inserts/drops words.
+    _script_to_align, align_to_script = _build_script_alignment_maps(script_words, alignment)
+    mapped_script_idx: list[int | None] = [align_to_script.get(i) for i in range(len(words))]
+    prev_mapped: list[int | None] = [None] * len(words)
+    next_mapped: list[int | None] = [None] * len(words)
+    last_seen: int | None = None
+    for i, s_idx in enumerate(mapped_script_idx):
+        if s_idx is not None:
+            last_seen = s_idx
+        prev_mapped[i] = last_seen
+    last_seen = None
+    for i in range(len(words) - 1, -1, -1):
+        s_idx = mapped_script_idx[i]
+        if s_idx is not None:
+            last_seen = s_idx
+        next_mapped[i] = last_seen
+
+    mapping_coverage = sum(1 for s_idx in mapped_script_idx if s_idx is not None) / max(1, len(words))
+    low_mapping_coverage = mapping_coverage < 0.35
+
+    def _script_idx_for_alignment_idx(a_idx: int) -> int | None:
+        if not (0 <= a_idx < len(words)):
+            return None
+        direct = mapped_script_idx[a_idx]
+        if direct is not None and 0 <= direct < len(script_words):
+            return direct
+
+        left = prev_mapped[a_idx]
+        right = next_mapped[a_idx]
+        if left is not None and right is not None:
+            if right - left >= 2:
+                guess = left + 1
+            else:
+                guess = left
+            return guess if 0 <= guess < len(script_words) else None
+        if left is not None:
+            return left if 0 <= left < len(script_words) else None
+        if right is not None:
+            return right if 0 <= right < len(script_words) else None
+        if low_mapping_coverage and 0 <= a_idx < len(script_words):
+            return a_idx
+        return None
+
     # Detect synthetic/low-fidelity timelines (e.g. evenly spaced fallback timestamps).
     # On such timelines, do not emit hard good/bad labels.
     gaps: list[float] = []
@@ -975,11 +2297,16 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
 
     # Additional low-confidence signal:
     # if most strong boundaries are near-zero gaps, timestamps are likely coarse.
-    upper_probe = min(len(words) - 1, len(script_words))
+    upper_probe = len(words) - 1
     strong_boundary_count = 0
     strong_zero_gap_count = 0
     for idx in range(max(0, upper_probe)):
-        exp_probe = (ref_pause_targets.get(idx) or punct_target.get(idx) or "none").strip().lower()
+        script_idx = _script_idx_for_alignment_idx(idx)
+        exp_probe = (
+            (ref_pause_targets.get(script_idx) if script_idx is not None else None)
+            or (punct_target.get(script_idx) if script_idx is not None else None)
+            or "none"
+        ).strip().lower()
         if exp_probe != "strong":
             continue
         strong_boundary_count += 1
@@ -996,15 +2323,20 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
     practice_focus_points: list[dict[str, Any]] = []
     boundary_candidates: list[dict[str, Any]] = []
     seen_focus: set[str] = set()
-    upper = min(len(words) - 1, len(script_words))
+    upper = len(words) - 1
     for idx in range(max(0, upper)):
-        exp = (ref_pause_targets.get(idx) or punct_target.get(idx) or "none").strip().lower()
+        script_idx = _script_idx_for_alignment_idx(idx)
+        exp = (
+            (ref_pause_targets.get(script_idx) if script_idx is not None else None)
+            or (punct_target.get(script_idx) if script_idx is not None else None)
+            or "none"
+        ).strip().lower()
         if exp not in {"strong", "medium", "light", "none"}:
             exp = "medium"
         if exp != "none":
             expected_pause_targets += 1
 
-        left_word = str(words[idx].word if idx < len(words) else script_words[idx]).strip()
+        left_word = str(words[idx].word if idx < len(words) else "").strip()
         right_word = str(words[idx + 1].word if (idx + 1) < len(words) else "").strip()
         token = _normalize_token(left_word)
         if not token:
@@ -1122,7 +2454,12 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
         issue = ""
         adjust_sec = 0.0
 
-        expected = (ref_pause_targets.get(i) or punct_target.get(i) or "none").strip().lower()
+        script_idx = _script_idx_for_alignment_idx(i)
+        expected = (
+            (ref_pause_targets.get(script_idx) if script_idx is not None else None)
+            or (punct_target.get(script_idx) if script_idx is not None else None)
+            or "none"
+        ).strip().lower()
         if expected not in {"strong", "medium", "light", "none"}:
             expected = "none"
         target_min, target_max = _pause_target_window(
@@ -1186,11 +2523,11 @@ def detect_pauses(alignment: Alignment, script_text: str, engine_raw: dict[str, 
 
 def detect_linking(alignment: Alignment) -> None:
     """
-    检测连读并更新 Alignment
+    妫€娴嬭繛璇诲苟鏇存柊 Alignment
     
-    连读规则 (初步实现)：
-    1. 前一词的结束与后一词的开始有重叠，或间隔极微小 (< 0.02s)
-    2. 后续可扩展音素级规则 (C-V)
+    杩炶瑙勫垯 (鍒濇瀹炵幇)锛?
+    1. 鍓嶄竴璇嶇殑缁撴潫涓庡悗涓€璇嶇殑寮€濮嬫湁閲嶅彔锛屾垨闂撮殧鏋佸井灏?(< 0.02s)
+    2. 鍚庣画鍙墿灞曢煶绱犵骇瑙勫垯 (C-V)
     """
     words = alignment.words
     if not words:
@@ -1200,12 +2537,12 @@ def detect_linking(alignment: Alignment) -> None:
         curr_word = words[i]
         next_word = words[i+1]
         
-        # 计算间隙
+        # 璁＄畻闂撮殭
         gap = next_word.start - curr_word.end
         
-        # 连读判定规则：
-        # 1. 重叠 (gap < 0)
-        # 2. 极其微小的间隙 (gap < 0.03s)
+        # 杩炶鍒ゅ畾瑙勫垯锛?
+        # 1. 閲嶅彔 (gap < 0)
+        # 2. 鏋佸叾寰皬鐨勯棿闅?(gap < 0.03s)
         if gap < 0.03:
             curr_word.is_linked = True
 
@@ -1216,9 +2553,9 @@ def calculate_pace_trend(
     audio_duration_sec: float = 0.0,
 ) -> list[PacePoint]:
     """
-    璁＄畻璇€熻秼鍔?(WPM)
+    鐠侊紕鐣荤拠顓⑩偓鐔荤Ъ閸?(WPM)
 
-    浣跨敤婊戝姩绐楀彛銆?
+    娴ｈ法鏁ゅ鎴濆З缁愭褰涢妴?
     """
     if not alignment.words:
         return []
@@ -1283,16 +2620,14 @@ def analyze_completeness(
     script_text: str, 
     missing_words: list[str]
 ) -> CompletenessStats:
-    """
-    完整度分析
-    """
+    """Completeness analysis."""
     FUNCTION_WORDS = {
         "a", "an", "the", "of", "in", "on", "at", "to", "for", "with", "by", 
         "is", "are", "was", "were", "be", "been", "has", "have", "had", 
         "and", "or", "but", "so", "as", "if", "that", "it", "this", "that"
     }
     
-    # 使用正则分词统计单词数
+    # Token count from script text.
     total_words = len(re.findall(r"[a-zA-Z']+", script_text))
     if total_words == 0:
         total_words = 1
@@ -1309,34 +2644,34 @@ def analyze_completeness(
         else:
             key_missed += 1
             
-    # 生成 Tips
+    # Generate tips.
     tips = []
     if key_missed > 0:
-        tips.append("尝试更仔细地阅读实词（名词、动词），它们承载了句子的核心含义。")
+        tips.append("Read content words more clearly, especially nouns and verbs.")
     if func_missed > 2:
-        tips.append("注意不要吞掉像 'a', 'the' 这样的小词，虽然它们不重读，但也是句子的一部分。")
+        tips.append("Do not drop short function words like 'a' and 'the'.")
     if coverage == 100:
-        tips.append("完美！你没有漏掉任何单词。")
+        tips.append("Great job. No words were omitted.")
     elif coverage > 90 and key_missed == 0:
-        tips.append("整体完整度很高，只漏读了一些功能词，继续保持！")
+        tips.append("Great overall coverage. Only a few function words were missed.")
         
     return CompletenessStats(
-        title="完整度分析",
-        score_label="优秀" if coverage > 90 else ("良好" if coverage > 70 else "需加油"),
+        title="Completeness Analysis",
+        score_label="Excellent" if coverage > 90 else ("Good" if coverage > 70 else "Needs Work"),
         coverage=coverage,
         missing_stats={
             "total": missing_count,
             "keywords": key_missed,
             "function_words": func_missed
         },
-        insight=f"内容覆盖率: {coverage}% (漏读 {key_missed} 个关键词)",
+        insight=f"Coverage {coverage}% (missed {key_missed} key word(s))",
         tips=tips
     )
 
 
 def analyze_hesitations(alignment: Alignment) -> HesitationStats | None:
     """
-    杩熺枒/濉厖璇嶅垎鏋?
+    鏉╃喓鏋?婵夘偄鍘栫拠宥呭瀻閺?
 
     Mixed disfluency detection based on fillers + long pauses + repetitions.
     """
@@ -1492,25 +2827,25 @@ def analyze_hesitations(alignment: Alignment) -> HesitationStats | None:
 
 def extract_weak_words(alignment: Alignment) -> list[str]:
     """
-    提取分数最低的词
+    鎻愬彇鍒嗘暟鏈€浣庣殑璇?
     
     Args:
-        alignment: 对齐信息
+        alignment: 瀵归綈淇℃伅
         
     Returns:
-        弱词列表（按分数升序）
+        寮辫瘝鍒楄〃锛堟寜鍒嗘暟鍗囧簭锛?
     """
     top_n = config.get("analysis.weak_words_top_n", 5)
     ok_threshold = config.get("analysis.word_thresholds.ok", 85)
     
-    # 筛选非 missing 的低分词
+    # 绛涢€夐潪 missing 鐨勪綆鍒嗚瘝
     weak_candidates = [
         (w.word, w.score)
         for w in alignment.words
         if w.tag != WordTag.MISSING and w.score < ok_threshold
     ]
     
-    # 按分数升序排序，取 top N
+    # 鎸夊垎鏁板崌搴忔帓搴忥紝鍙?top N
     weak_candidates.sort(key=lambda x: x[1])
     
     return [word for word, score in weak_candidates[:top_n]]
@@ -1518,47 +2853,47 @@ def extract_weak_words(alignment: Alignment) -> list[str]:
 
 def extract_weak_phonemes(alignment: Alignment) -> list[str]:
     """
-    提取分数最低的音素
+    鎻愬彇鍒嗘暟鏈€浣庣殑闊崇礌
     
     Args:
-        alignment: 对齐信息
+        alignment: 瀵归綈淇℃伅
         
     Returns:
-        弱音素列表（去重，按出现频率排序）
+        寮遍煶绱犲垪琛紙鍘婚噸锛屾寜鍑虹幇棰戠巼鎺掑簭锛?
     """
     top_n = config.get("analysis.weak_phonemes_top_n", 3)
     ok_threshold = config.get("analysis.phoneme_thresholds.ok", 85)
     
-    # 情况 1：如果有详细音素，按出现频率排序
+    # 鎯呭喌 1锛氬鏋滄湁璇︾粏闊崇礌锛屾寜鍑虹幇棰戠巼鎺掑簭
     if alignment.phonemes:
         weak_phoneme_counts: Counter[str] = Counter()
         for phoneme in alignment.phonemes:
             if phoneme.score < ok_threshold:
-                # 标准化音素名称（去掉数字后缀等）
+                # 鏍囧噯鍖栭煶绱犲悕绉帮紙鍘绘帀鏁板瓧鍚庣紑绛夛級
                 phoneme_name = phoneme.phoneme.rstrip("012").upper()
                 weak_phoneme_counts[phoneme_name] += 1
         
-        # 取出现最多的 top N
+        # 鍙栧嚭鐜版渶澶氱殑 top N
         most_common = weak_phoneme_counts.most_common(top_n)
         return [phoneme for phoneme, count in most_common]
     
-    # 情况 2：如果没有详细音素（保底模式），尝试从弱词中合成音素建议
-    # 这是一种“启发式”分析，让报告看起来更专业
+    # 鎯呭喌 2锛氬鏋滄病鏈夎缁嗛煶绱狅紙淇濆簳妯″紡锛夛紝灏濊瘯浠庡急璇嶄腑鍚堟垚闊崇礌寤鸿
+    # 杩欐槸涓€绉嶁€滃惎鍙戝紡鈥濆垎鏋愶紝璁╂姤鍛婄湅璧锋潵鏇翠笓涓?
     else:
-        # 获取所有弱词（不限于 top_n）
+        # 鑾峰彇鎵€鏈夊急璇嶏紙涓嶉檺浜?top_n锛?
         all_weak = [w.word.lower() for w in alignment.words if w.tag != WordTag.OK and w.tag != WordTag.MISSING]
         
-        # 简单规则映射 (Spelling -> Phoneme)
+        # 绠€鍗曡鍒欐槧灏?(Spelling -> Phoneme)
         rules = [
-            ("th", "θ"),
+            ("th", "胃"),
             ("v", "v"),
             ("r", "r"),
             ("l", "l"),
-            ("ng", "ŋ"),
+            ("ng", "艐"),
             ("w", "w"),
             ("ph", "f"),
-            ("sh", "ʃ"),
-            ("ch", "tʃ"),
+            ("sh", "蕛"),
+            ("ch", "t蕛"),
         ]
         
         synthesized: Counter[str] = Counter()
@@ -1567,28 +2902,28 @@ def extract_weak_phonemes(alignment: Alignment) -> list[str]:
                 if pattern in word:
                     synthesized[ph] += 1
         
-        # 取出现最多的 top N
+        # 鍙栧嚭鐜版渶澶氱殑 top N
         most_common = synthesized.most_common(top_n)
         return [ph for ph, count in most_common]
 
 
 def extract_missing_words(alignment: Alignment, script_text: str) -> list[str]:
     """
-    提取缺失的词
+    鎻愬彇缂哄け鐨勮瘝
     
     Args:
-        alignment: 对齐信息
-        script_text: 标准文本
+        alignment: 瀵归綈淇℃伅
+        script_text: 鏍囧噯鏂囨湰
         
     Returns:
-        缺失词列表
+        缂哄け璇嶅垪琛?
     """
-    # 从对齐结果中获取 missing 标签的词
+    # 浠庡榻愮粨鏋滀腑鑾峰彇 missing 鏍囩鐨勮瘝
     missing_from_alignment = [
         w.word for w in alignment.words if w.tag == WordTag.MISSING
     ]
     
-    # 同样使用正则分词进行对比
+    # 鍚屾牱浣跨敤姝ｅ垯鍒嗚瘝杩涜瀵规瘮
     script_words = set(
         word.lower()
         for word in re.findall(r"[a-zA-Z']+", script_text)
@@ -1600,7 +2935,7 @@ def extract_missing_words(alignment: Alignment, script_text: str) -> list[str]:
     
     missing_from_comparison = list(script_words - recognized_words)
     
-    # 合并去重
+    # 鍚堝苟鍘婚噸
     all_missing = list(set(missing_from_alignment + missing_from_comparison))
     
     return all_missing
@@ -1608,21 +2943,21 @@ def extract_missing_words(alignment: Alignment, script_text: str) -> list[str]:
 
 def extract_confusions(engine_raw: dict[str, Any]) -> list[Confusion]:
     """
-    提取音素混淆信息
+    鎻愬彇闊崇礌娣锋穯淇℃伅
     
-    某些引擎会输出混淆矩阵，标识学生把哪个音素发成了哪个。
+    鏌愪簺寮曟搸浼氳緭鍑烘贩娣嗙煩闃碉紝鏍囪瘑瀛︾敓鎶婂摢涓煶绱犲彂鎴愪簡鍝釜銆?
     
     Args:
-        engine_raw: 引擎原始输出
+        engine_raw: 寮曟搸鍘熷杈撳嚭
         
     Returns:
-        混淆列表
+        娣锋穯鍒楄〃
     """
     top_n = config.get("analysis.confusions_top_n", 2)
     
     confusions: list[Confusion] = []
     
-    # 检查引擎是否提供了混淆信息
+    # 妫€鏌ュ紩鎿庢槸鍚︽彁渚涗簡娣锋穯淇℃伅
     confusion_data = engine_raw.get("confusions", [])
     
     if isinstance(confusion_data, list):
@@ -1639,7 +2974,7 @@ def extract_confusions(engine_raw: dict[str, Any]) -> list[Confusion]:
                         count=count,
                     ))
     
-    # 按 count 降序排序，取 top N
+    # 鎸?count 闄嶅簭鎺掑簭锛屽彇 top N
     confusions.sort(key=lambda x: x.count, reverse=True)
     
     return confusions[:top_n]
@@ -1647,11 +2982,11 @@ def extract_confusions(engine_raw: dict[str, Any]) -> list[Confusion]:
 
 def detect_mistakes(alignment: Alignment, engine_raw: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    检测具体的错误模式，生成详细描述。
+    妫€娴嬪叿浣撶殑閿欒妯″紡锛岀敓鎴愯缁嗘弿杩般€?
     """
     mistakes = []
     
-    # 1. 检测 AI 语义冲突 (来自 ProEngine)
+    # 1. 妫€娴?AI 璇箟鍐茬獊 (鏉ヨ嚜 ProEngine)
     ai_referee = engine_raw.get("ai_referee", {})
     if ai_referee.get("status") == "completed" and ai_referee.get("conflicts", 0) > 0:
         conflict_details = ai_referee.get("conflict_details", [])
@@ -1666,7 +3001,7 @@ def detect_mistakes(alignment: Alignment, engine_raw: dict[str, Any]) -> list[di
                 "severity": "medium"
             })
 
-    # 2. 检测漏读 (Missing)
+    # 2. 妫€娴嬫紡璇?(Missing)
     for word in alignment.words:
         if word.tag == WordTag.MISSING:
             mistakes.append({
@@ -1676,9 +3011,9 @@ def detect_mistakes(alignment: Alignment, engine_raw: dict[str, Any]) -> list[di
                 "severity": "high"
             })
 
-    # 3. 检测音素级显著错误 (GOP Evidence)
+    # 3. 妫€娴嬮煶绱犵骇鏄捐憲閿欒 (GOP Evidence)
     for word in alignment.words:
-        # 即使 WordTag 是 OK，如果有音素分极低，也要挑出来
+        # 鍗充娇 WordTag 鏄?OK锛屽鏋滄湁闊崇礌鍒嗘瀬浣庯紝涔熻鎸戝嚭鏉?
         for phoneme in getattr(word, 'phonemes', []):
             if phoneme.tag in [PhonemeTag.WEAK, PhonemeTag.POOR] and phoneme.score < 65:
                 mistakes.append({
@@ -1695,18 +3030,18 @@ def detect_mistakes(alignment: Alignment, engine_raw: dict[str, Any]) -> list[di
 
 def assign_tags(alignment: Alignment) -> None:
     """
-    为对齐结果分配标签
+    涓哄榻愮粨鏋滃垎閰嶆爣绛?
     
-    根据分数阈值为 words 和 phonemes 分配 ok/weak/poor 标签。
+    鏍规嵁鍒嗘暟闃堝€间负 words 鍜?phonemes 鍒嗛厤 ok/weak/poor 鏍囩銆?
     
     Args:
-        alignment: 对齐信息（会被原地修改）
+        alignment: 瀵归綈淇℃伅锛堜細琚師鍦颁慨鏀癸級
     """
     word_ok = config.get("analysis.word_thresholds.ok", 70)
     word_weak = config.get("analysis.word_thresholds.weak", 40)
     phoneme_ok = config.get("analysis.phoneme_thresholds.ok", 70)
 
-    # 长文本里如果出现“平均分不低但几乎全橙”，动态收紧误判。
+    # Default threshold; may be relaxed for long text sessions.
     adaptive_word_ok = float(word_ok)
     valid_word_scores = [
         float(w.score)
@@ -1727,7 +3062,7 @@ def assign_tags(alignment: Alignment) -> None:
                 base_ok_ratio,
             )
     
-    # 分配词标签
+    # Assign word tags.
     for word in alignment.words:
         if word.tag == WordTag.MISSING:
             continue
@@ -1738,9 +3073,10 @@ def assign_tags(alignment: Alignment) -> None:
         else:
             word.tag = WordTag.POOR
     
-    # 分配音素标签
+    # 鍒嗛厤闊崇礌鏍囩
     for phoneme in alignment.phonemes:
         if phoneme.score >= phoneme_ok:
             phoneme.tag = PhonemeTag.OK
         else:
             phoneme.tag = PhonemeTag.WEAK
+

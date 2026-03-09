@@ -50,6 +50,37 @@ def _extract_number(value: Any) -> float | None:
         return None
 
 
+def _count_stable_missing_words(
+    script_text: str,
+    alignment: Alignment,
+    engine_raw: dict[str, Any],
+) -> tuple[int, int, str]:
+    script_tokens = re.findall(r"[A-Za-z']+", str(script_text or ""))
+    total = len(script_tokens)
+    if total <= 0:
+        return 0, 0, "none"
+
+    raw_indices = (engine_raw or {}).get("stable_missing_indices")
+    if isinstance(raw_indices, list):
+        stable: set[int] = set()
+        for raw in raw_indices:
+            try:
+                idx = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < total:
+                stable.add(idx)
+        return len(stable), total, "stable_indices"
+
+    missing_by_tag = 0
+    for idx, word in enumerate(alignment.words):
+        if idx >= total:
+            break
+        if word.tag == WordTag.MISSING:
+            missing_by_tag += 1
+    return missing_by_tag, total, "alignment_tags"
+
+
 def _timeline_duration_for_wpm(
     timed_words: list[Any],
     audio_duration_sec: float = 0.0,
@@ -988,7 +1019,76 @@ def normalize_scores(
             logger.info(f"使用引擎直接提供的完整分: {completeness}")
         else:
             completeness = calculate_completeness_score(script_text, alignment)
-    
+
+    missing_count, script_total, missing_source = _count_stable_missing_words(
+        script_text=script_text,
+        alignment=alignment,
+        engine_raw=engine_raw,
+    )
+    if script_total > 0:
+        current = _clamp_0_100(completeness)
+        raw_source = str((engine_raw or {}).get("source", "")).lower()
+        annotation_source = str((engine_raw or {}).get("annotation_source", "")).lower()
+        allow_force_100 = (
+            "gemini" in raw_source
+            or ("azure" in raw_source and annotation_source == "gemini")
+        )
+        if missing_count <= 0:
+            if allow_force_100 and current < 99.9:
+                completeness = 100.0
+                engine_raw["completeness_adjusted_for_missing"] = {
+                    "from": round(current, 2),
+                    "to": completeness,
+                    "missing_count": 0,
+                    "script_word_count": int(script_total),
+                    "missing_source": missing_source,
+                    "rule": "no_missing_force_100",
+                }
+                logger.info(
+                    "Completeness forced to 100.0 because no missing words were detected (source=%s).",
+                    missing_source,
+                )
+        else:
+            max_consistent = max(0.0, 100.0 * (1.0 - missing_count / script_total))
+            if allow_force_100:
+                # Gemini-involved path: completeness should reflect missing-word count directly.
+                # This avoids mismatches like "2 missing words but completeness still ~85".
+                if abs(current - max_consistent) >= 0.6:
+                    completeness = round(max_consistent, 1)
+                    engine_raw["completeness_adjusted_for_missing"] = {
+                        "from": round(current, 2),
+                        "to": completeness,
+                        "missing_count": int(missing_count),
+                        "script_word_count": int(script_total),
+                        "missing_source": missing_source,
+                        "rule": "missing_ratio_consistent",
+                    }
+                    logger.info(
+                        "Completeness normalized to missing-ratio consistency: %.1f -> %.1f (missing=%s/%s, source=%s).",
+                        current,
+                        completeness,
+                        missing_count,
+                        script_total,
+                        missing_source,
+                    )
+            elif current > max_consistent + 0.6:
+                completeness = round(max_consistent, 1)
+                engine_raw["completeness_adjusted_for_missing"] = {
+                    "from": round(current, 2),
+                    "to": completeness,
+                    "missing_count": int(missing_count),
+                    "script_word_count": int(script_total),
+                    "missing_source": missing_source,
+                }
+                logger.info(
+                    "Completeness adjusted for missing-word consistency: %.1f -> %.1f (missing=%s/%s, source=%s).",
+                    current,
+                    completeness,
+                    missing_count,
+                    script_total,
+                    missing_source,
+                )
+
     scores = Scores(
         pronunciation_100=pronunciation,
         fluency_100=fluency,

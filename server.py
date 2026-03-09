@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import json
+import csv
 import threading
 import re
 import time
@@ -9,11 +10,17 @@ import uuid
 import gzip
 import hmac
 import shutil
+import tempfile
 from collections import Counter
 from typing import Any, Dict, Optional
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import requests
+try:
+    from qcloud_cos import CosConfig, CosS3Client
+except Exception:  # pragma: no cover - optional dependency
+    CosConfig = None  # type: ignore[assignment]
+    CosS3Client = None  # type: ignore[assignment]
 
 # Fix import path to prioritize backend src (inside score_reading) over frontend src
 # This is crucial because both have a 'src' folder
@@ -25,7 +32,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from src.analysis.llm_advisor import get_llm_advisor
 from src.config import config, load_config
+from src.feedback_optimization import (
+    apply_feedback_optimization_result,
+    begin_feedback_optimization,
+    build_feedback_optimization_state,
+    freeze_feedback_optimization,
+    hydrate_scoring_result_for_feedback,
+    mark_feedback_optimization_pending,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +56,8 @@ ADMIN_TOKEN_HEADER = "x-admin-token"
 
 PLAYBOOK_PATH = Path(__file__).parent / "score_reading" / "advice" / "western_pronunciation_playbook.md"
 PLAYBOOK_LOCK = threading.Lock()
+FEEDBACK_OPTIMIZATION_LOCK = threading.Lock()
+FEEDBACK_OPTIMIZATION_INFLIGHT: set[str] = set()
 
 def _load_cors_origins() -> list[str]:
     """
@@ -107,6 +125,11 @@ class FeedbackOverrideRequest(BaseModel):
     integrated_feedback_text: str
     updated_by: Optional[str] = None
 
+
+class FeedbackFreezeBatchRequest(BaseModel):
+    submission_ids: Optional[list[str]] = None
+    reason: Optional[str] = None
+
 class TeacherPhraseCreateRequest(BaseModel):
     text: str
     category: Optional[str] = None
@@ -137,6 +160,11 @@ class WordClipJobRequest(BaseModel):
     clip_seconds: float = 5.0
     source: str = "youglish"
     include_cambridge: bool = True
+
+
+class AnalyticsPgSyncRequest(BaseModel):
+    dry_run: bool = False
+    limit: Optional[int] = None
 
 # --- Async Job System ---
 import asyncio
@@ -179,9 +207,17 @@ WORD_CLIP_PO_TOKEN_PATH = Path("data/yt_po_tokens.json")
 TEACHER_PHRASE_BANK_PATH = Path("data/teacher_phrase_bank.json")
 TEACHER_PHRASE_BANK_LOCK = threading.Lock()
 TEACHER_PHRASE_CATEGORIES = {"praise", "issue", "advice", "encourage"}
+SOS_LIBRARY_ROOT = Path(str(os.getenv("SOS_LIBRARY_ROOT", "data/sos_assets_english_full") or "data/sos_assets_english_full"))
+SOS_LIBRARY_LOCK = threading.Lock()
+SOS_LIBRARY_CACHE: dict[str, Any] | None = None
+SOS_LIBRARY_CACHE_TS = 0.0
+SOS_LIBRARY_CACHE_TTL_SECONDS = 12.0
 PRON_FOCUS_CACHE_LOCK = threading.Lock()
 PRON_FOCUS_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 PRON_FOCUS_CACHE_TTL_SECONDS = 45.0
+COS_SIGN_CLIENT_LOCK = threading.Lock()
+COS_SIGN_CLIENT: Any = None
+COS_SIGN_CLIENT_KEY = ""
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -193,6 +229,29 @@ def _read_float_env(name: str, default: float) -> float:
     except Exception:
         logger.warning("Invalid %s=%r; fallback to %s", name, raw, default)
         return float(default)
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        logger.warning("Invalid %s=%r; fallback to %s", name, raw, default)
+        return int(default)
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Invalid %s=%r; fallback to %s", name, raw, default)
+    return bool(default)
 
 
 WORK_TMP_RETENTION_HOURS = max(0.0, _read_float_env("WORK_TMP_RETENTION_HOURS", 24.0))
@@ -217,6 +276,17 @@ ALLOWED_AUDIO_EXTENSIONS = {
     ".wma",
     ".mp4",
 }
+COS_SIGN_ENABLED = _read_bool_env("COS_SIGN_ENABLED", True)
+COS_SIGN_EXPIRE_SECONDS = max(60, _read_int_env("COS_SIGN_EXPIRE_SECONDS", 7 * 24 * 3600))
+COS_SIGN_REGION = str(os.getenv("COS_SIGN_REGION", os.getenv("COS_REGION", "ap-beijing")) or "ap-beijing").strip()
+COS_SIGN_BUCKET = str(os.getenv("COS_SIGN_BUCKET", os.getenv("COS_BUCKET", "")) or "").strip()
+COS_SIGN_KEY_PREFIX = str(os.getenv("COS_SIGN_KEY_PREFIX", "sos/phonemes") or "sos/phonemes").strip().strip("/")
+COS_SIGN_SECRET_ID = str(
+    os.getenv("COS_SIGN_SECRET_ID", os.getenv("COS_SECRET_ID", os.getenv("TENCENT_SECRET_ID", ""))) or ""
+).strip()
+COS_SIGN_SECRET_KEY = str(
+    os.getenv("COS_SIGN_SECRET_KEY", os.getenv("COS_SECRET_KEY", os.getenv("TENCENT_SECRET_KEY", ""))) or ""
+).strip()
 
 
 def _normalize_po_token_key(value: str) -> str:
@@ -465,6 +535,38 @@ def _sorted_teacher_phrase_items(items: list[Dict[str, Any]]) -> list[Dict[str, 
             str(row.get("text", "")).lower(),
         ),
     )
+
+
+def _delete_teacher_phrase_from_bank(phrase_id: str) -> Dict[str, Any]:
+    phrase_id = str(phrase_id or "").strip()
+    if not phrase_id:
+        raise HTTPException(status_code=400, detail="phrase_id is required")
+
+    now_ts = int(time.time())
+    with TEACHER_PHRASE_BANK_LOCK:
+        bank = _read_teacher_phrase_bank_unlocked()
+        items = list(bank.get("items") or [])
+        kept: list[Dict[str, Any]] = []
+        deleted: Optional[Dict[str, Any]] = None
+
+        for row in items:
+            item = _normalize_teacher_phrase_item(row, now_ts)
+            if not item:
+                continue
+            if item.get("id") != phrase_id:
+                kept.append(item)
+                continue
+            if bool(item.get("builtin")):
+                raise HTTPException(status_code=400, detail="builtin phrase cannot be deleted")
+            deleted = item
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail="phrase_id not found")
+
+        bank["items"] = kept
+        bank["updated_at"] = now_ts
+        _write_json_atomic(TEACHER_PHRASE_BANK_PATH, bank)
+        return deleted
 
 def save_jobs():
     """Persist jobs to disk"""
@@ -1190,6 +1292,54 @@ def restart_backend():
     timer.start()
     return {"status": "restarting", "message": "Backend restart initiated"}
 
+
+@app.post("/api/analytics/pg-sync", dependencies=[Depends(require_admin_token_if_configured)])
+async def trigger_analytics_pg_sync(payload: AnalyticsPgSyncRequest):
+    """
+    Trigger sidecar PG analytics sync.
+    - Does not affect scoring/report generation pipeline.
+    - Reads report JSON from data/out and upserts analytics tables.
+    """
+    dry_run = bool(payload.dry_run)
+    limit = int(payload.limit) if payload.limit is not None else None
+    if limit is not None and limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be > 0")
+
+    dsn = str(os.getenv("PG_ANALYTICS_DSN", "") or os.getenv("DATABASE_URL", "")).strip()
+    if not dry_run and not dsn:
+        raise HTTPException(status_code=400, detail="PG_ANALYTICS_DSN is not configured")
+
+    schema_sql = (Path(__file__).parent / "analytics_pg" / "schema.sql").resolve()
+    if not schema_sql.exists():
+        raise HTTPException(status_code=500, detail=f"Schema SQL not found: {schema_sql}")
+
+    from fastapi.concurrency import run_in_threadpool
+
+    try:
+        from src.analytics.pg_sync import sync_reports_to_pg
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load PG sync module: {exc}") from exc
+
+    try:
+        summary = await run_in_threadpool(
+            sync_reports_to_pg,
+            dsn=dsn,
+            report_root=REPORTS_DIR,
+            schema_sql_path=schema_sql,
+            limit=limit,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        logger.exception("PG analytics sync failed")
+        raise HTTPException(status_code=500, detail=f"PG analytics sync failed: {exc}") from exc
+
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "limit": limit,
+        "summary": summary,
+    }
+
 # Serve Reports (e.g. data/out/demo/demo_report.html -> /reports/demo/demo_report.html)
 REPORTS_DIR = Path("data/out")
 if not REPORTS_DIR.exists():
@@ -1546,6 +1696,100 @@ def _find_report_json_path(submission_id: str) -> Optional[Path]:
     return None
 
 
+def _read_report_payload(json_path: Path) -> dict[str, Any]:
+    current = json.loads(json_path.read_text(encoding="utf-8"))
+    return current if isinstance(current, dict) else {}
+
+
+def _freeze_report_feedback(json_path: Path, *, reason: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    current = _read_report_payload(json_path)
+    state = freeze_feedback_optimization(current, reason=reason)
+    _write_json_atomic(json_path, current)
+    return current, state
+
+
+def _feedback_error_message(advisor_feedback: dict[str, Any] | None) -> str:
+    if not isinstance(advisor_feedback, dict):
+        return ""
+    errors = advisor_feedback.get("_advisor_errors")
+    if isinstance(errors, list):
+        joined = " | ".join(str(item or "").strip() for item in errors if str(item or "").strip())
+        if joined:
+            return joined[:1000]
+    return ""
+
+
+def _should_schedule_feedback_optimization(payload: dict[str, Any]) -> bool:
+    state = build_feedback_optimization_state(payload)
+    if state.get("status") != "pending":
+        return False
+    if str(state.get("current_provider") or "") != "azure_fallback":
+        return False
+    if int(state.get("updated_at", 0) or 0) > 0:
+        return False
+    return bool(str(state.get("current_text") or "").strip())
+
+
+def _run_feedback_optimization(submission_id: str, json_path_str: str) -> None:
+    json_path = Path(json_path_str)
+    try:
+        current = _read_report_payload(json_path)
+        state = begin_feedback_optimization(current)
+        if state.get("status") != "optimizing":
+            return
+        expected_version = int(state.get("version", 0) or 0)
+        _write_json_atomic(json_path, current)
+
+        advisor = get_llm_advisor()
+        result = hydrate_scoring_result_for_feedback(current)
+        _, advisor_feedback = advisor.generate_feedback(result)
+
+        latest = _read_report_payload(json_path)
+        provider = (
+            str((advisor_feedback or {}).get("_advisor_provider") or (advisor_feedback or {}).get("provider") or "")
+            .strip()
+            .lower()
+        )
+        overall_comment = str((advisor_feedback or {}).get("overall_comment", "") or "").strip()
+        if not advisor_feedback or provider == "azure_fallback" or not overall_comment:
+            mark_feedback_optimization_pending(latest, error=_feedback_error_message(advisor_feedback))
+            _write_json_atomic(json_path, latest)
+            return
+
+        updated = apply_feedback_optimization_result(
+            latest,
+            advisor_feedback,
+            expected_version=expected_version,
+        )
+        _write_json_atomic(json_path, updated)
+    except Exception as exc:
+        try:
+            latest = _read_report_payload(json_path)
+            mark_feedback_optimization_pending(latest, error=str(exc))
+            _write_json_atomic(json_path, latest)
+        except Exception:
+            logger.warning("Failed to persist feedback optimization error for %s", submission_id, exc_info=True)
+        logger.warning("Feedback optimization failed for %s: %s", submission_id, exc)
+    finally:
+        with FEEDBACK_OPTIMIZATION_LOCK:
+            FEEDBACK_OPTIMIZATION_INFLIGHT.discard(submission_id)
+
+
+def _schedule_feedback_optimization(submission_id: str, json_path: Path) -> bool:
+    with FEEDBACK_OPTIMIZATION_LOCK:
+        if submission_id in FEEDBACK_OPTIMIZATION_INFLIGHT:
+            return False
+        FEEDBACK_OPTIMIZATION_INFLIGHT.add(submission_id)
+
+    worker_thread = threading.Thread(
+        target=_run_feedback_optimization,
+        args=(submission_id, str(json_path)),
+        daemon=True,
+    )
+    worker_thread.start()
+    return True
+
+
 @app.get("/api/reports/{submission_id}/data")
 async def get_report_data(submission_id: str):
     """
@@ -1666,9 +1910,222 @@ async def get_report_data(submission_id: str):
         except Exception as enrich_err:
             logger.warning(f"Phoneme enrichment skipped: {enrich_err}")
 
+        build_feedback_optimization_state(data)
+        if _should_schedule_feedback_optimization(data):
+            _schedule_feedback_optimization(submission_id, json_path)
+
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read report: {e}")
+
+
+@app.post("/api/reports/{submission_id}/freeze-feedback")
+async def freeze_report_feedback(submission_id: str):
+    _validate_submission_id(submission_id)
+    json_path = _find_report_json_path(submission_id)
+    if not json_path or not json_path.exists():
+        raise HTTPException(status_code=404, detail="Report data not found")
+
+    try:
+        current, state = _freeze_report_feedback(json_path, reason="single_export")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to freeze feedback: {exc}") from exc
+
+    return {
+        "status": "ok",
+        "submission_id": submission_id,
+        "feedback_optimization": state,
+        "feedback_override": current.get("feedback_override"),
+    }
+
+
+@app.post("/api/reports/freeze-feedback-batch")
+async def freeze_report_feedback_batch(payload: FeedbackFreezeBatchRequest):
+    submission_ids = [
+        str(item or "").strip()
+        for item in (payload.submission_ids or [])
+        if str(item or "").strip()
+    ]
+    reason = str(payload.reason or "").strip() or "batch_export"
+    targets: list[tuple[str, Path]] = []
+
+    if submission_ids:
+        for submission_id in submission_ids:
+            _validate_submission_id(submission_id)
+            json_path = _find_report_json_path(submission_id)
+            if json_path and json_path.exists():
+                targets.append((submission_id, json_path))
+    else:
+        targets = [(path.stem, path) for path in REPORTS_DIR.glob("**/*.json") if path.exists()]
+
+    frozen_ids: list[str] = []
+    for submission_id, json_path in targets:
+        try:
+            _freeze_report_feedback(json_path, reason=reason)
+            frozen_ids.append(submission_id)
+        except Exception:
+            logger.warning("Failed to freeze feedback for %s during batch export", submission_id, exc_info=True)
+
+    return {
+        "status": "ok",
+        "reason": reason,
+        "frozen_count": len(frozen_ids),
+        "submission_ids": frozen_ids,
+    }
+
+
+@app.get("/api/reports/{submission_id}/phoneme-videos")
+async def get_report_phoneme_videos(submission_id: str, top_n: int = 3, per_phoneme: int = 2):
+    """
+    根据报告中的 weak_phonemes 自动返回针对性发音视频链接。
+    - 优先返回 COS 签名链接（若配置了 COS 签名参数）
+    - 同时保留本地 /api/sos/assets 链接作为回退
+    """
+    _validate_submission_id(submission_id)
+    json_path = _find_report_json_path(submission_id)
+    if not json_path or not json_path.exists():
+        raise HTTPException(status_code=404, detail="Report data not found")
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read report JSON: {exc}") from exc
+
+    analysis_obj = data.get("analysis") if isinstance(data.get("analysis"), dict) else {}
+    raw_weak = (analysis_obj.get("weak_phonemes") or [])
+    raw_focus_words = (analysis_obj.get("weak_words") or [])
+    focus_words: list[str] = []
+    seen_focus: set[str] = set()
+    for item in raw_focus_words if isinstance(raw_focus_words, list) else []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen_focus:
+            continue
+        seen_focus.add(key)
+        focus_words.append(text)
+        if len(focus_words) >= 12:
+            break
+
+    weak_phonemes: list[str] = []
+    seen_tokens: set[str] = set()
+    for item in raw_weak if isinstance(raw_weak, list) else []:
+        token = str(item or "").strip()
+        if not token:
+            continue
+        key = token.lower()
+        if key in seen_tokens:
+            continue
+        seen_tokens.add(key)
+        weak_phonemes.append(token)
+        if len(weak_phonemes) >= max(1, min(int(top_n or 3), 12)):
+            break
+
+    if not weak_phonemes:
+        return {
+            "submission_id": submission_id,
+            "available": False,
+            "detail": "No weak_phonemes in report",
+            "focus_words": focus_words,
+            "weak_phonemes": [],
+            "items": [],
+        }
+
+    with SOS_LIBRARY_LOCK:
+        index = _sos_load_index()
+    if not bool(index.get("available")):
+        return {
+            "submission_id": submission_id,
+            "available": False,
+            "detail": str(index.get("detail") or "SoS library unavailable"),
+            "focus_words": focus_words,
+            "weak_phonemes": weak_phonemes,
+            "items": [],
+        }
+
+    clipped_per = max(1, min(int(per_phoneme or 2), 4))
+    items: list[dict[str, Any]] = []
+    for phoneme in weak_phonemes:
+        matches = _sos_search_matches(index, phoneme, max(3, clipped_per))
+        if not matches:
+            items.append(
+                {
+                    "phoneme": phoneme,
+                    "matched": False,
+                    "matches": [],
+                }
+            )
+            continue
+
+        best = matches[0]
+        videos = _pick_sos_video_rows(best, clipped_per)
+        items.append(
+            {
+                "phoneme": phoneme,
+                "matched": True,
+                "folder": str(best.get("folder") or ""),
+                "display": str(best.get("display") or ""),
+                "matched_by": str(best.get("matched_by") or ""),
+                "matches": videos,
+            }
+        )
+
+    return {
+        "submission_id": submission_id,
+        "available": True,
+        "cos_signed_enabled": bool(_get_cos_sign_client() is not None),
+        "focus_words": focus_words,
+        "weak_phonemes": weak_phonemes,
+        "items": items,
+    }
+
+
+@app.get("/api/reports/{submission_id}/phoneme-video-message")
+async def get_report_phoneme_video_message(submission_id: str, top_n: int = 3, per_phoneme: int = 2, max_links: int = 3):
+    """
+    生成可直接发送给家长的文本消息（含针对性发音视频链接）。
+    """
+    payload = await get_report_phoneme_videos(submission_id=submission_id, top_n=top_n, per_phoneme=per_phoneme)
+    items = payload.get("items") or []
+    links = _pick_parent_push_links(items if isinstance(items, list) else [], max_links=max_links)
+    focus_words = payload.get("focus_words") or []
+    if not isinstance(focus_words, list):
+        focus_words = []
+
+    json_path = _find_report_json_path(submission_id)
+    student_name = ""
+    if json_path and json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                student_name = str(data.get("student_name") or data.get("student") or "").strip()
+        except Exception:
+            student_name = ""
+
+    weak_phonemes = payload.get("weak_phonemes") or []
+    if not isinstance(weak_phonemes, list):
+        weak_phonemes = []
+
+    message_text = _build_parent_push_message(
+        student_name=student_name,
+        focus_words=[str(x or "").strip() for x in focus_words if str(x or "").strip()],
+        weak_phonemes=[str(x or "") for x in weak_phonemes],
+        links=links,
+    )
+
+    return {
+        "submission_id": submission_id,
+        "student_name": student_name,
+        "focus_words": focus_words,
+        "weak_phonemes": weak_phonemes,
+        "link_count": len(links),
+        "links": links,
+        "message_text": message_text,
+        "source": payload,
+    }
 
 
 @app.post("/api/reports/{submission_id}/feedback-override")
@@ -1835,6 +2292,18 @@ def mark_teacher_phrase_used(payload: TeacherPhraseUseRequest):
         raise HTTPException(status_code=500, detail="Failed to update teacher phrase usage")
 
     raise HTTPException(status_code=404, detail="phrase_id not found")
+
+
+@app.delete("/api/teacher-phrases/{phrase_id}")
+def delete_teacher_phrase(phrase_id: str):
+    try:
+        deleted = _delete_teacher_phrase_from_bank(phrase_id)
+        return {"status": "ok", "deleted": True, "item": deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete teacher phrase: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete teacher phrase")
 
 
 _WORD_TOKEN_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
@@ -2419,6 +2888,7 @@ async def prepare_script_reference(payload: ScriptReferenceRequest):
 
     try:
         from src.pipeline.script_reference import (
+            build_local_script_reference,
             ensure_script_reference_async,
             load_script_reference,
             render_preheat_text,
@@ -2436,9 +2906,10 @@ async def prepare_script_reference(payload: ScriptReferenceRequest):
             and isinstance((cached or {}).get("pace_norm"), dict)
         )
         ensure_script_reference_async(text)
-        ready_data = cached if cached_is_modern else None
+        fallback_data = build_local_script_reference(text, script_hash=script_hash)
+        ready_data = cached if cached_is_modern else fallback_data
 
-        if payload.wait and not ready_data:
+        if payload.wait and cached_is_modern and not ready_data:
             timeout_sec = max(0.0, min(60.0, float(payload.timeout_sec or 0.0)))
             if timeout_sec > 0:
                 ready_data = wait_for_script_reference(text, timeout_sec=timeout_sec)
@@ -2455,6 +2926,7 @@ async def prepare_script_reference(payload: ScriptReferenceRequest):
             "pause_rule_count": len((ready_data or {}).get("pause_rules", []) or []),
             "pace_norm_ready": bool((ready_data or {}).get("pace_norm")),
             "preheat_text": render_preheat_text(text, ready_data) if ready_data else "",
+            "enhancing": not cached_is_modern,
         }
     except Exception as e:
         logger.error(f"Failed to prebuild script reference: {e}")
@@ -2562,6 +3034,485 @@ def _build_youtube_embed_url(video_id: str, start_seconds: float | int | None = 
     return base
 
 
+def _normalize_clip_query(raw_word: str) -> str:
+    text = str(raw_word or "").strip()
+    text = re.sub(r"[^a-zA-Z0-9' -]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:120]
+
+
+def _extract_sos_rel_from_asset_url(asset_url: str) -> str:
+    token = str(asset_url or "").strip()
+    marker = "/api/sos/assets/"
+    idx = token.find(marker)
+    if idx < 0:
+        return ""
+    return _sos_safe_relative_path(token[idx + len(marker) :])
+
+
+def _rel_to_cos_object_key(rel_path: str) -> str:
+    rel = _sos_safe_relative_path(rel_path)
+    if not rel:
+        return ""
+    if rel.startswith("phonemes/"):
+        rel = rel[len("phonemes/") :]
+    prefix = COS_SIGN_KEY_PREFIX.strip("/")
+    if prefix:
+        return f"{prefix}/{rel}"
+    return rel
+
+
+def _get_cos_sign_client() -> Any:
+    global COS_SIGN_CLIENT, COS_SIGN_CLIENT_KEY
+    if not COS_SIGN_ENABLED:
+        return None
+    if not COS_SIGN_BUCKET or not COS_SIGN_REGION or not COS_SIGN_SECRET_ID or not COS_SIGN_SECRET_KEY:
+        return None
+    if CosConfig is None or CosS3Client is None:
+        return None
+
+    cache_key = "|".join([COS_SIGN_REGION, COS_SIGN_BUCKET, COS_SIGN_SECRET_ID, COS_SIGN_SECRET_KEY])
+    with COS_SIGN_CLIENT_LOCK:
+        if COS_SIGN_CLIENT is not None and COS_SIGN_CLIENT_KEY == cache_key:
+            return COS_SIGN_CLIENT
+        try:
+            cfg = CosConfig(
+                Region=COS_SIGN_REGION,
+                SecretId=COS_SIGN_SECRET_ID,
+                SecretKey=COS_SIGN_SECRET_KEY,
+                Scheme="https",
+            )
+            COS_SIGN_CLIENT = CosS3Client(cfg)
+            COS_SIGN_CLIENT_KEY = cache_key
+            return COS_SIGN_CLIENT
+        except Exception as exc:
+            logger.warning("COS sign client init failed: %s", exc)
+            COS_SIGN_CLIENT = None
+            COS_SIGN_CLIENT_KEY = ""
+            return None
+
+
+def _build_signed_cos_url_from_rel(rel_path: str, expire_seconds: Optional[int] = None) -> str:
+    client = _get_cos_sign_client()
+    if client is None:
+        return ""
+    key = _rel_to_cos_object_key(rel_path)
+    if not key:
+        return ""
+    ttl = max(60, int(expire_seconds or COS_SIGN_EXPIRE_SECONDS))
+    try:
+        return str(
+            client.get_presigned_download_url(
+                Bucket=COS_SIGN_BUCKET,
+                Key=key,
+                Expired=ttl,
+                SignHost=True,
+            )
+            or ""
+        ).strip()
+    except Exception as exc:
+        logger.warning("COS signed URL generation failed for %s: %s", key, exc)
+        return ""
+
+
+SOS_PHONEME_FOLDER_MAP: dict[str, list[str]] = {
+    "p": ["p-sound"],
+    "b": ["b-sound"],
+    "t": ["t-sound"],
+    "d": ["d-sound"],
+    "k": ["k-sound"],
+    "g": ["g-sound"],
+    "f": ["f-sound"],
+    "v": ["v-sound"],
+    "s": ["s-sound"],
+    "z": ["z-sound"],
+    "h": ["h-sound"],
+    "m": ["m-sound"],
+    "n": ["n-sound"],
+    "ng": ["ng-sound"],
+    "l": ["l-sound"],
+    "r": ["r-sound"],
+    "th": ["theta-sound"],
+    "dh": ["eth-sound"],
+    "sh": ["sch-sound"],
+    "zh": ["zh-sound"],
+    "ch": ["ch-sound"],
+    "j": ["y-sound"],
+    "jh": ["dzh-sound"],
+    "w": ["w-sound"],
+    "y": ["y-sound"],
+    "theta": ["theta-sound"],
+    "eth": ["eth-sound"],
+    "dzh": ["dzh-sound"],
+    "dj": ["dzh-sound"],
+    "ae": ["ae-sound"],
+    "a": ["short-a-sound", "long-a-sound"],
+    "e": ["short-e-sound", "long-e-sound"],
+    "i": ["short-i-sound", "long-e-sound", "i-sound"],
+    "o": ["short-o-sound", "long-o-sound"],
+    "u": ["short-u-sound", "long-u-sound", "long-ue-sound"],
+    "schwa": ["schwa-sound"],
+    "er": ["er-sound"],
+    "ai": ["ai-sound"],
+    "au": ["au-sound"],
+    "oi": ["oi-sound"],
+    "glottal": ["glottal-stop"],
+}
+
+
+def _normalize_sos_phoneme_token(raw: str) -> str:
+    token = str(raw or "").strip().lower()
+    token = token.replace("/", "").replace(" ", "")
+    substitutions = {
+        "tʃ": "ch",
+        "dʒ": "jh",
+        "θ": "th",
+        "ð": "dh",
+        "ʃ": "sh",
+        "ʒ": "zh",
+        "ŋ": "ng",
+        "æ": "ae",
+        "ə": "schwa",
+        "ɚ": "er",
+        "ɝ": "er",
+        "ɑ": "a",
+        "ɒ": "o",
+        "ɔ": "o",
+        "ʌ": "u",
+        "ʊ": "u",
+        "ɪ": "i",
+        "ː": "",
+    }
+    for src, dst in substitutions.items():
+        token = token.replace(src, dst)
+    token = re.sub(r"[^a-z0-9-]+", "", token)
+    return token
+
+
+def _sos_safe_relative_path(raw: str) -> str:
+    token = unquote(str(raw or "")).strip().replace("\\", "/")
+    token = token.lstrip("/")
+    if not token or ".." in token.split("/"):
+        return ""
+    return token
+
+
+def _sos_load_index(force: bool = False) -> dict[str, Any]:
+    global SOS_LIBRARY_CACHE, SOS_LIBRARY_CACHE_TS
+    now = time.time()
+    if not force and SOS_LIBRARY_CACHE and (now - SOS_LIBRARY_CACHE_TS) < SOS_LIBRARY_CACHE_TTL_SECONDS:
+        return SOS_LIBRARY_CACHE
+
+    root = SOS_LIBRARY_ROOT
+    manifest = root / "manifest.csv"
+    if not root.exists() or not manifest.exists():
+        payload = {
+            "available": False,
+            "detail": f"SoS library not found at {root}",
+            "root": str(root),
+            "folder_count": 0,
+            "file_count": 0,
+            "folders": [],
+        }
+        SOS_LIBRARY_CACHE = payload
+        SOS_LIBRARY_CACHE_TS = now
+        return payload
+
+    folder_rows: dict[str, dict[str, Any]] = {}
+    file_count = 0
+    with manifest.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            status = str(row.get("status") or "").strip().lower()
+            if not status.startswith("ok"):
+                continue
+            folder = str(row.get("folder") or "").strip()
+            kind = str(row.get("kind") or "").strip()
+            rel = _sos_safe_relative_path(str(row.get("saved_path") or ""))
+            if not folder or not kind or not rel:
+                continue
+            fp = root / rel
+            if not fp.exists() or not fp.is_file():
+                continue
+            row_obj = folder_rows.setdefault(
+                folder,
+                {
+                    "folder": folder,
+                    "label": folder.replace("-sound", "").replace("-", " "),
+                    "kinds": {},
+                },
+            )
+            row_obj["kinds"][kind] = {
+                "rel_path": rel,
+                "url": f"/api/sos/assets/{quote(rel, safe='/')}",
+            }
+            file_count += 1
+
+    folders = sorted(folder_rows.values(), key=lambda item: str(item.get("folder") or ""))
+    payload = {
+        "available": len(folders) > 0,
+        "root": str(root),
+        "folder_count": len(folders),
+        "file_count": file_count,
+        "folders": folders,
+    }
+    SOS_LIBRARY_CACHE = payload
+    SOS_LIBRARY_CACHE_TS = now
+    return payload
+
+
+def _sos_pick_preview_urls(kinds: dict[str, Any]) -> tuple[str, str, list[str]]:
+    animation_url = str(((kinds.get("animation") or {}).get("url")) or "")
+    sound_url = str(((kinds.get("sound") or {}).get("url")) or "")
+    samples: list[str] = []
+    for key in ("word1", "word2", "word3", "word4", "word"):
+        url = str(((kinds.get(key) or {}).get("url")) or "")
+        if url and url not in samples:
+            samples.append(url)
+    return animation_url, sound_url, samples
+
+
+def _sos_search_matches(index: dict[str, Any], raw_token: str, limit: int) -> list[dict[str, Any]]:
+    folders = list(index.get("folders") or [])
+    token = _normalize_sos_phoneme_token(raw_token)
+    if not token:
+        out = []
+        for row in folders[: max(1, min(limit, 12))]:
+            kinds = dict(row.get("kinds") or {})
+            animation_url, sound_url, samples = _sos_pick_preview_urls(kinds)
+            out.append(
+                {
+                    "folder": row.get("folder"),
+                    "display": row.get("label") or row.get("folder"),
+                    "matched_by": "default",
+                    "animation_url": animation_url,
+                    "sound_url": sound_url,
+                    "sample_urls": samples,
+                }
+            )
+        return out
+
+    alias_targets = SOS_PHONEME_FOLDER_MAP.get(token, [])
+    alias_set = set(alias_targets)
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for row in folders:
+        folder = str(row.get("folder") or "")
+        if not folder:
+            continue
+        base = folder.replace("-sound", "")
+        compact = re.sub(r"[^a-z0-9]+", "", folder.lower())
+        base_compact = re.sub(r"[^a-z0-9]+", "", base.lower())
+
+        score = -1
+        matched_by = ""
+        if folder in alias_set:
+            score = 100
+            matched_by = "alias"
+        elif token == base_compact:
+            score = 90
+            matched_by = "exact"
+        elif token in base_compact:
+            score = 80
+            matched_by = "contains"
+        elif token in compact:
+            score = 72
+            matched_by = "folder"
+        elif any(part.startswith(token) for part in folder.lower().split("-")):
+            score = 64
+            matched_by = "prefix"
+        elif token and len(token) >= 2 and any(token in part for part in folder.lower().split("-")):
+            score = 58
+            matched_by = "partial"
+        if score < 0:
+            continue
+
+        kinds = dict(row.get("kinds") or {})
+        animation_url, sound_url, samples = _sos_pick_preview_urls(kinds)
+        scored.append(
+            (
+                score,
+                {
+                    "folder": folder,
+                    "display": row.get("label") or folder,
+                    "matched_by": matched_by,
+                    "animation_url": animation_url,
+                    "sound_url": sound_url,
+                    "sample_urls": samples,
+                },
+            )
+        )
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored[: max(1, min(limit, 24))]]
+
+
+def _pick_sos_video_rows(match: dict[str, Any], per_phoneme: int) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    candidates: list[tuple[str, str]] = []
+    animation_url = str(match.get("animation_url") or "").strip()
+    sound_url = str(match.get("sound_url") or "").strip()
+    if animation_url:
+        candidates.append(("animation", animation_url))
+    if sound_url:
+        candidates.append(("sound", sound_url))
+    for url in list(match.get("sample_urls") or []):
+        token = str(url or "").strip()
+        if token:
+            candidates.append(("word", token))
+
+    for kind, local_url in candidates:
+        rel = _extract_sos_rel_from_asset_url(local_url)
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        signed_url = _build_signed_cos_url_from_rel(rel)
+        rows.append(
+            {
+                "kind": kind,
+                "local_url": local_url,
+                "asset_rel_path": rel,
+                "signed_url": signed_url,
+            }
+        )
+        if len(rows) >= max(1, per_phoneme):
+            break
+    return rows
+
+
+def _pick_parent_push_links(items: list[dict[str, Any]], max_links: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    limit = max(1, min(int(max_links or 3), 8))
+    for row in items:
+        phoneme = str(row.get("phoneme") or "").strip() or "Key Sound"
+        matches = row.get("matches") or []
+        if not isinstance(matches, list):
+            continue
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            url = str(match.get("signed_url") or match.get("local_url") or "").strip()
+            if not url:
+                continue
+            kind = str(match.get("kind") or "video").strip()
+            out.append(
+                {
+                    "phoneme": phoneme,
+                    "kind": kind,
+                    "url": url,
+                }
+            )
+            break
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _build_parent_push_message(
+    *,
+    student_name: str,
+    focus_words: list[str],
+    weak_phonemes: list[str],
+    links: list[dict[str, str]],
+) -> str:
+    _ = student_name
+    _ = focus_words  # Keep signature stable for callers.
+
+    phoneme_text = "、".join(
+        f"/{str(x or '').strip()}/" for x in weak_phonemes if str(x or "").strip()
+    ) or "（本次无明显弱读音素）"
+
+    video_parts: list[str] = []
+    for link in links:
+        phoneme = str(link.get("phoneme") or "Key Sound").strip()
+        url = str(link.get("url") or "").strip()
+        if not url:
+            continue
+        video_parts.append(f"{phoneme}: {url}")
+    video_text = "；".join(video_parts) if video_parts else "（暂无可用视频链接）"
+
+    lines = [
+        "家长您好！以下是孩子发音时需要注意的：",
+        f"弱读音素：{phoneme_text}",
+        f"对应发音示范视频：{video_text}",
+    ]
+    return "\\n".join(lines)
+def _resolve_precise_keyword_starts(
+    *,
+    word: str,
+    source_rows: list[Any],
+    max_items: int,
+) -> tuple[dict[str, tuple[float, str]], str]:
+    try:
+        from src.tools.word_clip_compiler import (  # type: ignore
+            _asr_keyword_window_starts,
+            _download_video_and_vtt,
+            _find_match_indexes,
+            _parse_vtt_file,
+        )
+    except Exception as exc:
+        return {}, f"precise locator unavailable: {str(exc)[:180]}"
+
+    resolved: dict[str, tuple[float, str]] = {}
+    warning = ""
+    if not source_rows or max_items <= 0:
+        return resolved, warning
+
+    max_scan = max(4, min(10, max_items + 2))
+    with tempfile.TemporaryDirectory(prefix="wordclip_precise_") as tmpdir:
+        target_dir = Path(tmpdir)
+        slot = 0
+        for row in source_rows:
+            if len(resolved) >= max_items:
+                break
+            if slot >= max_scan:
+                break
+            raw_url = str(getattr(row, "url", "") or "").strip()
+            if not raw_url:
+                continue
+            video_id = _extract_youtube_video_id(raw_url)
+            if not video_id or video_id in resolved:
+                continue
+
+            slot += 1
+            try:
+                bundle = _download_video_and_vtt(row, target_dir, slot)
+            except Exception as exc:
+                text = str(exc).strip()
+                if text:
+                    warning = (warning + f" | {text[:120]}").strip(" |")
+                continue
+            if not bundle:
+                continue
+
+            video_path, vtt_path = bundle
+            start_seconds: float | None = None
+            timing_source = ""
+            if vtt_path and vtt_path.exists():
+                try:
+                    cues = _parse_vtt_file(vtt_path)
+                    matches = _find_match_indexes(cues, word, max_count=1)
+                    if matches:
+                        cue = cues[matches[0]]
+                        start_seconds = max(0.0, float(cue.start))
+                        timing_source = "subtitle"
+                except Exception:
+                    start_seconds = None
+                    timing_source = ""
+            if start_seconds is None:
+                try:
+                    starts = _asr_keyword_window_starts(video_path, word, max_count=1)
+                except Exception:
+                    starts = []
+                if starts:
+                    start_seconds = max(0.0, float(starts[0]))
+                    timing_source = "asr"
+
+            if start_seconds is not None:
+                resolved[video_id] = (start_seconds, timing_source or "heuristic")
+    return resolved, warning
+
+
 def _parse_youglish_snapshot(markdown_text: str, *, max_nearby: int = 12) -> dict[str, Any]:
     text = str(markdown_text or "")
     count = 0
@@ -2631,7 +3582,7 @@ def _parse_youglish_snapshot(markdown_text: str, *, max_nearby: int = 12) -> dic
 
 @app.get("/api/word-clips/youglish-snapshot")
 async def get_youglish_snapshot(word: str, limit: int = 12):
-    token = re.sub(r"[^a-zA-Z'-]+", "", (word or "").strip())
+    token = _normalize_clip_query(word)
     if not token:
         raise HTTPException(status_code=400, detail="word is required")
 
@@ -2667,8 +3618,8 @@ async def get_youglish_snapshot(word: str, limit: int = 12):
 
 
 @app.get("/api/word-clips/online-sources")
-async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = "all"):
-    token = re.sub(r"[^a-zA-Z'-]+", "", (word or "").strip())
+async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = "all", precise: bool = False):
+    token = _normalize_clip_query(word)
     if not token:
         raise HTTPException(status_code=400, detail="word is required")
 
@@ -2712,6 +3663,16 @@ async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = 
             detail = f"Online source search failed: {exc}"
             raise HTTPException(status_code=502, detail=detail[:500]) from exc
 
+    precise_map: dict[str, tuple[float, str]] = {}
+    if precise:
+        precise_map, precise_warning = _resolve_precise_keyword_starts(
+            word=token,
+            source_rows=source_rows,
+            max_items=clipped_limit,
+        )
+        if precise_warning:
+            warning = (warning + f" | {precise_warning}").strip(" |")
+
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in source_rows:
@@ -2721,7 +3682,9 @@ async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = 
         vid = _extract_youtube_video_id(raw_url)
         if not vid:
             continue
-        start = float(getattr(row, "start_seconds", 0.0) or 0.0)
+        default_start = float(getattr(row, "start_seconds", 0.0) or 0.0)
+        precise_entry = precise_map.get(vid)
+        start = float(precise_entry[0]) if precise_entry else default_start
         bucket = int(round(start))
         dedupe_key = f"{vid}:{bucket}"
         if dedupe_key in seen:
@@ -2738,6 +3701,8 @@ async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = 
                 "embed_url": embed_url,
                 "start_seconds": bucket,
                 "source_type": str(getattr(row, "source_type", "") or source_name),
+                "timing_source": precise_entry[1] if precise_entry else ("youglish_hint" if default_start > 0 else "none"),
+                "has_precise_timing": bool(precise_entry),
             }
         )
         if len(items) >= clipped_limit:
@@ -2751,6 +3716,59 @@ async def get_word_clip_online_sources(word: str, limit: int = 8, accent: str = 
         "warning": warning,
         "items": items,
     }
+
+
+@app.get("/api/sos/status")
+async def get_sos_status():
+    with SOS_LIBRARY_LOCK:
+        payload = _sos_load_index()
+    return {
+        "available": bool(payload.get("available")),
+        "root": str(payload.get("root") or ""),
+        "folder_count": int(payload.get("folder_count") or 0),
+        "file_count": int(payload.get("file_count") or 0),
+        "detail": str(payload.get("detail") or ""),
+    }
+
+
+@app.get("/api/sos/search")
+async def search_sos_assets(phoneme: str = "", q: str = "", limit: int = 8):
+    query_token = str(phoneme or q or "").strip()
+    clipped_limit = max(1, min(int(limit or 8), 24))
+    with SOS_LIBRARY_LOCK:
+        payload = _sos_load_index()
+    if not bool(payload.get("available")):
+        return {
+            "available": False,
+            "query": query_token,
+            "count": 0,
+            "matches": [],
+            "detail": str(payload.get("detail") or "SoS library unavailable"),
+        }
+    matches = _sos_search_matches(payload, query_token, clipped_limit)
+    return {
+        "available": True,
+        "query": query_token,
+        "count": len(matches),
+        "matches": matches,
+    }
+
+
+@app.get("/api/sos/assets/{asset_path:path}")
+async def get_sos_asset(asset_path: str):
+    rel = _sos_safe_relative_path(asset_path)
+    if not rel:
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+    root = SOS_LIBRARY_ROOT.resolve()
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid asset path") from exc
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Asset not found")
+    media_type = "video/mp4" if target.suffix.lower() == ".mp4" else None
+    return FileResponse(path=target, filename=target.name, media_type=media_type)
 
 
 @app.post("/api/word-clips/po-token/extract-har")
@@ -3465,7 +4483,44 @@ async def rescore_job(job_id: str):
                 break
     
     original_file_path = None
+    original_text = ""
     original_filename = "unknown.mp3"
+    upload_root = Path("data/uploads")
+    recovered_engine_used = ""
+
+    def _load_report_script_snapshot(submission_id: str) -> tuple[str, bool, str]:
+        if not submission_id:
+            return "", True, ""
+        try:
+            candidates = list(REPORTS_DIR.glob(f"**/{submission_id}/{submission_id}.json"))
+        except Exception:
+            candidates = []
+        for report_json in candidates:
+            try:
+                payload = json.loads(report_json.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            script = str(payload.get("script_text") or "").strip()
+            meta = payload.get("meta") if isinstance(payload, dict) else {}
+            is_auto = bool((meta or {}).get("is_auto_transcribed", True))
+            engine_used = str((meta or {}).get("engine_used") or "").strip().lower()
+            if script and not is_auto:
+                return script, is_auto, engine_used
+        # Fallback: if only auto-transcribed reports are available, don't force script.
+        return "", True, ""
+
+    def find_submission_audio(submission_id: str) -> Optional[Path]:
+        if not submission_id:
+            return None
+        if not upload_root.exists():
+            return None
+        for path in upload_root.glob(f"**/{submission_id}.*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in ALLOWED_AUDIO_EXTENSIONS:
+                continue
+            return path
+        return None
     
     if target_job:
         # Known job, try to find its file in data/uploads/...
@@ -3476,22 +4531,44 @@ async def rescore_job(job_id: str):
         # We don't know date_str easily from Job unless we check timestamp or search.
         
         # Strategy: Search for the file in data/uploads
-        upload_root = Path("data/uploads")
-        for path in upload_root.glob(f"**/{target_job.submission_id}.*"):
-            original_file_path = path
+        original_file_path = find_submission_audio(target_job.submission_id)
+        if original_file_path is not None:
             original_filename = target_job.filename
-            break
-            
+            txt_path = original_file_path.with_suffix(".txt")
+            if txt_path.exists():
+                try:
+                    original_text = txt_path.read_text(encoding="utf-8")
+                except Exception:
+                    original_text = ""
+            if not original_text.strip():
+                recovered_text, _recovered_auto, recovered_engine = _load_report_script_snapshot(
+                    target_job.submission_id
+                )
+                if recovered_text:
+                    original_text = recovered_text
+                if recovered_engine:
+                    recovered_engine_used = recovered_engine
+             
     else:
         # Job might be gone (restarted server), but report exists?
         # If passed ID is a submission_id (from report list UI)
         submission_id = job_id
-        upload_root = Path("data/uploads")
-        # Find file
-        for path in upload_root.glob(f"**/{submission_id}.*"):
-            original_file_path = path
-            original_filename = f"{submission_id}.mp3" # Fallback
-            break
+        # Find audio file only
+        original_file_path = find_submission_audio(submission_id)
+        if original_file_path is not None:
+            original_filename = f"{submission_id}{original_file_path.suffix}"  # Fallback
+            txt_path = original_file_path.with_suffix(".txt")
+            if txt_path.exists():
+                try:
+                    original_text = txt_path.read_text(encoding="utf-8")
+                except Exception:
+                    original_text = ""
+            if not original_text.strip():
+                recovered_text, _recovered_auto, recovered_engine = _load_report_script_snapshot(submission_id)
+                if recovered_text:
+                    original_text = recovered_text
+                if recovered_engine:
+                    recovered_engine_used = recovered_engine
             
     if not original_file_path or not original_file_path.exists():
         raise HTTPException(status_code=404, detail="Original audio file not found. Cannot rescore.")
@@ -3547,6 +4624,9 @@ async def rescore_job(job_id: str):
     try:
         shutil.copy2(original_file_path, new_file_path)
         logger.info(f"Rescore: Copied {original_file_path} to {new_file_path}")
+        if original_text.strip():
+            new_txt_path = new_file_path.with_suffix(".txt")
+            new_txt_path.write_text(original_text, encoding="utf-8")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to copy file: {e}")
         
@@ -3593,14 +4673,24 @@ async def rescore_job(job_id: str):
     JOBS[new_job_id] = job
     save_jobs()
     
+    try:
+        target_mode = EngineMode(str(target_job.mode or "auto").lower()) if target_job else EngineMode.AUTO
+    except Exception:
+        target_mode = EngineMode.AUTO
+    if target_mode == EngineMode.AUTO and recovered_engine_used:
+        try:
+            target_mode = EngineMode(recovered_engine_used)
+        except Exception:
+            pass
+
     metadata = {
         "student_id": student_id,
         "task_id": task_id,
         "submission_id": new_submission_id,
-        "engine_mode": EngineMode.AUTO # Force auto or reuse? Reuse is hard if we don't store it. Auto is safe.
+        "engine_mode": target_mode
     }
     
-    await JOB_QUEUE.put((new_job_id, new_file_path, "", "auto", metadata))
+    await JOB_QUEUE.put((new_job_id, new_file_path, original_text, target_mode.value, metadata))
     logger.info(f"Rescore job {new_job_id} queued for {new_submission_id} (derived from {job_id})")
     
     return {

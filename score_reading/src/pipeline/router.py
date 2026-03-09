@@ -63,11 +63,18 @@ def select_engine(
     if requested_mode != EngineMode.AUTO:
         logger.info(f"使用指定引擎: {requested_mode.value}")
         return requested_mode
+
+    # Honor explicit accuracy preference first.
+    # When Pro is preferred, keep cloud path as primary instead of early local downgrade.
+    use_pro = config.get("engines.pro.prefer_pro_mode", True)
+    if use_pro:
+        logger.info("配置要求优先使用 Pro 高精度引擎")
+        return EngineMode.PRO
     
     # Auto 模式：根据音频质量选择
     min_duration = config.get("quality_thresholds.min_duration_sec", 2.5)
-    max_silence = config.get("quality_thresholds.max_silence_ratio", 0.6)
-    min_rms = config.get("quality_thresholds.min_rms_db", -35)
+    max_silence = config.get("quality_thresholds.max_silence_ratio", 0.85)
+    min_rms = config.get("quality_thresholds.min_rms_db", -60)
     
     # 检查是否应该使用 fast 引擎
     if audio_metrics.duration_sec < min_duration:
@@ -82,12 +89,6 @@ def select_engine(
         logger.info(f"RMS {audio_metrics.rms_db:.1f}dB < {min_rms}dB，选择 fast 引擎")
         return EngineMode.FAST
     
-    # 默认策略：质量好的音频优先使用 STANDARD 或 PRO
-    use_pro = config.get("engines.pro.prefer_pro_mode", False)
-    if use_pro:
-        logger.info("配置要求优先使用 Pro 高精度引擎")
-        return EngineMode.PRO
-        
     # 默认使用 wav2vec2 引擎 (代替 Kaldi STANDARD)
     logger.info("音频质量良好，选择 wav2vec2 引擎 (Standard Alternative)")
     return EngineMode.WAV2VEC2

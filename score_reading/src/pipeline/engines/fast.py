@@ -79,7 +79,7 @@ class FastEngine:
         
         with open(wav_path, "rb") as audio_file:
             files = {"audio": ("audio.wav", audio_file, "audio/wav")}
-            data = {"transcript": script_text}
+            data = {"transcript": script_text, "async": "false"}
             
             response = httpx.post(
                 url,
@@ -89,8 +89,26 @@ class FastEngine:
                 follow_redirects=True,
             )
             response.raise_for_status()
-            
-            return response.json()
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "application/json" in content_type:
+                return response.json()
+
+            # Gentle web UI may return HTML after redirect.
+            # Pull structured alignment from task-level align.json explicitly.
+            final_url = str(response.url)
+            if final_url.endswith("/"):
+                align_url = f"{final_url}align.json"
+            else:
+                align_url = f"{final_url}/align.json"
+
+            align_response = httpx.get(
+                align_url,
+                timeout=self.timeout,
+                follow_redirects=True,
+            )
+            align_response.raise_for_status()
+            return align_response.json()
     
     def _parse_gentle_result(
         self,

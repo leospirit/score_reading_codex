@@ -1,16 +1,10 @@
-"""
-口语评分 CLI 框架 - 数据模型定义
-
-定义统一的数据结构，用于在各模块间传递数据。
-"""
-from dataclasses import dataclass, field
+﻿from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any
 
 
 class EngineMode(str, Enum):
-    """评分引擎模式"""
     AUTO = "auto"
     FAST = "fast"
     PRO = "pro"
@@ -21,7 +15,6 @@ class EngineMode(str, Enum):
 
 
 class WordTag(str, Enum):
-    """词级评分标签"""
     OK = "ok"
     WEAK = "weak"
     MISSING = "missing"
@@ -29,7 +22,6 @@ class WordTag(str, Enum):
 
 
 class PhonemeTag(str, Enum):
-    """音素级评分标签"""
     OK = "ok"
     WEAK = "weak"
     POOR = "poor"
@@ -37,7 +29,6 @@ class PhonemeTag(str, Enum):
 
 @dataclass
 class AudioMetrics:
-    """音频质量指标"""
     duration_sec: float
     silence_ratio: float
     rms_db: float
@@ -46,10 +37,9 @@ class AudioMetrics:
 
 @dataclass
 class PauseInfo:
-    """鍋滈】淇℃伅"""
-    type: str  # good, bad, optional, missed
+    type: str
     duration: float = 0.0
-    issue: str = ""  # too_long / too_short
+    issue: str = ""
     target_min: float = 0.0
     target_max: float = 0.0
     adjust_sec: float = 0.0
@@ -58,23 +48,22 @@ class PauseInfo:
 
 @dataclass
 class WordAlignment:
-    """词对齐信息"""
     word: str
     start: float
     end: float
     tag: WordTag = WordTag.OK
     score: float = 100.0
-    pause: PauseInfo | None = None  # 单词后的停顿信息
-    stress: float = 0.0  # 单词重音强度 (0.0 - 1.0)
-    is_linked: bool = False  # 是否与下一个词连读
-    expected_stress: float = 0.5  # 期望重音强度 (Native Speaker 参考)
-    diagnosis: str = ""  # AI 补充的诊断信息 (例如: "原文识别为 frine")
-    phonemes: list["PhonemeAlignment"] = field(default_factory=list) # 音素级对齐详情
+    pause: PauseInfo | None = None
+    stress: float = 0.0
+    prominence_score: float = 0.0
+    is_linked: bool = False
+    expected_stress: float = 0.5
+    diagnosis: str = ""
+    phonemes: list["PhonemeAlignment"] = field(default_factory=list)
 
 
 @dataclass
 class PhonemeAlignment:
-    """音素对齐信息"""
     phoneme: str
     start: float
     end: float
@@ -85,14 +74,12 @@ class PhonemeAlignment:
 
 @dataclass
 class Alignment:
-    """完整对齐信息"""
     words: list[WordAlignment] = field(default_factory=list)
     phonemes: list[PhonemeAlignment] = field(default_factory=list)
 
 
 @dataclass
 class Scores:
-    """评分结果（0-100 分制）"""
     overall_100: float = 0.0
     pronunciation_100: float = 0.0
     fluency_100: float = 0.0
@@ -102,7 +89,6 @@ class Scores:
 
 @dataclass
 class Confusion:
-    """音素混淆记录"""
     expected: str
     got: str
     count: int = 1
@@ -110,58 +96,52 @@ class Confusion:
 
 @dataclass
 class PacePoint:
-    """语速数据点 (Time vs WPM)"""
     x: float
     y: int
 
 
 @dataclass
 class PitchPoint:
-    """语调数据点 (Time vs F0)"""
     t: float
     f0: float
 
 
 @dataclass
 class HesitationStats:
-    """迟疑与口癖分析"""
     score_label: str
     desc: str
-    fillers: list[dict] = field(default_factory=list)  # [{"word": "uh", "count": 2}]
-    examples: list[dict] = field(default_factory=list) # [{"original": "...", "corrected": "..."}]
+    fillers: list[dict] = field(default_factory=list)
+    examples: list[dict] = field(default_factory=list)
     tips: list[str] = field(default_factory=list)
 
 
 @dataclass
 class CompletenessStats:
-    """完整度分析"""
     title: str = "Completeness"
     score_label: str = ""
     coverage: int = 0
-    missing_stats: dict = field(default_factory=dict) # {total: 3, keywords: 0, function_words: 3}
+    missing_stats: dict = field(default_factory=dict)
     insight: str = ""
     tips: list[str] = field(default_factory=list)
 
 
 @dataclass
 class Analysis:
-    """分析结果"""
     weak_words: list[str] = field(default_factory=list)
     weak_phonemes: list[str] = field(default_factory=list)
     missing_words: list[str] = field(default_factory=list)
+    missing_indices: list[int] = field(default_factory=list)
     confusions: list[Confusion] = field(default_factory=list)
-    mistakes: list[dict] = field(default_factory=list)  # 具体错误描述
-    
-    # New Fields for Advanced UI
+    mistakes: list[dict] = field(default_factory=list)
     pace_chart_data: list[PacePoint] = field(default_factory=list)
-    pitch_contour: list[PitchPoint] = field(default_factory=list)  # 语调曲线数据
+    pitch_contour: list[PitchPoint] = field(default_factory=list)
     hesitations: HesitationStats | None = None
     completeness: CompletenessStats | None = None
+    intonation_analysis: dict[str, Any] | None = None
 
 
 @dataclass
 class Feedback:
-    """反馈建议"""
     cn_summary: str = ""
     cn_actions: list[str] = field(default_factory=list)
     practice: list[str] = field(default_factory=list)
@@ -169,7 +149,6 @@ class Feedback:
 
 @dataclass
 class Meta:
-    """元数据"""
     task_id: str = ""
     student_id: str = ""
     student_name: str = ""
@@ -183,11 +162,6 @@ class Meta:
 
 @dataclass
 class ScoringResult:
-    """
-    完整评分结果
-    
-    这是整个评分流程的最终输出，包含所有信息。
-    """
     meta: Meta = field(default_factory=Meta)
     audio: AudioMetrics | None = None
     script_text: str = ""
@@ -196,11 +170,10 @@ class ScoringResult:
     alignment: Alignment = field(default_factory=Alignment)
     analysis: Analysis = field(default_factory=Analysis)
     feedback: Feedback = field(default_factory=Feedback)
-    advisor_feedback: dict[str, Any] | None = None  # AI 老师完整点评数据
+    advisor_feedback: dict[str, Any] | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为字典格式（用于 JSON 输出）"""
         return {
             "meta": {
                 "task_id": self.meta.task_id,
@@ -236,8 +209,18 @@ class ScoringResult:
                         "end": round(w.end, 3),
                         "tag": w.tag.value,
                         "score": round(w.score, 1),
-                        "pause": {"type": w.pause.type, "duration": w.pause.duration, "issue": w.pause.issue, "target_min": w.pause.target_min, "target_max": w.pause.target_max, "adjust_sec": w.pause.adjust_sec, "expected_type": w.pause.expected_type} if w.pause else None,
+                        "pause": {
+                            "type": w.pause.type,
+                            "duration": w.pause.duration,
+                            "issue": w.pause.issue,
+                            "target_min": w.pause.target_min,
+                            "target_max": w.pause.target_max,
+                            "adjust_sec": w.pause.adjust_sec,
+                            "expected_type": w.pause.expected_type,
+                        } if w.pause else None,
                         "stress": w.stress,
+                        "prominence_score": w.prominence_score,
+                        "expected_stress": w.expected_stress,
                         "is_linked": w.is_linked,
                         "diagnosis": w.diagnosis,
                     }
@@ -259,6 +242,7 @@ class ScoringResult:
                 "weak_words": self.analysis.weak_words,
                 "weak_phonemes": self.analysis.weak_phonemes,
                 "missing_words": self.analysis.missing_words,
+                "missing_indices": self.analysis.missing_indices,
                 "confusions": [
                     {"expected": c.expected, "got": c.got, "count": c.count}
                     for c in self.analysis.confusions
@@ -271,7 +255,7 @@ class ScoringResult:
                     "desc": self.analysis.hesitations.desc,
                     "fillers": self.analysis.hesitations.fillers,
                     "examples": self.analysis.hesitations.examples,
-                    "tips": self.analysis.hesitations.tips
+                    "tips": self.analysis.hesitations.tips,
                 } if self.analysis.hesitations else None,
                 "completeness": {
                     "title": self.analysis.completeness.title,
@@ -279,8 +263,9 @@ class ScoringResult:
                     "coverage": self.analysis.completeness.coverage,
                     "missing_stats": self.analysis.completeness.missing_stats,
                     "insight": self.analysis.completeness.insight,
-                    "tips": self.analysis.completeness.tips
+                    "tips": self.analysis.completeness.tips,
                 } if self.analysis.completeness else None,
+                "intonation_analysis": self.analysis.intonation_analysis,
             },
             "feedback": {
                 "cn_summary": self.feedback.cn_summary,

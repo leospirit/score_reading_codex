@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BookOpen, Download, ExternalLink, Loader2, Search, SlidersHorizontal, Subtitles, Upload, Video } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 import { API_HOST } from '../config/api';
 
 type WordClipStatus = 'queued' | 'processing' | 'completed' | 'failed';
@@ -42,6 +43,8 @@ interface OnlineClipItem {
     embed_url: string;
     start_seconds: number;
     source_type: string;
+    timing_source?: string;
+    has_precise_timing?: boolean;
 }
 
 interface OnlineClipResponse {
@@ -87,6 +90,7 @@ const formatActionError = (action: string, value: unknown, fallback: string): st
 };
 
 export default function WordClipStudio() {
+    const [searchParams] = useSearchParams();
     const [word, setWord] = useState('');
     const [videoCount, setVideoCount] = useState(4);
     const [includeCambridge, setIncludeCambridge] = useState(true);
@@ -107,6 +111,7 @@ export default function WordClipStudio() {
     const [focusStudentFilter, setFocusStudentFilter] = useState('');
     const [ygStatus, setYgStatus] = useState('Ready to search YouGlish clips in-page.');
     const [ygAccent, setYgAccent] = useState<'all' | 'us' | 'uk' | 'aus' | 'ca'>('all');
+    const [preciseLocate, setPreciseLocate] = useState(true);
     const [allowFallbackPlayer, setAllowFallbackPlayer] = useState(true);
     const [ygBusy, setYgBusy] = useState(false);
     const [ygNeedsVerify, setYgNeedsVerify] = useState(false);
@@ -211,6 +216,14 @@ export default function WordClipStudio() {
         },
         [readApiJson],
     );
+
+    useEffect(() => {
+        const seededWord = String(searchParams.get('word') || '').trim().replace(/\s+/g, ' ');
+        if (!seededWord) return;
+        setWord(seededWord);
+        void loadYouGlishSnapshot(seededWord);
+        setYgStatus(`Loaded word from report: "${seededWord}". Click "Load in player" for precise clips.`);
+    }, [loadYouGlishSnapshot, searchParams]);
 
     const loadFocusWords = useCallback(async () => {
         setFocusWordsLoading(true);
@@ -363,16 +376,38 @@ export default function WordClipStudio() {
         try {
             setYgBusy(true);
             setYgNeedsVerify(false);
-            setYgStatus(`Searching in-page clips for "${q}"...`);
+            setYgStatus(`Searching in-page clips for "${q}"${preciseLocate ? ' (precise timing)...' : '...'} `.trim());
             const params = new URLSearchParams({
                 word: q,
                 limit: String(Math.max(4, Math.min(20, videoCount))),
                 accent: ygAccent,
+                precise: preciseLocate ? '1' : '0',
             });
-            const response = await fetch(`${API_HOST}/api/word-clips/online-sources?${params.toString()}`);
-            const data = await readApiJson<OnlineClipResponse & { detail?: string }>(response);
-            if (!response.ok) {
-                throw new Error(data?.detail || 'Failed to load online clip sources');
+            const fetchOnlineSourceData = async (searchParams: URLSearchParams, timeoutMs: number) => {
+                const controller = new AbortController();
+                const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const response = await fetch(`${API_HOST}/api/word-clips/online-sources?${searchParams.toString()}`, {
+                        signal: controller.signal,
+                    });
+                    const payload = await readApiJson<OnlineClipResponse & { detail?: string }>(response);
+                    if (!response.ok) {
+                        throw new Error(payload?.detail || 'Failed to load online clip sources');
+                    }
+                    return payload;
+                } finally {
+                    window.clearTimeout(timer);
+                }
+            };
+            let data: OnlineClipResponse & { detail?: string };
+            try {
+                data = await fetchOnlineSourceData(params, preciseLocate ? 16000 : 12000);
+            } catch (err) {
+                const isAbort = err instanceof Error && err.name === 'AbortError';
+                if (!preciseLocate || !isAbort) throw err;
+                setYgStatus(`Precise timing took too long for "${q}". Switching to fast mode...`);
+                params.set('precise', '0');
+                data = await fetchOnlineSourceData(params, 12000);
             }
             const allItems = Array.isArray(data?.items) ? data.items : [];
             const youglishItems = allItems.filter((item) => {
@@ -383,7 +418,10 @@ export default function WordClipStudio() {
             const hasFallbackItems = !hasYouGlish && allItems.length > 0;
             // Keep the player practical: when YouGlish is unavailable, still show fallback clips.
             const items = hasYouGlish ? youglishItems : hasFallbackItems ? allItems : [];
-            setOnlineClips(items);
+            const preciseHits = items.filter((item) => Boolean(item?.has_precise_timing)).length;
+            const displayItems =
+                preciseLocate && preciseHits > 0 ? items.filter((item) => Boolean(item?.has_precise_timing)) : items;
+            setOnlineClips(displayItems);
             setOnlineIndex(0);
             setOnlineSource(
                 hasYouGlish
@@ -394,7 +432,11 @@ export default function WordClipStudio() {
             );
             if (hasYouGlish) {
                 setYgNeedsVerify(false);
-                setYgStatus(`Loaded ${items.length} YouGlish clip(s) in player.`);
+                setYgStatus(
+                    preciseLocate
+                        ? `Loaded ${displayItems.length} YouGlish clip(s). Precise timing confirmed for ${preciseHits}/${items.length}.`
+                        : `Loaded ${items.length} YouGlish clip(s) in player.`,
+                );
             } else if (hasFallbackItems) {
                 setYgNeedsVerify(true);
                 const fallbackSource = String(data?.source || 'fallback_youtube');
@@ -404,7 +446,9 @@ export default function WordClipStudio() {
                     setAllowFallbackPlayer(true);
                 }
                 setYgStatus(
-                    `YouGlish clips unavailable. Loaded ${items.length} fallback clip(s) from ${fallbackSource}.${reason}`,
+                    preciseLocate
+                        ? `YouGlish clips unavailable. Loaded ${displayItems.length} fallback clip(s) from ${fallbackSource}. Precise timing ${preciseHits}/${items.length}.${reason}`
+                        : `YouGlish clips unavailable. Loaded ${items.length} fallback clip(s) from ${fallbackSource}.${reason}`,
                 );
             } else {
                 setYgNeedsVerify(true);
@@ -424,7 +468,7 @@ export default function WordClipStudio() {
         } finally {
             setYgBusy(false);
         }
-    }, [allowFallbackPlayer, focusWords, loadYouGlishSnapshot, readApiJson, videoCount, word, ygAccent]);
+    }, [allowFallbackPlayer, focusWords, loadYouGlishSnapshot, preciseLocate, readApiJson, videoCount, word, ygAccent]);
 
     const controlYouGlish = useCallback((action: 'prev' | 'next' | 'replay') => {
         if (!onlineClips.length) return;
@@ -489,6 +533,18 @@ export default function WordClipStudio() {
             .filter(Boolean);
         return tokens.length > 0 ? tokens : QUICK_FOCUS_WORDS;
     }, [focusWords]);
+    const youglishQuery = useMemo(() => {
+        const raw = String(word || '').trim().replace(/\s+/g, ' ');
+        return raw || 'sausages';
+    }, [word]);
+    const youglishWebUrl = useMemo(
+        () => `https://youglish.com/pronounce/${encodeURIComponent(youglishQuery)}/english`,
+        [youglishQuery],
+    );
+    const youglishChromeUrl = useMemo(
+        () => `googlechromes://youglish.com/pronounce/${encodeURIComponent(youglishQuery)}/english`,
+        [youglishQuery],
+    );
     const coachWord = word.trim() || autoFocusWords[0] || 'sausages';
     const coachLinks = useMemo(() => {
         const token = encodeURIComponent(coachWord);
@@ -619,6 +675,18 @@ export default function WordClipStudio() {
                                         </button>
                                         <button
                                             type="button"
+                                            onClick={() => setPreciseLocate((prev) => !prev)}
+                                            className={`rounded-xl border px-3 py-2 text-xs font-semibold transition ${
+                                                preciseLocate
+                                                    ? 'border-cyan-300/45 bg-cyan-400/15 text-cyan-100'
+                                                    : 'border-white/20 bg-white/10 text-slate-200'
+                                            }`}
+                                            title="Subtitle-first + ASR fallback to find exact keyword timing"
+                                        >
+                                            Precise timing {preciseLocate ? 'On' : 'Off'}
+                                        </button>
+                                        <button
+                                            type="button"
                                             onClick={openYouGlishTab}
                                             className="inline-flex items-center gap-2 rounded-xl border border-white/20 bg-white/10 px-4 py-2 text-sm font-semibold text-white transition hover:border-white/35"
                                         >
@@ -680,6 +748,9 @@ export default function WordClipStudio() {
                                 {currentOnlineClip && (
                                     <p className="text-xs text-violet-200/90">
                                         {currentOnlineClip.title} | keyword at {currentClipStart}s
+                                        {currentOnlineClip.has_precise_timing
+                                            ? ` | precise(${currentOnlineClip.timing_source || 'subtitle'})`
+                                            : ' | estimate'}
                                     </p>
                                 )}
                                 <div className="mt-2 flex flex-wrap gap-2">
@@ -714,15 +785,25 @@ export default function WordClipStudio() {
                                 <div className="mt-3 rounded-xl border border-emerald-300/35 bg-emerald-500/10 p-3">
                                     <div className="flex flex-wrap items-center justify-between gap-2">
                                         <p className="text-xs uppercase tracking-wide text-emerald-200">Direct YouGlish Results</p>
-                                        <a
-                                            href={ygSnapshot?.source_url || `https://youglish.com/pronounce/${encodeURIComponent(word.trim() || 'sausages')}/english`}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            className="inline-flex items-center gap-1 rounded-md border border-emerald-300/40 bg-emerald-400/15 px-2 py-1 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-400/25"
-                                        >
-                                            Open on YouGlish
-                                            <ExternalLink className="h-3 w-3" />
-                                        </a>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <a
+                                                href={youglishChromeUrl}
+                                                className="inline-flex items-center gap-1 rounded-md border border-emerald-300/40 bg-emerald-400/15 px-2 py-1 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-400/25"
+                                                title="Prefer opening in Chrome browser"
+                                            >
+                                                Open on YouGlish (Chrome)
+                                                <ExternalLink className="h-3 w-3" />
+                                            </a>
+                                            <a
+                                                href={youglishWebUrl}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                className="inline-flex items-center gap-1 rounded-md border border-emerald-300/25 bg-emerald-400/10 px-2 py-1 text-[11px] font-semibold text-emerald-100/90 hover:bg-emerald-400/20"
+                                                title="Fallback if Chrome protocol is blocked"
+                                            >
+                                                Open normal
+                                            </a>
+                                        </div>
                                     </div>
                                     {ygSnapshotBusy ? (
                                         <p className="mt-2 text-xs text-emerald-100/85">Loading YouGlish snapshot...</p>

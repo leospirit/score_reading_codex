@@ -262,8 +262,31 @@ def process_single_submission(
             
             # 4. 分析
             result.analysis = analyze_results(
-                alignment, submission.script_text, engine_raw
+                alignment,
+                submission.script_text,
+                engine_raw,
+                context={
+                    "submission_id": result.meta.submission_id,
+                    "student_id": result.meta.student_id,
+                    "task_id": result.meta.task_id,
+                    "audio_path": str(wav_path),
+                },
             )
+
+            # Re-normalize after analysis so completeness reflects finalized
+            # stable missing indices and fluency uses finalized pause labels.
+            result.scores = normalize_scores(
+                engine_raw=engine_raw,
+                audio_metrics=audio_metrics,
+                alignment=alignment,
+                script_text=submission.script_text,
+            )
+            assign_tags(alignment)
+            if result.analysis and result.analysis.completeness:
+                try:
+                    result.analysis.completeness.coverage = int(round(float(result.scores.completeness_100)))
+                except Exception:
+                    pass
             
             # 5. 生成建议
             result.feedback = generate_feedback(result.analysis)

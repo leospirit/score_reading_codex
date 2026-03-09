@@ -1,5 +1,22 @@
-services:
-  # 后端 API 服务
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: speech-scoring-pg
+    environment:
+      - POSTGRES_USER=${PG_USER:-speech}
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-speech123}
+      - POSTGRES_DB=${PG_DB:-speech_analytics}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-speech} -d ${PG_DB:-speech_analytics}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks:
+      - speech-net
+
   api:
     build:
       context: .
@@ -15,21 +32,32 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_API_BASE=${GEMINI_API_BASE:-}
+      - ARK_API_KEY=${ARK_API_KEY:-}
+      - ARK_BASE_URL=${ARK_BASE_URL:-}
+      - ARK_MODEL=${ARK_MODEL:-}
       - AZURE_API_KEY=${AZURE_API_KEY:-}
       - YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}
       - YTDLP_PO_TOKENS=${YTDLP_PO_TOKENS:-}
       - ADMIN_API_TOKEN=${ADMIN_API_TOKEN:-}
       - CORS_ALLOW_ORIGINS=${CORS_ALLOW_ORIGINS:-}
       - UPLOAD_STORAGE_WARN_GB=${UPLOAD_STORAGE_WARN_GB:-20}
+      - COS_SIGN_ENABLED=${COS_SIGN_ENABLED:-true}
+      - COS_SIGN_BUCKET=${COS_SIGN_BUCKET:-}
+      - COS_SIGN_REGION=${COS_SIGN_REGION:-ap-beijing}
+      - COS_SIGN_KEY_PREFIX=${COS_SIGN_KEY_PREFIX:-sos/phonemes}
+      - COS_SIGN_SECRET_ID=${COS_SIGN_SECRET_ID:-}
+      - COS_SIGN_SECRET_KEY=${COS_SIGN_SECRET_KEY:-}
       - YTDLP_PO_TOKEN_FILE=/app/data/yt_po_tokens.json
       - GENTLE_URL=http://gentle:8765
+      - PG_ANALYTICS_DSN=${PG_ANALYTICS_DSN:-}
+      - DATABASE_URL=${DATABASE_URL:-}
     depends_on:
       - gentle
+      - postgres
     restart: unless-stopped
     networks:
       - speech-net
 
-  # 前端 Web 服务
   web:
     build:
       context: .
@@ -47,16 +75,12 @@ services:
     networks:
       - speech-net
 
-  # Gentle 语音对齐服务
   gentle:
     image: lowerquality/gentle
     container_name: speech-scoring-gentle
     restart: unless-stopped
     networks:
       - speech-net
-    # 调试时可取消注释下面的端口映射
-    # ports:
-    #   - "8765:8765"
 
 networks:
   speech-net:

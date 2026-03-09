@@ -1,12 +1,14 @@
 import json
 import logging
 import os
+import time
 from typing import Any, Dict
 
 from src.analysis.openai_provider import OpenAIProvider
 from src.advice.playbook import build_playbook_runtime_hints
 from src.config import load_config
 from src.models import Feedback, PhonemeTag, ScoringResult, WordTag
+from src.semantic_pronunciation import build_semantic_pronunciation_priors
 
 logger = logging.getLogger(__name__)
 
@@ -20,33 +22,85 @@ class LLMAdvisor:
     def __init__(self):
         self.provider = OpenAIProvider()
 
-    def _build_fallback_provider(self) -> OpenAIProvider | None:
-        """Optional backup advisor provider (e.g. Zhipu) when primary LLM fails."""
+    @staticmethod
+    def _provider_ready(provider: OpenAIProvider | None) -> bool:
+        if provider is None:
+            return False
+        return bool(
+            (getattr(provider, "client_type", "") and getattr(provider, "client_type", "") != "none")
+            or getattr(provider, "client", None)
+            or getattr(provider, "genai_model", None)
+        )
+
+    @staticmethod
+    def _provider_signature(provider: OpenAIProvider) -> tuple[str, str, str]:
+        api_keys = getattr(provider, "api_keys", None) or []
+        first_key = str(api_keys[0]) if api_keys else ""
+        return (
+            str(getattr(provider, "client_type", "") or ""),
+            str(getattr(provider, "model", "") or ""),
+            first_key[:12],
+        )
+
+    def _build_volcengine_provider(self) -> OpenAIProvider | None:
+        """Build deterministic Volcengine Ark advisor provider."""
         try:
             cfg = load_config()
         except Exception:
             cfg = {}
 
-        fallback_key = (
-            cfg.get("llm.fallback_api_key")
-            or cfg.get("llm.zhipu_api_key")
-            or os.getenv("ZHIPU_API_KEY")
+        ark_key = (
+            cfg.get("llm.ark_api_key")
+            or os.getenv("ARK_API_KEY")
         )
-        if not fallback_key:
+        if not ark_key:
             return None
 
-        fallback_model = (
-            cfg.get("llm.fallback_model")
-            or cfg.get("llm.zhipu_model")
-            or "glm-4-flash"
+        ark_model = (
+            cfg.get("llm.ark_model")
+            or os.getenv("ARK_MODEL")
+            or "doubao-seed-2-0-lite-260215"
         )
-        provider = OpenAIProvider(api_key=fallback_key, model=fallback_model)
-        provider_ready = bool(
-            (getattr(provider, "client_type", "") and getattr(provider, "client_type", "") != "none")
-            or getattr(provider, "client", None)
-            or getattr(provider, "genai_model", None)
+        ark_base_url = (
+            cfg.get("llm.ark_base_url")
+            or os.getenv("ARK_BASE_URL")
+            or "https://ark.cn-beijing.volces.com/api/v3"
         )
-        return provider if provider_ready else None
+        provider = OpenAIProvider(
+            api_key=ark_key,
+            model=ark_model,
+            base_url=ark_base_url,
+            provider_name="volcengine",
+        )
+        return provider if self._provider_ready(provider) else None
+
+    def _build_provider_chain(self) -> list[tuple[str, OpenAIProvider]]:
+        """
+        Fixed fallback chain for integrated feedback:
+        1) Volcengine Ark
+        2) Gemini
+        3) Azure fallback
+        """
+        chain: list[tuple[str, OpenAIProvider]] = []
+        volcengine = self._build_volcengine_provider()
+        if volcengine and self._provider_ready(volcengine):
+            chain.append(("volcengine", volcengine))
+
+        if self._provider_ready(self.provider):
+            primary_type = str(getattr(self.provider, "client_type", "") or "").lower()
+            if primary_type in {"gemini", "gemini_rest"}:
+                primary_label = "gemini"
+            elif primary_type == "volcengine":
+                primary_label = "volcengine"
+            elif primary_type == "zhipu":
+                primary_label = "zhipu_primary"
+            else:
+                primary_label = "llm_primary"
+            primary_sig = self._provider_signature(self.provider)
+            duplicate = any(self._provider_signature(provider) == primary_sig for _, provider in chain)
+            if not duplicate:
+                chain.append((primary_label, self.provider))
+        return chain
 
     def generate_feedback(self, result: ScoringResult) -> tuple[Feedback, dict[str, Any] | None]:
         """
@@ -77,46 +131,86 @@ class LLMAdvisor:
                 "is_abnormal": True,
             }
 
-        provider_ready = bool(
-            (getattr(self.provider, "client_type", "") and getattr(self.provider, "client_type", "") != "none")
-            or getattr(self.provider, "client", None)
-            or getattr(self.provider, "genai_model", None)
-        )
-        if not provider_ready:
-            logger.warning("LLM provider not available. Skipping AI feedback.")
-            return result.feedback, None
-
         try:
-            prompt_data = self._prepare_prompt_data(result)
-            system_prompt = self._get_system_prompt()
-            user_prompt = json.dumps(prompt_data, ensure_ascii=False, indent=2)
-
-            logger.info("Calling LLM for advisor feedback generation...")
-            feedback_data: Dict[str, Any] = {}
-            primary_error: Exception | None = None
-
+            cfg = load_config()
+            raw_budget = cfg.get("llm.advisor_budget_sec", cfg.get("llm.max_total_wait_sec", 12.0))
             try:
-                response_json = self.provider.generate_response(system_prompt, user_prompt)
-                feedback_data = self._parse_response(response_json)
-            except Exception as e:
-                primary_error = e
-                logger.warning("Primary advisor LLM failed: %s", e)
+                advisor_budget_sec = max(2.0, float(raw_budget))
+            except Exception:
+                advisor_budget_sec = 12.0
+            raw_fallback_reserve = cfg.get("llm.fallback_min_budget_sec", 3.0)
+            try:
+                fallback_min_budget_sec = max(1.0, float(raw_fallback_reserve))
+            except Exception:
+                fallback_min_budget_sec = 3.0
+
+            provider_chain = self._build_provider_chain()
+            if not provider_chain:
+                logger.warning("No LLM provider available. Skipping AI feedback.")
+                return result.feedback, None
+
+            logger.info(
+                "Calling LLM for advisor feedback generation (chain=%s).",
+                " -> ".join(label for label, _ in provider_chain),
+            )
+            feedback_data: Dict[str, Any] = {}
+            provider_errors: list[str] = []
+            started_at = time.monotonic()
+            chain_labels = [label for label, _ in provider_chain]
+
+            for idx, (label, provider) in enumerate(provider_chain):
+                elapsed_sec = time.monotonic() - started_at
+                remaining_sec = advisor_budget_sec - elapsed_sec
+                if remaining_sec <= 0.6:
+                    logger.info(
+                        "Skipping advisor provider %s due to budget exhaustion (remaining=%.2fs).",
+                        label,
+                        max(0.0, remaining_sec),
+                    )
+                    continue
+
+                remaining_providers = max(0, len(provider_chain) - idx - 1)
+                reserved_for_fallback = fallback_min_budget_sec * remaining_providers
+                provider_budget_sec = remaining_sec
+                if remaining_providers > 0:
+                    provider_budget_sec = max(1.0, remaining_sec - reserved_for_fallback)
+
+                original_wait = getattr(provider, "max_total_wait_sec", remaining_sec)
+                try:
+                    provider.max_total_wait_sec = min(float(original_wait), float(provider_budget_sec))
+                    prompt_data = self._prepare_prompt_data(result, provider_label=label)
+                    system_prompt = self._get_system_prompt(provider_label=label)
+                    user_prompt = json.dumps(prompt_data, ensure_ascii=False, indent=2)
+                    response_json = provider.generate_response(system_prompt, user_prompt)
+                    parsed = self._parse_response(response_json)
+                    if parsed:
+                        feedback_data = parsed
+                        feedback_data["_advisor_provider"] = label
+                        feedback_data["_advisor_chain"] = chain_labels
+                        logger.info("Advisor provider succeeded: %s", label)
+                        break
+                    provider_errors.append(f"{label}: empty_response")
+                    logger.warning("Advisor provider %s returned empty/invalid JSON.", label)
+                except Exception as err:
+                    provider_errors.append(f"{label}: {err}")
+                    logger.warning("Advisor provider %s failed: %s", label, err)
+                finally:
+                    try:
+                        provider.max_total_wait_sec = original_wait
+                    except Exception:
+                        pass
 
             if not feedback_data:
-                fallback_provider = self._build_fallback_provider()
-                if fallback_provider:
-                    try:
-                        logger.info("Trying fallback advisor provider...")
-                        response_json = fallback_provider.generate_response(system_prompt, user_prompt)
-                        feedback_data = self._parse_response(response_json)
-                        if feedback_data:
-                            logger.info("Fallback advisor provider succeeded.")
-                    except Exception as fallback_err:
-                        logger.warning("Fallback advisor provider failed: %s", fallback_err)
-                if not feedback_data:
-                    if primary_error:
-                        logger.error("Advisor feedback unavailable after fallback: %s", primary_error)
-                    return result.feedback, None
+                if provider_errors:
+                    logger.error(
+                        "Advisor feedback unavailable after chain fallback: %s",
+                        " | ".join(provider_errors),
+                    )
+                return result.feedback, {
+                    "provider": "azure_fallback",
+                    "_advisor_chain": chain_labels,
+                    "_advisor_errors": provider_errors,
+                }
 
             new_feedback = Feedback(
                 cn_summary=feedback_data.get("overall_comment", ""),
@@ -130,12 +224,13 @@ class LLMAdvisor:
 
             result.advisor_feedback = feedback_data
 
-            # Optional style score from model.
+            # Keep rubric scores source-driven. LLM style score is advisory only.
             ai_naturalness = feedback_data.get("ai_naturalness_score")
             if ai_naturalness is not None:
-                score = float(ai_naturalness)
-                result.scores.intonation_100 = (result.scores.intonation_100 * 0.4) + (score * 0.6)
-                result.scores.overall_100 = (result.scores.overall_100 * 0.8) + (score * 0.2)
+                try:
+                    feedback_data["ai_naturalness_score"] = float(ai_naturalness)
+                except Exception:
+                    feedback_data.pop("ai_naturalness_score", None)
 
             return new_feedback, feedback_data
         except Exception as e:
@@ -162,7 +257,7 @@ class LLMAdvisor:
             return prefix[1:3]
         return prefix[:2]
 
-    def _prepare_prompt_data(self, result: ScoringResult) -> Dict[str, Any]:
+    def _prepare_prompt_data(self, result: ScoringResult, provider_label: str = "") -> Dict[str, Any]:
         """
         Build compact structured payload for advisor model.
         """
@@ -206,14 +301,16 @@ class LLMAdvisor:
             phoneme_symbols=[str(item.get("phoneme", "")) for item in phoneme_issues[:20]],
             max_items=5,
         )
+        semantic_pronunciation_priors = build_semantic_pronunciation_priors(result.script_text or "")
 
-        return {
+        payload = {
             "instruction": (
                 f"Start with '{nickname}' and provide precise, actionable coaching in Chinese. "
                 "Do not use generic address like the generic Chinese term for classmate."
             ),
             "student_nickname": nickname,
             "playbook_hints": playbook_hints,
+            "semantic_pronunciation_priors": semantic_pronunciation_priors,
             "text": result.script_text,
             "scores": {
                 "pronunciation": round(result.scores.pronunciation_100, 1),
@@ -237,7 +334,68 @@ class LLMAdvisor:
             },
         }
 
-    def _get_system_prompt(self) -> str:
+        if str(provider_label or "").strip().lower() == "volcengine":
+            ordered_scores = [
+                ("completeness", round(result.scores.completeness_100, 1)),
+                ("fluency", round(result.scores.fluency_100, 1)),
+                ("pronunciation", round(result.scores.pronunciation_100, 1)),
+                ("intonation", round(result.scores.intonation_100, 1)),
+            ]
+            focus_strength = max(ordered_scores, key=lambda item: item[1])
+            focus_issue_word = weak_words_data[0] if weak_words_data else {}
+            focus_issue_phoneme = phoneme_issues[0] if phoneme_issues else {}
+            compact_payload = {
+                "instruction": (
+                    f"Address {nickname} directly in Chinese. Write exactly 3 short sentences: praise, issue, action."
+                ),
+                "student_nickname": nickname,
+                "text": result.script_text,
+                "focus_strength": {
+                    "dimension": focus_strength[0],
+                    "score": focus_strength[1],
+                },
+                "focus_issue": {
+                    "word": str(focus_issue_word.get('word', '') or ''),
+                    "word_score": float(focus_issue_word.get("score", 0) or 0),
+                    "diagnosis": str(focus_issue_word.get("diagnosis", "") or ""),
+                    "phoneme": str(focus_issue_phoneme.get("phoneme", "") or ""),
+                    "phoneme_score": float(focus_issue_phoneme.get("score", 0) or 0),
+                },
+                "scores": payload["scores"],
+                "fluency_details": payload["fluency_details"],
+                "missing_words": list((result.analysis.missing_words or [])[:3]),
+                "semantic_pronunciation_priors": semantic_pronunciation_priors[:3],
+            }
+            return compact_payload
+        return payload
+
+    def _get_system_prompt(self, provider_label: str = "") -> str:
+        if str(provider_label or "").strip().lower() == "volcengine":
+            return """
+You are an expert English speaking coach for children.
+Return ONLY valid JSON using this schema:
+{
+  "overall_comment": "string",
+  "top_errors": [{"phoneme":"string","type":"string","description":"string","words":["string"],"improvement":"string"}],
+  "specific_feedback": [{"target":"string","issue":"string","suggestion":"string"}],
+  "practice_tips": ["string"],
+  "fluency_diagnosis": {"status":"string","advice":"string","motto":"string"},
+  "ai_naturalness_score": 0
+}
+
+Rules:
+- Respond in Chinese.
+- overall_comment must be exactly 3 Chinese sentences.
+- Sentence 1: one factual praise based on provided evidence only (fluency/completeness/pronunciation/intonation).
+- Sentence 2: point out exactly one core problem.
+- Sentence 3: give exactly one concrete, easy-to-practice action.
+- Do not mention any numeric score/points.
+- Keep wording simple and student-facing; avoid mouth/tongue anatomy wording.
+- specific_feedback must contain at most 1 item.
+- practice_tips must contain at most 1 item.
+- top_errors should contain at most 1 item.
+- If semantic_pronunciation_priors are provided, obey them for ambiguous word readings.
+"""
         return """
 You are an expert English speaking coach for children.
 Return ONLY valid JSON using this schema:
@@ -253,10 +411,14 @@ Return ONLY valid JSON using this schema:
 Rules:
 - Respond in Chinese.
 - Always address the student with provided student_nickname.
-- Use concrete, physical pronunciation instructions.
+- Keep language simple and student-facing; avoid technical mouth/tongue anatomy wording.
+- If semantic_pronunciation_priors are provided, obey them for ambiguous word readings and do not contradict them.
+- Do not mention any numeric score/points in overall_comment, specific_feedback, or practice_tips.
 - Prefer playbook_hints when they match evidence; ignore irrelevant entries.
-- Keep overall_comment to 1-2 sentences and <= 45 Chinese chars.
-- Mention exactly one strongest point and one key fix.
+- overall_comment must be exactly 3 Chinese sentences.
+- Sentence 1: one factual praise.
+- Sentence 2: one key issue.
+- Sentence 3: one actionable suggestion.
 - specific_feedback must contain at most 1 item.
 - practice_tips must contain at most 1 item.
 - top_errors should include 1-3 concrete items when evidence exists.
@@ -264,6 +426,7 @@ Rules:
 - Mnemonic can be playful/humorous, but must remain positive and executable.
 - Avoid repeating the same wording across top_errors improvements.
 - Keep tone encouraging but evidence-based.
+- Prohibited words/ideas in final text: 舌尖, 舌中, 口型, 卷舌, 长音短音对比, x音发音器官说明.
 """
 
     def _parse_response(self, response_str: str) -> Dict[str, Any]:

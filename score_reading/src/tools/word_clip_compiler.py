@@ -906,7 +906,8 @@ def _search_youtube_api_sources(word: str, domains: list[str], max_videos: int) 
 
 
 def _search_youglish_sources(word: str, *, max_videos: int) -> list[SourceCandidate]:
-    normalized = re.sub(r"[^a-zA-Z'-]+", "", (word or "").strip())
+    normalized = re.sub(r"[^a-zA-Z0-9' -]+", " ", (word or "").strip())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return []
 

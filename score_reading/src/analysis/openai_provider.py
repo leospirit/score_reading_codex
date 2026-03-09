@@ -16,9 +16,16 @@ class OpenAIProvider(LLMProvider):
     OpenAI-compatible implementation (OpenAI/Zhipu/proxy Gemini).
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider_name: Optional[str] = None,
+    ):
         config = load_config()
         self.config = config
+        self.provider_name = str(provider_name or "").strip().lower()
         self.connect_timeout_sec = float(config.get("llm.connect_timeout_sec", 5.0))
         self.read_timeout_sec = float(config.get("llm.read_timeout_sec", 12.0))
         self.max_retry_rounds = int(config.get("llm.max_retries", 3))
@@ -54,8 +61,10 @@ class OpenAIProvider(LLMProvider):
 
         has_gemini_key = any(k.startswith("AIza") for k in self.api_keys)
         gemini_proxy_base = config.get("engines.gemini.api_base") or os.getenv("GEMINI_API_BASE")
-        configured_llm_base = config.get("llm.base_url")
-        if has_gemini_key and gemini_proxy_base:
+        configured_llm_base = base_url or config.get("llm.base_url")
+        if self.provider_name == "volcengine":
+            self.base_url = configured_llm_base or os.getenv("ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3"
+        elif has_gemini_key and gemini_proxy_base:
             # Prefer Gemini-compatible proxy for AIza keys.
             self.base_url = gemini_proxy_base
         elif has_gemini_key and configured_llm_base and "bigmodel.cn" in configured_llm_base:
@@ -98,7 +107,18 @@ class OpenAIProvider(LLMProvider):
         """Initialize provider client for current key."""
         current_key = self.api_keys[self.current_key_index]
 
-        if current_key.startswith("AIza"):
+        if self.provider_name == "volcengine" or "ark.cn-beijing.volces.com" in str(self.base_url or ""):
+            self.client_type = "volcengine"
+            self.client = None
+            self.genai_model = None
+            if not self.model:
+                self.model = (
+                    self.config.get("llm.ark_model")
+                    or os.getenv("ARK_MODEL")
+                    or "doubao-seed-2-0-lite-260215"
+                )
+            logger.info("Initialized Volcengine Ark provider for Advisor (model=%s).", self.model)
+        elif current_key.startswith("AIza"):
             proxy_base = self.base_url or os.getenv("GEMINI_API_BASE")
             if proxy_base:
                 # Proxy mode: many self-hosted Gemini gateways expose OpenAI-compatible API.
@@ -118,7 +138,11 @@ class OpenAIProvider(LLMProvider):
         elif "." in current_key and len(current_key) > 20 and not current_key.startswith("sk-"):
             # Zhipu key in id.secret format
             self.client_type = "zhipu"
-            zhipu_default_model = self.config.get("llm.zhipu_model") or "glm-4.5-air"
+            configured_zhipu_model = self.config.get("llm.zhipu_model")
+            zhipu_default_model = str(configured_zhipu_model or "glm-4.7").strip()
+            if zhipu_default_model.lower() in {"glm-4-flash", "glm-4"}:
+                # Backward-compatible guard: old config value is no longer available.
+                zhipu_default_model = "glm-4.7"
             target_model = self.model or zhipu_default_model
             if (
                 "gemini" in target_model.lower()
@@ -127,9 +151,14 @@ class OpenAIProvider(LLMProvider):
                 or target_model.lower() == "glm-4-flash"
             ):
                 target_model = zhipu_default_model
+            zhipu_base_url = (
+                self.config.get("llm.zhipu_base_url")
+                or os.getenv("ZHIPU_BASE_URL")
+                or "https://api.z.ai/api/paas/v4"
+            )
             self.client = openai.OpenAI(
                 api_key=current_key,
-                base_url="https://open.bigmodel.cn/api/paas/v4/",
+                base_url=zhipu_base_url,
             )
             self.model = target_model
             self.genai_model = None
@@ -154,6 +183,81 @@ class OpenAIProvider(LLMProvider):
         self._init_client()
         logger.warning("Rotated to API key #%s", self.current_key_index)
         return True
+
+    def _build_request_timeout(self) -> httpx.Timeout:
+        """
+        Clamp per-request HTTP timeout to the currently assigned provider budget.
+        This keeps advisor fallback windows real instead of letting one provider
+        exceed its share and starve the next provider in the chain.
+        """
+        budget_sec = max(1.0, float(getattr(self, "max_total_wait_sec", 20.0) or 20.0))
+        default_connect = max(0.5, float(getattr(self, "connect_timeout_sec", 5.0) or 5.0))
+        default_read = max(0.5, float(getattr(self, "read_timeout_sec", 12.0) or 12.0))
+
+        if budget_sec <= default_connect:
+            connect_timeout = max(0.5, budget_sec * 0.4)
+        else:
+            connect_timeout = min(default_connect, max(0.5, budget_sec * 0.4))
+
+        remaining_read = max(0.5, budget_sec - connect_timeout)
+        read_timeout = min(default_read, remaining_read)
+        write_timeout = min(read_timeout, max(0.5, budget_sec))
+        pool_timeout = min(connect_timeout, max(0.5, budget_sec))
+        return httpx.Timeout(
+            timeout=max(connect_timeout, read_timeout, write_timeout, pool_timeout),
+            connect=connect_timeout,
+            read=read_timeout,
+            write=write_timeout,
+            pool=pool_timeout,
+        )
+
+    def _generate_via_volcengine_responses(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float,
+    ) -> str:
+        current_key = self.api_keys[self.current_key_index]
+        endpoint = str(self.base_url or "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+        if not endpoint.endswith("/responses"):
+            endpoint = f"{endpoint}/responses"
+
+        payload = {
+            "model": self.model or os.getenv("ARK_MODEL") or "doubao-seed-2-0-lite-260215",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{system_prompt}\n\n{user_prompt}",
+                        }
+                    ],
+                }
+            ],
+            "temperature": temperature,
+        }
+        headers = {
+            "Authorization": f"Bearer {current_key}",
+            "Content-Type": "application/json",
+        }
+        with httpx.Client(timeout=self._build_request_timeout(), follow_redirects=True) as client:
+            resp = client.post(endpoint, headers=headers, json=payload)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Volcengine Ark error status={resp.status_code}: {resp.text[:300]}")
+            data = resp.json()
+            output_text = str(data.get("output_text") or "").strip()
+            if output_text:
+                return output_text
+            for item in data.get("output") or []:
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                for content in item.get("content") or []:
+                    if isinstance(content, dict) and content.get("type") == "output_text":
+                        text = str(content.get("text") or "").strip()
+                        if text:
+                            return text
+            raise RuntimeError("Volcengine Ark returned empty text")
 
     def _generate_via_gemini_rest_proxy(
         self,
@@ -186,7 +290,7 @@ class OpenAIProvider(LLMProvider):
             f"{self.base_url.rstrip('/')}/v1/models/{model}:generateContent",
         ]
 
-        with httpx.Client(timeout=(max(2.0, self.connect_timeout_sec), max(4.0, self.read_timeout_sec)), follow_redirects=True) as client:
+        with httpx.Client(timeout=self._build_request_timeout(), follow_redirects=True) as client:
             for endpoint in endpoints:
                 try:
                     resp = client.post(endpoint, params={"key": current_key}, json=payload)
@@ -246,7 +350,7 @@ class OpenAIProvider(LLMProvider):
                 "responseMimeType": "application/json",
             },
         }
-        with httpx.Client(timeout=(max(2.0, self.connect_timeout_sec), max(4.0, self.read_timeout_sec)), follow_redirects=True) as client:
+        with httpx.Client(timeout=self._build_request_timeout(), follow_redirects=True) as client:
             resp = client.post(endpoint, params={"key": current_key}, json=payload)
             if resp.status_code != 200:
                 raise RuntimeError(f"Gemini REST error status={resp.status_code}")
@@ -267,14 +371,17 @@ class OpenAIProvider(LLMProvider):
         user_prompt: str,
         temperature: float = 0.7,
     ) -> str:
-        if self.client_type not in ("gemini", "gemini_rest") and not self.client and not self.genai_model:
+        if self.client_type not in ("gemini", "gemini_rest", "volcengine") and not self.client and not self.genai_model:
             raise RuntimeError("LLM client not initialized (missing API key).")
 
         import random
         import time
 
         max_retries = int(self.max_retry_rounds)
-        if len(self.api_keys) > 1:
+        # Respect explicit low retry budget (e.g. latency-first advisor mode).
+        if max_retries <= 1:
+            max_retries = 1
+        elif len(self.api_keys) > 1:
             max_retries = max(max_retries, min(3, len(self.api_keys)))
         else:
             max_retries = min(max_retries, 2)
@@ -288,9 +395,17 @@ class OpenAIProvider(LLMProvider):
                         user_prompt=user_prompt,
                         temperature=temperature,
                     )
+                if self.client_type == "volcengine":
+                    return self._generate_via_volcengine_responses(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        temperature=temperature,
+                    )
 
                 # OpenAI-compatible branch (OpenAI/Zhipu/Gemini proxy)
                 def _chat_create(client_obj, with_json_mode: bool = True):
+                    timeout = self._build_request_timeout()
+                    request_client = client_obj.with_options(timeout=timeout) if hasattr(client_obj, "with_options") else client_obj
                     kwargs = {
                         "model": self.model,
                         "messages": [
@@ -301,7 +416,7 @@ class OpenAIProvider(LLMProvider):
                     }
                     if with_json_mode:
                         kwargs["response_format"] = {"type": "json_object"}
-                    return client_obj.chat.completions.create(**kwargs)
+                    return request_client.chat.completions.create(**kwargs)
 
                 try:
                     response = _chat_create(self.client, with_json_mode=True)

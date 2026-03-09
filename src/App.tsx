@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import Navigation from './components/Navigation';
 
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const DashboardPro = lazy(() => import('./pages/DashboardPro'));
 const HistoryPage = lazy(() => import('./pages/History'));
 const ReportBuilder = lazy(() => import('./pages/ReportBuilder'));
 const WordClipStudio = lazy(() => import('./pages/WordClipStudio'));
@@ -22,6 +23,7 @@ function App() {
         >
           <Routes>
             <Route path="/" element={<Dashboard />} />
+            <Route path="/dashboard-pro" element={<DashboardPro />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/report-builder" element={<ReportBuilder />} />
             <Route path="/word-clips" element={<WordClipStudio />} />
